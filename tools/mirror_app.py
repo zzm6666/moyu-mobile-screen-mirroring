@@ -53,7 +53,9 @@ BLUR_RADIUS = 24  # 毛玻璃背景模糊半径
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+TRAY_CLICK_GUARD = 0.35  # 秒；双击托盘只算一次，避免「显示→立刻又隐藏」
 WH_MOUSE_LL = 14
 
 DEFAULT_CFG = {
@@ -227,6 +229,13 @@ user32.SetWindowPos.argtypes = [wt.HWND, ctypes.c_void_p, ctypes.c_int, ctypes.c
                                 ctypes.c_int, ctypes.c_int, wt.UINT]
 user32.SetWindowPos.restype = wt.BOOL
 user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+user32.AttachThreadInput.restype = wt.BOOL
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.BringWindowToTop.restype = wt.BOOL
 user32.SetTimer.argtypes = [wt.HWND, ctypes.c_size_t, wt.UINT, ctypes.c_void_p]
 user32.SetTimer.restype = ctypes.c_size_t
 user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
@@ -313,6 +322,8 @@ kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
 kernel32.CreateMutexW.restype = wt.HANDLE
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HINSTANCE
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wt.DWORD
 
 dwmapi.DwmSetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ctypes.c_void_p, wt.DWORD]
 dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
@@ -344,6 +355,7 @@ _FONT_CACHE = {}
 
 state = {
     'tray': None, 'frame': None, 'child': None, 'proc': None,
+    'tray_click_ts': 0.0,
     'started_at': time.time(), 'quitting': False, 'error_shown': False,
     'aspect': 1080 / 2376, 'video_rect': (0, 0, 0, 0), 'close_hover': False,
     'orient': None, 'user_moved': False, 'region_key': None,
@@ -744,13 +756,44 @@ def sync_child_zorder():
                         SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE)
 
 
+def force_foreground(hwnd):
+    """把窗口真正激活到前台。
+
+    点托盘时输入属于任务栏，普通 SetForegroundWindow 会被 Windows 前台锁拒绝，
+    窗口虽然显示了却拿不到焦点（看起来像「点了没反应」）。这里临时挂到当前前台
+    线程的输入队列再激活，激活完立刻解挂。
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    fg = user32.GetForegroundWindow()
+    if fg == hwnd:
+        return
+    tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    tid_me = kernel32.GetCurrentThreadId()
+    attached = False
+    if tid_fg and tid_fg != tid_me:
+        attached = bool(user32.AttachThreadInput(tid_me, tid_fg, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        if attached:
+            user32.AttachThreadInput(tid_me, tid_fg, False)
+
+
 def raise_mirror():
-    """激活时把「操作栏 + 视频」作为一个整体提到 Z 序最前（普通层级，非 topmost）。"""
-    f, ch = state['frame'], state['child']
+    """激活时把「操作栏 + 视频」作为一个整体提到 Z 序最前（普通层级，非 topmost）。
+
+    注意：单用 SetWindowPos(HWND_TOP) 在本机多窗口叠加时实测无效——窗口仍留在
+    其它普通窗口之下（点击托盘后依然看不见）。改用「先临时 TOPMOST、立刻还原
+    NOTOPMOST」：真正提到最前，且不会常驻置顶（用户明确不要 always-on-top）。
+    """
+    f = state['frame']
     if not f or not user32.IsWindow(f) or not user32.IsWindowVisible(f):
         return
-    user32.SetWindowPos(f, HWND_TOP, 0, 0, 0, 0,
-                        SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE)
+    flags = SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE
+    user32.SetWindowPos(f, HWND_TOPMOST, 0, 0, 0, 0, flags)
+    user32.SetWindowPos(f, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
     sync_child_zorder()
 
 
@@ -1018,13 +1061,14 @@ def toggle_mirror():
         user32.ShowWindow(f, 0)
         if state['child']:
             user32.ShowWindow(state['child'], 0)
-    else:
-        user32.ShowWindow(f, 5)
-        user32.SetForegroundWindow(f)
-        if state['child']:
-            user32.ShowWindow(state['child'], 5)
-        update_frame(f)
-        raise_mirror()
+        return
+    # 显示：先把两个窗口放出来，再重绘、提到最前、抢前台，缺一步都会「看起来没反应」
+    user32.ShowWindow(f, 5)
+    if state['child']:
+        user32.ShowWindow(state['child'], 5)
+    update_frame(f)
+    raise_mirror()
+    force_foreground(f)
 
 
 def show_menu(hwnd):
@@ -1129,14 +1173,16 @@ def watchdog(hwnd):
 def tray_proc(hwnd, msg, wparam, lparam):
     if msg == WM_APP_RAISE:
         raise_mirror()
-        if state['frame']:
-            user32.SetForegroundWindow(state['frame'])
+        force_foreground(state['frame'])
         return 0
     if msg == WM_TRAY:
         if lparam == 0x0205:
             show_menu(hwnd)
         elif lparam == 0x0202:
-            toggle_mirror()
+            now = time.time()
+            if now - state['tray_click_ts'] >= TRAY_CLICK_GUARD:
+                state['tray_click_ts'] = now
+                toggle_mirror()
         return 0
     if msg == 0x0111:
         mid = wparam & 0xFFFF
