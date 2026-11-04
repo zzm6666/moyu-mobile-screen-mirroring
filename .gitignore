@@ -1,0 +1,17 @@
+# 构建产物与二进制依赖不入库（源仓库只留可读代码/配置/脚本）
+tools/build/
+tools/dist/
+tools/__pycache__/
+tools/scrcpy-win64-*/
+tools/backups/
+tools/魔芋/
+tools/魔芋.exe
+tools/*.zip
+
+# 运行日志与调试截图
+tools/*.log
+tools/*.png
+tools/.verify/
+
+# PyInstaller 中间文件
+*.spec.bak
