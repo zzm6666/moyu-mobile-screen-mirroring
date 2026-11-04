@@ -5,7 +5,7 @@ a = Analysis(
     ['mirror_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('app.ico', '.')],
+    datas=[('app.ico', '.'), ('app_icon.png', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

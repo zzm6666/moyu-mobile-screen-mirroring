@@ -19,7 +19,8 @@ import sys
 import threading
 import time
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageGrab
+from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont,
+                 ImageGrab)
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -41,15 +42,17 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 232)  # 毛玻璃竖向渐变（上）
-TINT_BOTTOM = (246, 248, 251, 216)  # 毛玻璃竖向渐变（下）
+TINT_TOP = (255, 255, 255, 198)  # 毛玻璃竖向渐变（上）：透明度降下来，透出背后的模糊色块
+TINT_BOTTOM = (238, 243, 251, 164)  # 毛玻璃竖向渐变（下）：越往下越透，形成玻璃厚度感
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (146, 149, 158, 255)  # 关闭 × 默认浅色
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
-BRAND_COLOR = (62, 176, 158, 255)  # 左上角简约鱼形标记
 MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
-BLUR_RADIUS = 24  # 毛玻璃背景模糊半径
+BLUR_RADIUS = 34  # 毛玻璃背景模糊半径（比操作栏高度还大，糊得更彻底）
+ICON_SIZE = 20  # 操作栏左侧应用图标边长
+ICON_LEFT = 9  # 图标左边距
+SATURATION = 1.35  # 背景饱和度增益：毛玻璃透出的颜色更"活"
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -105,6 +108,8 @@ SCRCPY_DIR = os.path.join(BASE, 'scrcpy-win64-v5.0.1')
 ADB = os.path.join(SCRCPY_DIR, 'adb.exe')
 SCRCPY = os.path.join(SCRCPY_DIR, 'scrcpy.exe')
 ICO = os.path.join(getattr(sys, '_MEIPASS', BASE), 'app.ico')
+# 操作栏里贴的应用图标（圆形，圆外透明）；app.ico 供托盘与 exe 资源使用
+APP_ICON = os.path.join(getattr(sys, '_MEIPASS', BASE), 'app_icon.png')
 
 
 def log(msg):
@@ -116,6 +121,25 @@ def log(msg):
 
 
 log('--- start, BASE=%s frozen=%s' % (BASE, getattr(sys, 'frozen', False)))
+
+_ICON_CACHE = {}
+
+
+def app_icon(size):
+    """操作栏用的圆形应用图标（按边长缓存；读不到时退化为全透明）。"""
+    size = max(1, int(size))
+    hit = _ICON_CACHE.get(size)
+    if hit is not None:
+        return hit
+    try:
+        im = Image.open(APP_ICON).convert('RGBA')
+        if im.size != (size, size):
+            im = im.resize((size, size), Image.LANCZOS)
+    except Exception:
+        im = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    _ICON_CACHE[size] = im
+    return im
+
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
@@ -209,6 +233,33 @@ class NOTIFYICONDATAW(ctypes.Structure):
         ('uVersion', wt.UINT), ('szInfoTitle', wt.WCHAR * 64), ('dwInfoFlags', wt.DWORD),
         ('guidItem', GUID), ('hBalloonIcon', wt.HICON),
     ]
+
+
+class NOTIFYICONIDENTIFIER(ctypes.Structure):
+    """Shell_NotifyIconGetRect 的入参：定位托盘图标矩形（诊断/点击命中用）。"""
+    _fields_ = [
+        ('cbSize', wt.DWORD), ('hWnd', wt.HWND), ('uID', wt.UINT),
+        ('guidItem', ctypes.c_uint32 * 4),
+    ]
+
+
+def tray_icon_rect(hwnd, uid=1):
+    """返回托盘图标在屏幕上的矩形；图标被收进溢出面板时返回 None。"""
+    try:
+        shell32.Shell_NotifyIconGetRect.argtypes = [
+            ctypes.POINTER(NOTIFYICONIDENTIFIER), ctypes.POINTER(RECT)]
+        shell32.Shell_NotifyIconGetRect.restype = ctypes.c_long
+    except Exception:
+        return None
+    nii = NOTIFYICONIDENTIFIER()
+    nii.cbSize = ctypes.sizeof(NOTIFYICONIDENTIFIER)
+    nii.hWnd = hwnd
+    nii.uID = uid
+    rc = RECT()
+    hr = shell32.Shell_NotifyIconGetRect(ctypes.byref(nii), ctypes.byref(rc))
+    if hr != 0:
+        return None
+    return rc
 
 
 user32.FindWindowW.argtypes = [wt.LPCWSTR, wt.LPCWSTR]
@@ -361,6 +412,7 @@ state = {
     'orient': None, 'user_moved': False, 'region_key': None,
     'resizing': False, 'resize_hit': 0, 'resize_pt': (0, 0), 'resize_rect': (0, 0, 0, 0),
     'blur': None, 'blur_key': None, 'blur_ts': 0.0, 'moving': False,
+    'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
 }
 
@@ -370,8 +422,15 @@ def target_hwnd():
 
 
 def mirror_visible():
+    """窗口是否真的「在用户眼前」：可见且是最前台。
+
+    只判断 IsWindowVisible 会把「被别的窗口盖住」也算作显示状态，导致托盘菜单
+    文案与实际行为对不上（菜单写「隐藏投屏」，点下去却是把它提到前面）。
+    """
     f = state['frame']
-    return bool(f) and bool(user32.IsWindowVisible(f))
+    if not f or not user32.IsWindowVisible(f):
+        return False
+    return user32.GetForegroundWindow() in (f, state['child'])
 
 
 def has_audio_device():
@@ -566,7 +625,11 @@ def capture_blur(hwnd):
     if W <= 0 or H <= 0:
         return None
     img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
-    return img.convert('RGB').filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
+    img = img.convert('RGB').filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
+    # 把透出来的颜色调鲜艳、提亮一点（相当于 Windows 亚克力的亮度层），
+    # 否则隔着半透明 tint 看就是一片灰白，不像玻璃
+    img = ImageEnhance.Color(img).enhance(SATURATION)
+    return ImageEnhance.Brightness(img).enhance(1.12)
 
 
 def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
@@ -601,21 +664,18 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))
     d = ImageDraw.Draw(ui)
     d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 120), width=SS)  # 顶部玻璃高光
+    # 底部内侧高光：把操作栏与视频的接缝压成一条亮线，看起来是一体式玻璃面板
+    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 82), width=SS)
 
-    # 左上角简约鱼形标记（呼应「手摸鱼」图标）：尾巴左侧压进鱼身，连成一体
-    ax, acy = 12 * SS, sH // 2
-    d.polygon([(ax + 9 * SS, acy - 5 * SS), (ax + 19 * SS, acy - 6 * SS),
-               (ax + 19 * SS, acy + 6 * SS), (ax + 9 * SS, acy + 5 * SS)],
-              fill=BRAND_COLOR)
-    d.ellipse([ax, acy - 5 * SS, ax + 13 * SS, acy + 5 * SS], fill=BRAND_COLOR)
-    d.ellipse([ax + 3 * SS, acy - 2 * SS, ax + 4.5 * SS, acy - 0.5 * SS],
-              fill=(255, 255, 255, 235))
+    # 左上角：应用图标（圆形，圆外透明），替代原先手绘的鱼形标记
+    isz = ICON_SIZE * SS
+    ui.alpha_composite(app_icon(isz), (ICON_LEFT * SS, (sH - isz) // 2))
 
     # 标题：垂直居中
     f_title = _font(12 * SS)
     bb = d.textbbox((0, 0), APP_NAME, font=f_title)
     ty = (sH - (bb[3] - bb[1])) // 2 - bb[1]
-    d.text((34 * SS, ty), APP_NAME, font=f_title, fill=TEXT_COLOR)
+    d.text(((ICON_LEFT + ICON_SIZE + 9) * SS, ty), APP_NAME, font=f_title, fill=TEXT_COLOR)
 
     # 关闭 ×：自绘圆头细线，hover 仅变深，不加红底
     cx, cy = sW - (CLOSE_W * SS) // 2, sH // 2
@@ -831,7 +891,7 @@ def remove_mouse_hook():
         state['hook'] = None
 
 
-def update_frame(hwnd):
+def update_frame(hwnd, force=False):
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
     W = r.right - r.left
@@ -840,6 +900,16 @@ def update_frame(hwnd):
         return
     vx, vy, vw, vh = calc_video_rect(W, H)
     state['video_rect'] = (vx, vy, vw, vh)
+    # 视频窗口必须最先跟随，绝不能排在操作栏渲染之后：拖动的每一帧里 frame 由系统
+    # 立即挪走，视频窗口却要等这一整段（PIL 渲染 ~12ms + 预乘 2ms + 提交）跑完才跟上，
+    # 于是肉眼看到操作栏和视频「脱节」。先把它挪到位，再慢慢画操作栏。
+    position_scrcpy(vx, vy, vw, vh)
+    apply_child_round_region(vw, vh)
+    size = (W, H)
+    # 纯位移（拖动）时分层窗口的内容与位置无关：尺寸没变就不用重画操作栏，
+    # 否则每一次 WM_WINDOWPOSCHANGED 都要白跑十几毫秒，反过来又把视频拖后。
+    if not force and state['moving'] and state['drawn_size'] == size:
+        return
     key = (r.left, r.top, W, H)
     now = time.time()
     blur_bg = None
@@ -855,8 +925,7 @@ def update_frame(hwnd):
     img = build_frame_image(W, H, vx, vy, vw, vh, blur_bg)
     raw = premultiply(img).tobytes('raw', 'BGRA')
     draw_layered(hwnd, W, H, raw)
-    position_scrcpy(vx, vy, vw, vh)
-    apply_child_round_region(vw, vh)
+    state['drawn_size'] = size
 
 
 def in_close_button(hwnd, lparam):
@@ -1036,6 +1105,16 @@ def frame_proc(hwnd, msg, wparam, lparam):
         if in_close_button(hwnd, lparam):
             hide_mirror()
         return 0
+    if msg == 0x0216:  # WM_MOVING：系统拖动中，lparam 指向「即将移到」的矩形
+        # 必须在 frame 真正被挪走之前把视频窗口放到同一位置，两者才会在同一帧里
+        # 一起动；等 WM_WINDOWPOSCHANGED 再补就已经晚一步，看起来就是「脱节」。
+        rc = ctypes.cast(lparam, ctypes.POINTER(RECT)).contents
+        vx, vy, vw, vh = calc_video_rect(rc.right - rc.left, rc.bottom - rc.top)
+        ch = state['child']
+        if ch and user32.IsWindow(ch):
+            user32.SetWindowPos(ch, hwnd, rc.left + vx, rc.top + vy, vw, vh,
+                                SWP_NOACTIVATE)
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0047 or msg == 0x0005:  # WM_WINDOWPOSCHANGED / WM_SIZE
         update_frame(hwnd)
         return 0
@@ -1054,13 +1133,23 @@ def hide_mirror():
 
 
 def toggle_mirror():
+    """托盘左键：保证「点一下=看到窗口」。
+
+    只要窗口当前不在最前（被隐藏 / 被别的窗口盖住 / 没焦点），这一次点击就一律
+    按「显示并置前」处理；只有当它已经是最前台窗口时才收起。否则会出现「窗口其
+    实还开着、只是被盖住」→ 点一下反而收起、必须再点一次才出来的错觉。
+    """
     f = state['frame']
     if not f:
         return
-    if user32.IsWindowVisible(f):
+    visible = user32.IsWindowVisible(f)
+    fg = user32.GetForegroundWindow()
+    on_top = bool(visible) and fg in (f, state['child'])
+    if on_top:
         user32.ShowWindow(f, 0)
         if state['child']:
             user32.ShowWindow(state['child'], 0)
+        log('toggle: hide (was front)')
         return
     # 显示：先把两个窗口放出来，再重绘、提到最前、抢前台，缺一步都会「看起来没反应」
     user32.ShowWindow(f, 5)
@@ -1069,6 +1158,8 @@ def toggle_mirror():
     update_frame(f)
     raise_mirror()
     force_foreground(f)
+    log('toggle: show (visible=%s fg=%s) -> visible=%s front=%s'
+        % (visible, fg, user32.IsWindowVisible(f), user32.GetForegroundWindow() == f))
 
 
 def show_menu(hwnd):
@@ -1131,8 +1222,12 @@ def watchdog(hwnd):
         if t:
             ex = user32.GetWindowLongW(t, -20)
             user32.SetWindowLongW(t, -20, ex | 0x08000000)  # WS_EX_NOACTIVATE，避免抢焦点
-            val = ctypes.c_int(2)
-            dwmapi.DwmSetWindowAttribute(t, 33, ctypes.byref(val), 4)  # 圆角
+            # Windows 11 默认会把顶层窗口四角磨圆（DWMWCP_ROUND=2）。视频窗口一旦被
+            # 磨圆，上沿两角就会从操作栏底下露出桌面，形成一道「缝隙」。这里显式关掉
+            # 系统圆角（DWMWCP_DONOTROUND=1），形状完全交给 SetWindowRgn 决定：
+            # 上沿直角紧贴操作栏，只有下面两角是圆的。
+            no_round = ctypes.c_int(1)
+            dwmapi.DwmSetWindowAttribute(t, 33, ctypes.byref(no_round), 4)
             state['child'] = t
             r = RECT()
             user32.GetWindowRect(t, ctypes.byref(r))
@@ -1176,13 +1271,20 @@ def tray_proc(hwnd, msg, wparam, lparam):
         force_foreground(state['frame'])
         return 0
     if msg == WM_TRAY:
-        if lparam == 0x0205:
+        evt = lparam & 0xFFFF  # 兼容 NOTIFYICON_VERSION_4（事件在 LOWORD，图标 id 在 HIWORD）
+        if evt == 0x0205:
             show_menu(hwnd)
-        elif lparam == 0x0202:
+        elif evt == 0x0202:
             now = time.time()
-            if now - state['tray_click_ts'] >= TRAY_CLICK_GUARD:
+            gap = now - state['tray_click_ts']
+            if gap >= TRAY_CLICK_GUARD:
                 state['tray_click_ts'] = now
+                log('tray: click lparam=0x%08x visible=%s gap=%.2fs -> toggle'
+                    % (lparam, user32.IsWindowVisible(state['frame'] or 0), gap))
                 toggle_mirror()
+            else:
+                log('tray: click lparam=0x%08x ignored by guard gap=%.2fs'
+                    % (lparam, gap))
         return 0
     if msg == 0x0111:
         mid = wparam & 0xFFFF
@@ -1241,6 +1343,13 @@ def main():
     nid.szTip = APP_NAME
     shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
     log('main: notifyicon=%s hicon=%s' % (hicon, bool(hicon)))
+    trc = tray_icon_rect(state['tray'])
+    if trc is not None:
+        log('main: tray icon rect=(%d,%d)-(%d,%d) %s'
+            % (trc.left, trc.top, trc.right, trc.bottom,
+               'in-overflow' if trc.top < 100 else 'pinned'))
+    else:
+        log('main: tray icon rect unknown (not created yet)')
     user32.SetTimer(state['tray'], 1, 1000, None)
 
     register(CLASS_FRAME, frame_proc)
@@ -1249,6 +1358,9 @@ def main():
     state['frame'] = user32.CreateWindowExW(
         0x00080000 | 0x00000080, CLASS_FRAME, '', 0x80000000,
         CFG['x'], CFG['y'], fw, fh, None, None, hinst, None)
+    # 外框用分层窗口逐像素 alpha 自己画圆角，关掉系统圆角避免叠加出毛边
+    no_round = ctypes.c_int(1)
+    dwmapi.DwmSetWindowAttribute(state['frame'], 33, ctypes.byref(no_round), 4)
     move_to_bottom_right()
     update_frame(state['frame'])
     user32.ShowWindow(state['frame'], 5)
