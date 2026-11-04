@@ -20,7 +20,7 @@ import threading
 import time
 
 from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont,
-                 ImageGrab)
+                 ImageGrab, ImageStat)
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -29,12 +29,14 @@ CLASS_FRAME = 'CapyMirrorFrame'
 TOOLBAR_H = 38
 FRAME = 0  # 视频洞与外框的内边距（0=视频直接贴边，无间隙）
 RESIZE_EDGE = 4  # 窗口边缘的缩放热区宽度（独立于 FRAME，用于拖拽缩放）
+EDGE_GRAB = 6  # 全局钩子判定「抓边缩放」的带宽：比 RESIZE_EDGE 宽一点更好抓
 CLOSE_W = 44
 MIN_VIDEO = 180  # 视频区短边下限（缩放时保比例的下限）
 NIM_ADD, NIM_DELETE = 0, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 WM_TRAY = 0x8001
 WM_APP_RAISE = 0x8002  # 点击视频区时请求整体置前
+TIMER_RESIZE = 3  # 缩放期间的轮询定时器（鼠标压在视频区上时收不到 WM_MOUSEMOVE）
 ID_TOGGLE = 1001
 ID_EXIT = 1002
 CREATE_NO_WINDOW = 0x08000000
@@ -42,17 +44,24 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 198)  # 毛玻璃竖向渐变（上）：透明度降下来，透出背后的模糊色块
-TINT_BOTTOM = (238, 243, 251, 164)  # 毛玻璃竖向渐变（下）：越往下越透，形成玻璃厚度感
+TINT_TOP = (255, 255, 255, 120)  # 毛玻璃竖向渐变（上）：透出背后的模糊色块
+TINT_BOTTOM = (238, 243, 251, 96)  # 毛玻璃竖向渐变（下）：越往下越透，形成玻璃厚度感
+# 深色背景用深色玻璃：白玻璃压在暗底上会把背后糊成一整片均匀灰，反而看不出玻璃
+TINT_TOP_DARK = (22, 24, 30, 88)
+TINT_BOTTOM_DARK = (12, 14, 20, 64)
 TEXT_COLOR = (56, 58, 66, 255)
+TEXT_COLOR_DARK = (244, 247, 252, 255)
 CLOSE_X_COLOR = (146, 149, 158, 255)  # 关闭 × 默认浅色
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
+CLOSE_X_COLOR_DARK = (196, 200, 210, 255)
+CLOSE_X_HOVER_DARK = (255, 255, 255, 255)
 MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
-BLUR_RADIUS = 34  # 毛玻璃背景模糊半径（比操作栏高度还大，糊得更彻底）
+BLUR_RADIUS = 12  # 毛玻璃背景模糊半径：太大（34）会把背后内容糊成一片灰，看不出玻璃
 ICON_SIZE = 20  # 操作栏左侧应用图标边长
 ICON_LEFT = 9  # 图标左边距
-SATURATION = 1.35  # 背景饱和度增益：毛玻璃透出的颜色更"活"
+SATURATION = 1.6  # 背景饱和度增益：毛玻璃透出的颜色更"活"
+GRAIN = 6  # 操作栏颗粒感强度（亚克力噪点，sigma），0 关闭
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -289,6 +298,10 @@ user32.BringWindowToTop.argtypes = [wt.HWND]
 user32.BringWindowToTop.restype = wt.BOOL
 user32.SetTimer.argtypes = [wt.HWND, ctypes.c_size_t, wt.UINT, ctypes.c_void_p]
 user32.SetTimer.restype = ctypes.c_size_t
+user32.KillTimer.argtypes = [wt.HWND, ctypes.c_size_t]
+user32.KillTimer.restype = wt.BOOL
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                    wt.HWND, wt.HMENU, wt.HINSTANCE, ctypes.c_void_p]
@@ -414,6 +427,7 @@ state = {
     'blur': None, 'blur_key': None, 'blur_ts': 0.0, 'moving': False,
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
+    'bar_dark': False,  # 操作栏背后是深色底 → 用深色玻璃 tint
 }
 
 
@@ -572,6 +586,39 @@ def lock_aspect(l, t, r, b, hit, aspect, min_video=MIN_VIDEO):
     return l, t, r, b
 
 
+def rect_edge_hit(r, x, y, grab=EDGE_GRAB):
+    """屏幕点 (x, y) 落在外框矩形 r 的哪条抓边：返回 10-17（同 WM_NCHITTEST），否则 0。
+
+    视频区被 scrcpy 子窗口整块覆盖，frame 根本收不到那些点的 WM_NCHITTEST，
+    所以边缘缩放改由全局鼠标钩子用这个纯函数判断。
+    """
+    if r is None:
+        return 0
+    if not (r.left <= x < r.right and r.top <= y < r.bottom):
+        return 0
+    left = x < r.left + grab
+    right = x >= r.right - grab
+    top = y < r.top + grab
+    bottom = y >= r.bottom - grab
+    if left and top:
+        return 13
+    if right and top:
+        return 14
+    if left and bottom:
+        return 16
+    if right and bottom:
+        return 17
+    if left:
+        return 10
+    if right:
+        return 11
+    if top:
+        return 12
+    if bottom:
+        return 15
+    return 0
+
+
 def clamp_radius(w, h, r):
     """圆角半径不许超过短边一半，否则 CreateRoundRectRgn 画出畸形区域。"""
     if w <= 0 or h <= 0:
@@ -616,16 +663,46 @@ def premultiply(img):
                                 ImageChops.multiply(b, a), a))
 
 
+def blank_layered(hwnd, W, H):
+    """把分层窗口刷成全透明：让窗口在画面上「让开」，好让桌面的真实内容露出来。"""
+    draw_layered(hwnd, W, H, bytes(W * H * 4))
+
+
 def capture_blur(hwnd):
-    """截取窗口背后内容并高斯模糊，模拟毛玻璃背景。不隐藏窗口，避免拖动闪烁打断。"""
+    """截取操作栏背后**真实的桌面内容**并模糊，作为毛玻璃底。
+
+    不能直接 Grad 当前屏幕 —— 此时本窗口正是可见状态，截到的是自己刚画的那条
+    操作栏，模糊之后永远是一片均匀的浅色，看起来「根本没有毛玻璃」（实测条带
+    内 RGB 标准差只有 5~9，而真实背景在 40+）。所以先把窗口刷成全透明、
+    等合成器吐一帧，再只截操作栏那一条；update_frame 随后会立刻重画回来。
+    """
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
     W = r.right - r.left
     H = r.bottom - r.top
     if W <= 0 or H <= 0:
         return None
-    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.bottom))
-    img = img.convert('RGB').filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
+    th = max(1, min(TOOLBAR_H, H))
+    blank_layered(hwnd, W, H)
+    try:
+        dwmapi.DwmFlush()
+    except Exception:
+        pass
+    # 关窗后合成器需要一小段时间才真正把透明帧刷到屏幕上，
+    # 不等这一下偶尔会截到「上一帧的自己」（条带标准差 0）
+    time.sleep(0.012)
+    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.top + th), all_screens=True)
+    img = img.convert('RGB')
+    # 背景亮暗决定玻璃是白玻璃还是深色玻璃（自适应，和 Windows 亚克力一致）
+    st = ImageStat.Stat(img)
+    lum = 0.299 * st.mean[0] + 0.587 * st.mean[1] + 0.114 * st.mean[2]
+    state['bar_dark'] = lum < 128
+    try:
+        log('blur: strip %dx%d stddev=%.1f lum=%.1f dark=%s'
+            % (img.width, img.height, st.stddev[0], lum, state['bar_dark']))
+    except Exception:
+        pass
+    img = img.filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
     # 把透出来的颜色调鲜艳、提亮一点（相当于 Windows 亚克力的亮度层），
     # 否则隔着半透明 tint 看就是一片灰白，不像玻璃
     img = ImageEnhance.Color(img).enhance(SATURATION)
@@ -640,20 +717,25 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     th = min(TOOLBAR_H, H)
     sW, sH = W * SS, th * SS
 
-    # 背景：模糊后的屏幕内容（毛玻璃底）
+    # 背景：模糊后的屏幕内容（毛玻璃底）。capture_blur 现在只截操作栏那一条，
+    # 高度就等于 th；老缓存若是整窗高度，也只取顶部 th 行。
     if blur_bg is not None:
         bg = blur_bg.convert('RGBA')
-        if bg.size != (W, H):
-            bg = bg.resize((W, H), Image.LANCZOS)
-        bg = bg.crop((0, 0, W, th)).resize((sW, sH), Image.LANCZOS)
+        if bg.size[1] != th:
+            bg = bg.crop((0, 0, min(bg.size[0], W), min(bg.size[1], th)))
+        if bg.size != (W, th):
+            bg = bg.resize((W, th), Image.LANCZOS)
+        bg = bg.resize((sW, sH), Image.LANCZOS)
     else:
         bg = Image.new('RGBA', (sW, sH), (248, 249, 252, 255))
 
-    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感
+    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感；底色暗时换深色玻璃
+    dark = bool(state.get('bar_dark'))
+    top_c, bot_c = (TINT_TOP_DARK, TINT_BOTTOM_DARK) if dark else (TINT_TOP, TINT_BOTTOM)
     rows = []
     for y in range(sH):
         t = y / max(1, sH - 1)
-        rows.append(tuple(int(TINT_TOP[i] + (TINT_BOTTOM[i] - TINT_TOP[i]) * t)
+        rows.append(tuple(int(top_c[i] + (bot_c[i] - top_c[i]) * t)
                           for i in range(4)))
     grad = Image.new('RGBA', (1, sH))
     grad.putdata(rows)
@@ -663,9 +745,11 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     # UI 图层（独立图层再合成，保证半透明像素正确）
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))
     d = ImageDraw.Draw(ui)
-    d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 120), width=SS)  # 顶部玻璃高光
+    d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 110 if dark else 120),
+           width=SS)  # 顶部玻璃高光
     # 底部内侧高光：把操作栏与视频的接缝压成一条亮线，看起来是一体式玻璃面板
-    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 82), width=SS)
+    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 60 if dark else 82),
+           width=SS)
 
     # 左上角：应用图标（圆形，圆外透明），替代原先手绘的鱼形标记
     isz = ICON_SIZE * SS
@@ -675,12 +759,16 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     f_title = _font(12 * SS)
     bb = d.textbbox((0, 0), APP_NAME, font=f_title)
     ty = (sH - (bb[3] - bb[1])) // 2 - bb[1]
-    d.text(((ICON_LEFT + ICON_SIZE + 9) * SS, ty), APP_NAME, font=f_title, fill=TEXT_COLOR)
+    d.text(((ICON_LEFT + ICON_SIZE + 9) * SS, ty), APP_NAME, font=f_title,
+           fill=TEXT_COLOR_DARK if dark else TEXT_COLOR)
 
     # 关闭 ×：自绘圆头细线，hover 仅变深，不加红底
     cx, cy = sW - (CLOSE_W * SS) // 2, sH // 2
     half, lw = 6 * SS, 2 * SS
-    x_color = CLOSE_X_HOVER if state['close_hover'] else CLOSE_X_COLOR
+    if dark:
+        x_color = CLOSE_X_HOVER_DARK if state['close_hover'] else CLOSE_X_COLOR_DARK
+    else:
+        x_color = CLOSE_X_HOVER if state['close_hover'] else CLOSE_X_COLOR
     d.line([(cx - half, cy - half), (cx + half, cy + half)], fill=x_color, width=lw)
     d.line([(cx + half, cy - half), (cx - half, cy + half)], fill=x_color, width=lw)
     rad = lw // 2
@@ -699,6 +787,12 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
 
     bar = bar.resize((W, th), Image.LANCZOS)
     bar.putalpha(ImageChops.multiply(bar.getchannel('A'), mask))
+    # 颗粒感（亚克力材质的关键）：真实毛玻璃/亚克力都有细噪点，纯色块永远不像玻璃
+    if GRAIN > 0:
+        g = Image.effect_noise((W, th), GRAIN).convert('L')
+        rgb = ImageChops.add(bar.convert('RGB'), Image.merge('RGB', (g, g, g)), 1.0, -128)
+        bar = Image.merge('RGBA', (rgb.getchannel('R'), rgb.getchannel('G'),
+                                   rgb.getchannel('B'), bar.getchannel('A')))
     # 强制底边完全不透明，与视频区严丝合缝
     a = bar.getchannel('A')
     ImageDraw.Draw(a).line([(0, th - 1), (W, th - 1)], fill=255)
@@ -857,22 +951,64 @@ def raise_mirror():
     sync_child_zorder()
 
 
-def mouse_hook_proc(n_code, wparam, lparam):
-    """全局低级鼠标钩子：点在魔芋任意区域（含视频区）时请求整体置前。
+CURSOR_FOR_HIT = {10: 32644, 11: 32644, 12: 32645, 15: 32645,
+                  13: 32642, 14: 32643, 16: 32643, 17: 32642}
 
-    视频区是 layered 窗口的 alpha=0 区域，鼠标会穿透到 scrcpy 窗口，
-    而 scrcpy 带 WS_EX_NOACTIVATE 不会激活 frame —— 这里补上这个激活路径。
+
+def _inside_frame(pt, f):
+    """屏幕点是否在 frame 外框内，并给出它属于哪条抓边（0=不是抓边）。"""
+    r = RECT()
+    user32.GetWindowRect(f, ctypes.byref(r))
+    if not (r.left <= pt.x < r.right and r.top <= pt.y < r.bottom):
+        return False, 0
+    return True, rect_edge_hit(r, pt.x, pt.y)
+
+
+def _owns_point(pt, f):
+    """该点当前是否由本程序接收（而不是被别的窗口盖住）。"""
+    ch = state['child']
+    if user32.WindowFromPoint(pt) in (f, ch):
+        return True
+    # 圆角/视频区是 alpha=0 的全透明像素，命中的会是底下别的窗口；此时只要
+    # 自己就是前台窗口，就认为这一下确实点在我们身上。
+    return user32.GetForegroundWindow() in (f, ch)
+
+
+def mouse_hook_proc(n_code, wparam, lparam):
+    """全局低级鼠标钩子：抓边缩放 + 点在魔芋任意区域时请求整体置前。
+
+    视频区是 layered 窗口的 alpha=0 区域，鼠标会穿透到 scrcpy 窗口，而 scrcpy 带
+    WS_EX_NOACTIVATE 不会激活 frame —— 这里补上这条激活路径。同时 scrcpy 子窗口
+    整块盖住了 frame 的左/右/下三条边，窗口自己根本收不到那几个点的
+    WM_NCHITTEST，所以四边四角的缩放也挪到这个钩子里判断和驱动。
     """
     try:
-        if n_code >= 0 and wparam in (0x0201, 0x0204):  # 左/右键按下
+        if n_code >= 0:
             f = state['frame']
             if f and user32.IsWindowVisible(f):
-                pt = POINT()
-                user32.GetCursorPos(ctypes.byref(pt))
-                r = RECT()
-                user32.GetWindowRect(f, ctypes.byref(r))
-                if r.left <= pt.x < r.right and r.top <= pt.y < r.bottom:
-                    user32.PostMessageW(state['tray'], WM_APP_RAISE, 0, 0)
+                if state['resizing']:
+                    if wparam == 0x0202:  # 松手：收尾，重排视频/重截毛玻璃交给窗口消息
+                        end_resize()
+                        user32.PostMessageW(f, 0x0232, 0, 0)  # WM_EXITSIZEMOVE
+                    elif wparam == 0x0200:  # 拖拽中：钩子驱动缩放
+                        do_resize(f)
+                    return 1
+                if wparam in (0x0201, 0x0204):  # 左/右键按下
+                    pt = POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    inside, hit = _inside_frame(pt, f)
+                    if inside and hit and _owns_point(pt, f):
+                        user32.SetForegroundWindow(f)
+                        start_resize(f, hit)
+                        return 1
+                    if inside:
+                        user32.PostMessageW(state['tray'], WM_APP_RAISE, 0, 0)
+                elif wparam == 0x0200:  # 悬停在抓边上时给出缩放光标
+                    pt = POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    inside, hit = _inside_frame(pt, f)
+                    if inside and hit and _owns_point(pt, f):
+                        user32.SetCursor(user32.LoadCursorW(None, CURSOR_FOR_HIT[hit]))
     except Exception:
         pass
     return user32.CallNextHookEx(None, n_code, wparam, lparam)
@@ -967,10 +1103,7 @@ def frame_hittest(hwnd, lparam):
     user32.GetClientRect(hwnd, ctypes.byref(r))
     cx, cy = pt.x, pt.y
     W, H = r.right, r.bottom
-    if cy < TOOLBAR_H:
-        if cx >= W - CLOSE_W:
-            return 1  # HTCLIENT（关闭按钮）
-        return 2  # HTCAPTION（拖动）
+    # 边缘判断必须在操作栏之前：否则操作栏上的上/左/右三条边永远只能拖动、不能缩放
     left = cx < RESIZE_EDGE
     right = cx > W - RESIZE_EDGE
     top = cy < RESIZE_EDGE
@@ -991,10 +1124,16 @@ def frame_hittest(hwnd, lparam):
         return 12
     if bottom:
         return 15
+    if cy < TOOLBAR_H:
+        if cx >= W - CLOSE_W:
+            return 1  # HTCLIENT（关闭按钮）
+        return 2  # HTCAPTION（拖动）
     return 1
 
 
 def start_resize(hwnd, hit):
+    log('resize start hit=%d' % hit)
+    state['resize_log'] = 0
     user32.SetCapture(hwnd)
     state['resizing'] = True
     state['moving'] = True
@@ -1006,6 +1145,18 @@ def start_resize(hwnd, hit):
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
     state['resize_rect'] = (r.left, r.top, r.right, r.bottom)
+    # 用定时器轮询光标驱动缩放：鼠标压在被 scrcpy 覆盖的视频区上时，frame 拿不到
+    # WM_MOUSEMOVE（SetCapture 也救不回来），只有轮询才是稳的。
+    user32.SetTimer(hwnd, TIMER_RESIZE, 10, None)
+
+
+def button_down():
+    """左键当前是否仍然按着（0x8000 = 按下）。
+
+    注意：钩子吞掉按下事件后系统不会把按键状态置为按下，这个函数只在
+    「按键事件没被吞掉」的路径下可信，缩放收尾仍以钩子的抬键事件为准。
+    """
+    return bool(user32.GetAsyncKeyState(0x01) & 0x8000)
 
 
 def do_resize(hwnd):
@@ -1015,6 +1166,7 @@ def do_resize(hwnd):
     dy = pt.y - state['resize_pt'][1]
     l, t, r, b = state['resize_rect']
     hit = state['resize_hit']
+    aspect = state.get('aspect') or 1.0
     if hit in (10, 13, 16):
         l += dx
     if hit in (11, 14, 17):
@@ -1034,13 +1186,36 @@ def do_resize(hwnd):
             t = b - min_h
         else:
             b = t + min_h
+    # 不许缩放到屏幕外：被拖动的那条边是锚点，对边向工作区内收
+    wa_h_px, wa_w_px = wa_h(), wa_w()
+    max_w = (r if hit in (10, 13, 16) else wa_w_px - l)
+    max_h = (b if hit in (12, 13, 14) else wa_h_px - t)
+    if hit in (10, 11, 13, 14, 16, 17):  # 横向：宽驱动高，两者一起受限
+        w_cap = min(max_w, int((max_h - TOOLBAR_H - FRAME) * aspect) + 2 * FRAME)
+        if r - l > w_cap:
+            if hit in (10, 13, 16):
+                l = r - w_cap
+            else:
+                r = l + w_cap
+    else:  # 纵向：高驱动宽
+        h_cap = min(max_h, int((max_w - 2 * FRAME) / aspect) + TOOLBAR_H + FRAME)
+        if b - t > h_cap:
+            if hit in (12, 13, 14):
+                t = b - h_cap
+            else:
+                b = t + h_cap
     # 需求3：视频区恒等于手机宽高比，缩到极限也不出黑边/拉伸
-    aspect = state.get('aspect') or 1.0
     l, t, r, b = lock_aspect(l, t, r, b, hit, aspect)
     user32.SetWindowPos(hwnd, None, l, t, r - l, b - t, 0x0004)  # SWP_NOZORDER
 
 
 def end_resize():
+    r = RECT()
+    user32.GetWindowRect(state['frame'], ctypes.byref(r)) if state['frame'] else None
+    log('resize end hit=%s from=%s to=(%d,%d,%d,%d)'
+        % (state.get('resize_hit'), state.get('resize_rect'), r.left, r.top, r.right, r.bottom))
+    if state['frame']:
+        user32.KillTimer(state['frame'], TIMER_RESIZE)
     state['resizing'] = False
     state['moving'] = False
     user32.ReleaseCapture()
@@ -1079,6 +1254,11 @@ def frame_proc(hwnd, msg, wparam, lparam):
             return 1
         if set_cursor_if_close(hwnd):
             return 1
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+    if msg == 0x0113:  # WM_TIMER：缩放期间轮询光标（视频区上的鼠标移动收不到）
+        if wparam == TIMER_RESIZE and state['resizing']:
+            do_resize(hwnd)
+            return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE
         if state['resizing']:

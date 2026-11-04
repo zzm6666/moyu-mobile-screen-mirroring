@@ -180,5 +180,76 @@ class TestClampRadius(unittest.TestCase):
         self.assertEqual(m.clamp_radius(100, 100, -5), 0)
 
 
+class TestRectEdgeHit(unittest.TestCase):
+    """rect_edge_hit：屏幕点落在窗口外框的哪条抓边上（0 表示不是抓边）。"""
+
+    def setUp(self):
+        self.left, self.top, self.right, self.bottom = 1000, 400, 1260, 1010
+
+    def hit(self, x, y, grab=6):
+        r = m.RECT()
+        r.left, r.top, r.right, r.bottom = self.left, self.top, self.right, self.bottom
+        return m.rect_edge_hit(r, x, y, grab)
+
+    def test_outside_returns_zero(self):
+        self.assertEqual(self.hit(999, 700), 0)
+        self.assertEqual(self.hit(1260, 700), 0)
+        self.assertEqual(self.hit(1100, 399), 0)
+        self.assertEqual(self.hit(1100, 1010), 0)
+
+    def test_left_and_right(self):
+        self.assertEqual(self.hit(1001, 700), 10)
+        self.assertEqual(self.hit(1258, 700), 11)
+
+    def test_top_and_bottom(self):
+        self.assertEqual(self.hit(1100, 401), 12)
+        self.assertEqual(self.hit(1100, 1008), 15)
+
+    def test_corners(self):
+        self.assertEqual(self.hit(1001, 401), 13)
+        self.assertEqual(self.hit(1258, 401), 14)
+        self.assertEqual(self.hit(1001, 1008), 16)
+        self.assertEqual(self.hit(1258, 1008), 17)
+
+    def test_middle_returns_zero(self):
+        self.assertEqual(self.hit(1130, 700), 0)
+
+    def test_custom_grab(self):
+        self.assertEqual(self.hit(1010, 700, grab=4), 0)
+        self.assertEqual(self.hit(1010, 700, grab=12), 10)
+        self.assertEqual(m.rect_edge_hit(None, 0, 0), 0)
+
+
+class TestGlassBar(unittest.TestCase):
+    """build_frame_image：操作栏毛玻璃——底色暗用深色玻璃、底色亮用白玻璃，且始终有颗粒感。"""
+
+    W, H, TH = 259, 610, 38
+
+    def render(self, rgb, dark):
+        from PIL import Image, ImageStat
+        m.state['bar_dark'] = dark
+        m.state['close_hover'] = False
+        bg = Image.new('RGB', (self.W, self.TH), rgb)
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W,
+                                  self.H - self.TH, bg)
+        self.assertEqual(out.size, (self.W, self.H))
+        self.assertEqual(out.mode, 'RGBA')
+        # 只取纯背景区（避开图标/标题/关闭 ×）
+        bar = out.crop((60, 2, self.W - 60, self.TH - 2)).convert('RGB')
+        return ImageStat.Stat(bar)
+
+    def test_dark_backdrop_gives_dark_glass(self):
+        st = self.render((20, 20, 20), True)
+        self.assertLess(sum(st.mean) / 3, 110)
+
+    def test_light_backdrop_gives_light_glass(self):
+        st = self.render((250, 250, 250), False)
+        self.assertGreater(sum(st.mean) / 3, 150)
+
+    def test_flat_backdrop_still_has_grain(self):
+        """纯色背景也必须看起来像磨砂玻璃：颗粒感让标准差不为 0。"""
+        self.assertGreater(min(self.render((120, 120, 120), False).stddev), 0.5)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
