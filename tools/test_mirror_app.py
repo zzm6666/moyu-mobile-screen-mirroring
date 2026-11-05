@@ -249,6 +249,18 @@ class TestEdgeHit(unittest.TestCase):
         self.assertEqual(m.edge_hit(None, 0, 0), 0)
 
 
+class TestPressRaise(unittest.TestCase):
+    """按住操作栏不要请求置前：那会触发 TOPMOST→NOTOPMOST 的 Z 序重排，拖动一开始就闪。"""
+
+    def test_toolbar_press_does_not_raise(self):
+        self.assertFalse(m.press_should_raise(0))
+        self.assertFalse(m.press_should_raise(m.TOOLBAR_H - 1))
+
+    def test_video_area_press_raises(self):
+        self.assertTrue(m.press_should_raise(m.TOOLBAR_H))
+        self.assertTrue(m.press_should_raise(m.TOOLBAR_H + 200))
+
+
 class TestGlassBar(unittest.TestCase):
     """build_frame_image：操作栏是纯「白色半透明」——不截屏、不模糊，直接透出桌面。"""
 
@@ -392,7 +404,7 @@ class TestAdoptAspect(unittest.TestCase):
 
 
 class TestVideoAreaClear(unittest.TestCase):
-    """接缝与右边缘那 1px 用操作栏同色补齐（scrcpy 整数取整会留 1px 底色），其余全透明。"""
+    """视频区只画接缝那 1px 白线，其余全透明（画面由 scrcpy 铺满，含 overscan）。"""
 
     W, H, TH = 259, 610, 38
 
@@ -416,10 +428,16 @@ class TestVideoAreaClear(unittest.TestCase):
         """白线要贯穿整个宽度，不能被右边缘补丁切断。"""
         self.assertEqual(self.image().getpixel((self.W - 1, self.TH))[3], 255)
 
-    def test_right_column_masked_so_width_matches(self):
-        """右边缘也要补齐，否则视频区看起来比操作栏窄 1px。"""
-        self.assertEqual(self.image().getpixel((self.W - 1, self.TH + 50))[3],
-                         m.BAR_TINT[3])
+    def test_right_column_stays_transparent(self):
+        """右边缘不再补色：画面靠 overscan 铺到边，补一条半透明白反而成灰边。"""
+        self.assertEqual(self.image().getpixel((self.W - 1, self.TH + 50))[3], 0)
+
+    def test_overscan_child_box(self):
+        """视频窗口比可见区大 2*overscan 并向上左外扩，把底色/系统边框挤出可见区。"""
+        self.assertEqual(m.OVERSCAN, 2)
+        self.assertEqual(m.child_box(0, 38, 259, 572), (-2, 36, 263, 576))
+        self.assertEqual(m.child_box(0, 38, 259, 572, overscan=0), (0, 38, 259, 572))
+        self.assertEqual(m.child_box(10, 40, 100, 200, overscan=1), (9, 39, 102, 202))
 
     def test_bottom_corner_stays_clear(self):
         """底部圆角区域不能画，否则会在圆角外冒出直角。"""

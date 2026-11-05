@@ -45,6 +45,9 @@ CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
 BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
 SEAM_WHITE = (255, 255, 255, 255)  # 操作栏与画面之间那 1px 分界线：纯白不透明（用户指定）
+OVERSCAN = 2  # 视频窗口比可见区大这么多像素：scrcpy 整数缩放会在自己边上留 1px 底色
+              # （右边/下边），Win11 还会给顶层窗口描 1px 边框。把窗口放大并往左上外扩，
+              # 再用 SetWindowRgn 裁回可见区，这些边就都落到可见区之外 —— 画面正好铺满。
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (152, 157, 166, 255)  # 关闭 × 默认浅灰：白条上要淡，不抢注意力
 CLOSE_X_HOVER = (104, 109, 118, 255)  # 悬停时略变深（仍然轻，无红底）
@@ -676,16 +679,25 @@ def clamp_radius(w, h, r):
     return max(0, min(int(r), min(int(w), int(h)) // 2))
 
 
-def round_region(w, h, r):
+def round_region(w, h, r, inset=0):
     """视频窗口的裁剪区域句柄（SetWindowRgn 成功后系统接管，不要自行删除）。
 
     只圆**下面两角**：上沿紧贴操作栏，必须保持直角才能无缝拼接；把外框顶边
     抬到 -r 处，弧线落在窗口之外，于是上沿自然变直、下沿两角仍是半径 r 的圆角。
+    `inset` 把可见区往窗口内部缩（overscan 时窗口比可见区大），区域因此比窗口小一圈，
+    多出来的那圈就是被裁掉的 scrcpy 底色。
     CreateRoundRectRgn 的椭圆参数是直径，故传 r*2；右/下边界开区间，+1 铺满。
     """
     w, h = int(w), int(h)
     r = clamp_radius(w, h, r)
-    return gdi32.CreateRoundRectRgn(0, -r, w + 1, h + 1, r * 2, r * 2)
+    inset = max(0, int(inset))
+    return gdi32.CreateRoundRectRgn(inset, inset - r, inset + w + 1, inset + h + 1,
+                                    r * 2, r * 2)
+
+
+def child_box(vx, vy, vw, vh, overscan=OVERSCAN):
+    """视频窗口该摆的位置尺寸：可见区往四周各放大 overscan，向上左偏移 overscan。"""
+    return (vx - overscan, vy - overscan, vw + 2 * overscan, vh + 2 * overscan)
 
 
 def apply_child_round_region(vw, vh):
@@ -697,10 +709,10 @@ def apply_child_round_region(vw, vh):
     ch = state['child']
     if not ch or not user32.IsWindow(ch) or vw <= 0 or vh <= 0:
         return
-    key = (int(ch), vw, vh, CORNER_R)
+    key = (int(ch), vw, vh, CORNER_R, OVERSCAN)
     if state.get('region_key') == key:
         return
-    hrgn = round_region(vw, vh, CORNER_R)
+    hrgn = round_region(vw, vh, CORNER_R, OVERSCAN)
     if user32.SetWindowRgn(ch, hrgn, True):
         state['region_key'] = key
     else:
@@ -771,14 +783,11 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     out = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     out.paste(bar, (0, 0))
-    # 接缝那 1px：视频窗口按整数缩放后总会在自己边缘留 1px 底色（scrcpy 清成黑），
-    # 它正好压在操作栏下沿，就是用户看到的那条「黑线」。盖住它的这条线按用户要求用
-    # 纯白不透明（不跟随操作栏的半透明），当成操作栏与画面之间的分界线。
-    # 右侧同理：右边也剩 1px 底色，视频区看起来就比操作栏窄 1px，铺一列同色补齐。
-    # 底部圆角那几行不铺，否则会在圆角之外画出直角。
+    # 接缝那 1px：操作栏与画面之间的分界线，按用户要求纯白不透明。
+    # 右侧/下边不再补色 —— 那 1px 是 scrcpy 自己留的底色，靠 OVERSCAN 把窗口放大一圈
+    # 并裁回可见区解决；在可见区里再铺半透明白只会变成一条灰边。
     if th < H:
         out.paste(SEAM_WHITE, (0, th, W, th + 1))
-        out.paste((255, 255, 255, BAR_TINT[3]), (W - 1, th + 1, W, max(th + 1, H - CORNER_R)))
     return out
 
 
@@ -899,7 +908,8 @@ def position_scrcpy(vx, vy, vw, vh):
     fr = RECT()
     user32.GetWindowRect(f, ctypes.byref(fr))
     # 显式插到 frame 正下方：不用 HWND_TOP，避免 Z 序被其它机制反复打乱
-    user32.SetWindowPos(ch, f, fr.left + vx, fr.top + vy, vw, vh, SWP_NOACTIVATE)
+    bx, by, bw, bh = child_box(vx, vy, vw, vh)
+    user32.SetWindowPos(ch, f, fr.left + bx, fr.top + by, bw, bh, SWP_NOACTIVATE)
     apply_child_round_region(vw, vh)
 
 
@@ -948,6 +958,11 @@ def raise_mirror():
     f = state['frame']
     if not f or not user32.IsWindow(f) or not user32.IsWindowVisible(f):
         return
+    if state['moving'] or state['resizing']:
+        # 拖动/缩放途中重排 Z 序，会让分层窗口与视频窗口重新合成一次 —— 接缝处那一帧
+        # 就会看到白线消失/透出下面，用户报的「拖动时接缝闪」正是这条路径。
+        return
+    log('raise: z bump')
     flags = SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE
     user32.SetWindowPos(f, HWND_TOPMOST, 0, 0, 0, 0, flags)
     user32.SetWindowPos(f, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
@@ -972,13 +987,19 @@ def edge_hit(r, x, y, grab=EDGE_GRAB, toolbar=TOOLBAR_H):
     return rect_edge_hit(r, x, y, grab)
 
 
+def press_should_raise(dy, toolbar=TOOLBAR_H):
+    """按住视频区要请求置前；按住操作栏不请求 —— 那是在拖动窗口，顺带置前会让
+    Z 序抖一下（TOPMOST→NOTOPMOST），拖动一开始就看到接缝处闪。"""
+    return dy >= toolbar
+
+
 def _inside_frame(pt, f):
-    """屏幕点是否在 frame 外框内，并给出它属于哪条抓边（0=不是抓边）。"""
+    """屏幕点是否在 frame 外框内，给出它属于哪条抓边（0=不是抓边）与相对高度。"""
     r = RECT()
     user32.GetWindowRect(f, ctypes.byref(r))
     if not (r.left <= pt.x < r.right and r.top <= pt.y < r.bottom):
-        return False, 0
-    return True, edge_hit(r, pt.x, pt.y)
+        return False, 0, 0
+    return True, edge_hit(r, pt.x, pt.y), pt.y - r.top
 
 
 def _owns_point(pt, f):
@@ -1013,17 +1034,19 @@ def mouse_hook_proc(n_code, wparam, lparam):
                 if wparam in (0x0201, 0x0204):  # 左/右键按下
                     pt = POINT()
                     user32.GetCursorPos(ctypes.byref(pt))
-                    inside, hit = _inside_frame(pt, f)
+                    inside, hit, dy = _inside_frame(pt, f)
                     if inside and hit and _owns_point(pt, f):
                         user32.SetForegroundWindow(f)
                         start_resize(f, hit)
                         return 1
-                    if inside:
+                    if inside and press_should_raise(dy):
+                        # 只有按住视频区才请求置前；按住操作栏是拖动的开始，
+                        # 这时再 TOPMOST→NOTOPMOST 会让接缝闪一下。
                         user32.PostMessageW(state['tray'], WM_APP_RAISE, 0, 0)
                 elif wparam == 0x0200:  # 悬停在抓边上时给出缩放光标
                     pt = POINT()
                     user32.GetCursorPos(ctypes.byref(pt))
-                    inside, hit = _inside_frame(pt, f)
+                    inside, hit, _dy = _inside_frame(pt, f)
                     if inside and hit and _owns_point(pt, f):
                         user32.SetCursor(user32.LoadCursorW(None, CURSOR_FOR_HIT[hit]))
     except Exception:
