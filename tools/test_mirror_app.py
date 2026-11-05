@@ -220,6 +220,35 @@ class TestRectEdgeHit(unittest.TestCase):
         self.assertEqual(m.rect_edge_hit(None, 0, 0), 0)
 
 
+class TestEdgeHit(unittest.TestCase):
+    """edge_hit：操作栏那一条整块只给拖动，整条都不算抓边。"""
+
+    left, top, right, bottom = 1000, 400, 1260, 1010
+
+    def hit(self, x, y, grab=6):
+        r = m.RECT()
+        r.left, r.top, r.right, r.bottom = self.left, self.top, self.right, self.bottom
+        return m.edge_hit(r, x, y, grab)
+
+    def test_toolbar_band_never_resizes(self):
+        # 操作栏高 38：从顶边到倒数一像素都属于拖动区
+        self.assertEqual(self.hit(1001, 401), 0)
+        self.assertEqual(self.hit(1258, 401), 0)
+        self.assertEqual(self.hit(1001, 430), 0)
+        self.assertEqual(self.hit(1001, 437), 0)
+
+    def test_below_toolbar_resizes(self):
+        self.assertEqual(self.hit(1001, 438), 10)
+        self.assertEqual(self.hit(1258, 438), 11)
+        self.assertEqual(self.hit(1001, 1008), 16)
+        self.assertEqual(self.hit(1258, 1008), 17)
+
+    def test_bottom_and_middle(self):
+        self.assertEqual(self.hit(1100, 1008), 15)
+        self.assertEqual(self.hit(1100, 700), 0)
+        self.assertEqual(m.edge_hit(None, 0, 0), 0)
+
+
 class TestGlassBar(unittest.TestCase):
     """build_frame_image：操作栏固定是「白色半透明毛玻璃」——高斯模糊 + 半透明白，无颗粒。"""
 

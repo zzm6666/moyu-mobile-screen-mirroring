@@ -45,8 +45,8 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 176)  # 白色玻璃（上）：暗背景上也要读作「白」，同时透出背后色块
-TINT_BOTTOM = (240, 246, 255, 142)  # 越往下越透，形成玻璃厚度感
+TINT_TOP = (255, 255, 255, 146)  # 白色玻璃（上）：暗背景上也要读作「白」，同时透出背后色块
+TINT_BOTTOM = (240, 246, 255, 112)  # 越往下越透，形成玻璃厚度感
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (104, 108, 118, 255)  # 关闭 × 默认中性灰，白玻璃上要有足够对比
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
@@ -1007,13 +1007,22 @@ CURSOR_FOR_HIT = {10: 32644, 11: 32644, 12: 32645, 15: 32645,
                   13: 32642, 14: 32643, 16: 32643, 17: 32642}
 
 
+def edge_hit(r, x, y, grab=EDGE_GRAB, toolbar=TOOLBAR_H):
+    """抓边判定：操作栏（顶部 toolbar 高那一条）整块只用于拖动，不算抓边。"""
+    if r is None:
+        return 0
+    if y - r.top < toolbar:
+        return 0
+    return rect_edge_hit(r, x, y, grab)
+
+
 def _inside_frame(pt, f):
     """屏幕点是否在 frame 外框内，并给出它属于哪条抓边（0=不是抓边）。"""
     r = RECT()
     user32.GetWindowRect(f, ctypes.byref(r))
     if not (r.left <= pt.x < r.right and r.top <= pt.y < r.bottom):
         return False, 0
-    return True, rect_edge_hit(r, pt.x, pt.y)
+    return True, edge_hit(r, pt.x, pt.y)
 
 
 def _owns_point(pt, f):
@@ -1168,15 +1177,14 @@ def frame_hittest(hwnd, lparam):
     user32.GetClientRect(hwnd, ctypes.byref(r))
     cx, cy = pt.x, pt.y
     W, H = r.right, r.bottom
-    # 边缘判断必须在操作栏之前：否则操作栏上的上/左/右三条边永远只能拖动、不能缩放
+    # 操作栏整条只用于拖动（含关闭按钮），不参与缩放，所以先处理它
+    if cy < TOOLBAR_H:
+        if cx >= W - CLOSE_W:
+            return 1  # HTCLIENT（关闭按钮）
+        return 2  # HTCAPTION（拖动）
     left = cx < RESIZE_EDGE
     right = cx > W - RESIZE_EDGE
-    top = cy < RESIZE_EDGE
     bottom = cy > H - RESIZE_EDGE
-    if left and top:
-        return 13
-    if right and top:
-        return 14
     if left and bottom:
         return 16
     if right and bottom:
@@ -1185,14 +1193,8 @@ def frame_hittest(hwnd, lparam):
         return 10
     if right:
         return 11
-    if top:
-        return 12
     if bottom:
         return 15
-    if cy < TOOLBAR_H:
-        if cx >= W - CLOSE_W:
-            return 1  # HTCLIENT（关闭按钮）
-        return 2  # HTCAPTION（拖动）
     return 1
 
 
