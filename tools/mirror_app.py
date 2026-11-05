@@ -20,7 +20,7 @@ import threading
 import time
 
 from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont,
-                 ImageGrab, ImageStat)
+                 ImageStat)
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -37,6 +37,7 @@ NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 WM_TRAY = 0x8001
 WM_APP_RAISE = 0x8002  # 点击视频区时请求整体置前
 TIMER_RESIZE = 3  # 缩放期间的轮询定时器（鼠标压在视频区上时收不到 WM_MOUSEMOVE）
+TIMER_BLUR = 4  # 拖动/缩放结束后延迟重截毛玻璃背景（立刻重截会让操作栏闪一下）
 ID_TOGGLE = 1001
 ID_EXIT = 1002
 CREATE_NO_WINDOW = 0x08000000
@@ -44,24 +45,18 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 120)  # 毛玻璃竖向渐变（上）：透出背后的模糊色块
-TINT_BOTTOM = (238, 243, 251, 96)  # 毛玻璃竖向渐变（下）：越往下越透，形成玻璃厚度感
-# 深色背景用深色玻璃：白玻璃压在暗底上会把背后糊成一整片均匀灰，反而看不出玻璃
-TINT_TOP_DARK = (22, 24, 30, 88)
-TINT_BOTTOM_DARK = (12, 14, 20, 64)
+TINT_TOP = (255, 255, 255, 176)  # 白色玻璃（上）：暗背景上也要读作「白」，同时透出背后色块
+TINT_BOTTOM = (240, 246, 255, 142)  # 越往下越透，形成玻璃厚度感
 TEXT_COLOR = (56, 58, 66, 255)
-TEXT_COLOR_DARK = (244, 247, 252, 255)
-CLOSE_X_COLOR = (146, 149, 158, 255)  # 关闭 × 默认浅色
+CLOSE_X_COLOR = (104, 108, 118, 255)  # 关闭 × 默认中性灰，白玻璃上要有足够对比
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
-CLOSE_X_COLOR_DARK = (196, 200, 210, 255)
-CLOSE_X_HOVER_DARK = (255, 255, 255, 255)
 MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
-BLUR_RADIUS = 12  # 毛玻璃背景模糊半径：太大（34）会把背后内容糊成一片灰，看不出玻璃
+BLUR_RADIUS = 12  # 高斯模糊半径：够柔但不糊死（34 会把背景糊成一片灰）
 ICON_SIZE = 20  # 操作栏左侧应用图标边长
 ICON_LEFT = 9  # 图标左边距
-SATURATION = 1.6  # 背景饱和度增益：毛玻璃透出的颜色更"活"
-GRAIN = 6  # 操作栏颗粒感强度（亚克力噪点，sigma），0 关闭
+SATURATION = 1.55  # 背景饱和度增益：毛玻璃透出的颜色更"活"
+BRIGHTEN = 1.25  # 背景提亮：玻璃要「透亮」，压暗底时才有通透感
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -373,6 +368,9 @@ gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
 gdi32.SelectObject.restype = wt.HGDIOBJ
 gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
 gdi32.DeleteDC.argtypes = [wt.HDC]
+gdi32.BitBlt.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                         ctypes.c_int, wt.HDC, ctypes.c_int, ctypes.c_int, wt.DWORD]
+gdi32.BitBlt.restype = wt.BOOL
 gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                      ctypes.c_int, ctypes.c_int, ctypes.c_int]
 gdi32.CreateRoundRectRgn.restype = wt.HRGN
@@ -427,7 +425,8 @@ state = {
     'blur': None, 'blur_key': None, 'blur_ts': 0.0, 'moving': False,
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
-    'bar_dark': False,  # 操作栏背后是深色底 → 用深色玻璃 tint
+    'hidden': False,  # 用户点了 × / 托盘「隐藏投屏」：收进托盘，只能靠托盘再唤出
+    'bar_hold': False,  # 拖动结束后短暂沿用旧背景，避免立刻重截造成操作栏闪一下
     'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
 }
@@ -444,7 +443,7 @@ def mirror_visible():
     文案与实际行为对不上（菜单写「隐藏投屏」，点下去却是把它提到前面）。
     """
     f = state['frame']
-    if not f or not user32.IsWindowVisible(f):
+    if state['hidden'] or not f or not user32.IsWindowVisible(f):
         return False
     return user32.GetForegroundWindow() in (f, state['child'])
 
@@ -710,6 +709,34 @@ def blank_layered(hwnd, W, H):
     draw_layered(hwnd, W, H, bytes(W * H * 4))
 
 
+def grab_rect(x, y, w, h):
+    """GDI BitBlt 直接抓屏幕上一小块。
+
+    PIL 的 ImageGrab 会先把整个虚拟屏幕截下来再裁，实测 34ms；操作栏只有 260x38，
+    BitBlt 2~3ms 就够。这段耗时直接等于「操作栏空白多久」，所以必须抠。
+    """
+    hdc_screen = user32.GetDC(None)
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = 0
+    pbits = ctypes.c_void_p()
+    hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(pbits),
+                                  None, 0)
+    old = gdi32.SelectObject(hdc_mem, hbmp)
+    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020)  # SRCCOPY
+    buf = ctypes.string_at(pbits, w * h * 4)
+    gdi32.SelectObject(hdc_mem, old)
+    gdi32.DeleteObject(hbmp)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(None, hdc_screen)
+    return Image.frombuffer('RGB', (w, h), buf, 'raw', 'BGRX', 0, 1)
+
+
 def capture_blur(hwnd):
     """截取操作栏背后**真实的桌面内容**并模糊，作为毛玻璃底。
 
@@ -725,30 +752,29 @@ def capture_blur(hwnd):
     if W <= 0 or H <= 0:
         return None
     th = max(1, min(TOOLBAR_H, H))
+    t0 = time.perf_counter()
     blank_layered(hwnd, W, H)
     try:
         dwmapi.DwmFlush()
     except Exception:
         pass
-    # 关窗后合成器需要一小段时间才真正把透明帧刷到屏幕上，
-    # 不等这一下偶尔会截到「上一帧的自己」（条带标准差 0）
-    time.sleep(0.012)
-    img = ImageGrab.grab(bbox=(r.left, r.top, r.right, r.top + th), all_screens=True)
-    img = img.convert('RGB')
-    # 背景亮暗决定玻璃是白玻璃还是深色玻璃（自适应，和 Windows 亚克力一致）
-    st = ImageStat.Stat(img)
-    lum = 0.299 * st.mean[0] + 0.587 * st.mean[1] + 0.114 * st.mean[2]
-    state['bar_dark'] = lum < 128
+    # 不能再 sleep：空白帧多留一毫秒，用户就看到操作栏闪一下。DwmFlush 之后
+    # 直接抓已经能拿到真实桌面内容（实测条带标准差与藏窗后的地面真值一致）。
+    img = grab_rect(r.left, r.top, r.right - r.left, th)
+    if img is None or img.size[0] <= 0:
+        return None
     try:
-        log('blur: strip %dx%d stddev=%.1f lum=%.1f dark=%s'
-            % (img.width, img.height, st.stddev[0], lum, state['bar_dark']))
+        st = ImageStat.Stat(img)
+        log('blur: strip %dx%d stddev=%.1f blank=%.0fms'
+            % (img.width, img.height, st.stddev[0],
+               (time.perf_counter() - t0) * 1000))
     except Exception:
         pass
     img = img.filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
-    # 把透出来的颜色调鲜艳、提亮一点（相当于 Windows 亚克力的亮度层），
+    # 把透出来的颜色调鲜艳、提亮（相当于 Windows 亚克力的亮度层），
     # 否则隔着半透明 tint 看就是一片灰白，不像玻璃
     img = ImageEnhance.Color(img).enhance(SATURATION)
-    return ImageEnhance.Brightness(img).enhance(1.12)
+    return ImageEnhance.Brightness(img).enhance(BRIGHTEN)
 
 
 def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
@@ -771,9 +797,8 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     else:
         bg = Image.new('RGBA', (sW, sH), (248, 249, 252, 255))
 
-    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感；底色暗时换深色玻璃
-    dark = bool(state.get('bar_dark'))
-    top_c, bot_c = (TINT_TOP_DARK, TINT_BOTTOM_DARK) if dark else (TINT_TOP, TINT_BOTTOM)
+    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感（固定白色玻璃）
+    top_c, bot_c = TINT_TOP, TINT_BOTTOM
     rows = []
     for y in range(sH):
         t = y / max(1, sH - 1)
@@ -787,11 +812,9 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     # UI 图层（独立图层再合成，保证半透明像素正确）
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))
     d = ImageDraw.Draw(ui)
-    d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 110 if dark else 120),
-           width=SS)  # 顶部玻璃高光
+    d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 120), width=SS)  # 顶部玻璃高光
     # 底部内侧高光：把操作栏与视频的接缝压成一条亮线，看起来是一体式玻璃面板
-    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 60 if dark else 82),
-           width=SS)
+    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 82), width=SS)
 
     # 左上角：应用图标（圆形，圆外透明），替代原先手绘的鱼形标记
     isz = ICON_SIZE * SS
@@ -802,15 +825,12 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
     bb = d.textbbox((0, 0), APP_NAME, font=f_title)
     ty = (sH - (bb[3] - bb[1])) // 2 - bb[1]
     d.text(((ICON_LEFT + ICON_SIZE + 9) * SS, ty), APP_NAME, font=f_title,
-           fill=TEXT_COLOR_DARK if dark else TEXT_COLOR)
+           fill=TEXT_COLOR)
 
     # 关闭 ×：自绘圆头细线，hover 仅变深，不加红底
     cx, cy = sW - (CLOSE_W * SS) // 2, sH // 2
     half, lw = 6 * SS, 2 * SS
-    if dark:
-        x_color = CLOSE_X_HOVER_DARK if state['close_hover'] else CLOSE_X_COLOR_DARK
-    else:
-        x_color = CLOSE_X_HOVER if state['close_hover'] else CLOSE_X_COLOR
+    x_color = CLOSE_X_HOVER if state['close_hover'] else CLOSE_X_COLOR
     d.line([(cx - half, cy - half), (cx + half, cy + half)], fill=x_color, width=lw)
     d.line([(cx + half, cy - half), (cx - half, cy + half)], fill=x_color, width=lw)
     rad = lw // 2
@@ -829,12 +849,6 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
 
     bar = bar.resize((W, th), Image.LANCZOS)
     bar.putalpha(ImageChops.multiply(bar.getchannel('A'), mask))
-    # 颗粒感（亚克力材质的关键）：真实毛玻璃/亚克力都有细噪点，纯色块永远不像玻璃
-    if GRAIN > 0:
-        g = Image.effect_noise((W, th), GRAIN).convert('L')
-        rgb = ImageChops.add(bar.convert('RGB'), Image.merge('RGB', (g, g, g)), 1.0, -128)
-        bar = Image.merge('RGBA', (rgb.getchannel('R'), rgb.getchannel('G'),
-                                   rgb.getchannel('B'), bar.getchannel('A')))
     # 强制底边完全不透明，与视频区严丝合缝
     a = bar.getchannel('A')
     ImageDraw.Draw(a).line([(0, th - 1), (W, th - 1)], fill=255)
@@ -1027,7 +1041,7 @@ def mouse_hook_proc(n_code, wparam, lparam):
     try:
         if n_code >= 0:
             f = state['frame']
-            if f and user32.IsWindowVisible(f):
+            if f and not state['hidden'] and user32.IsWindowVisible(f):
                 if state['resizing']:
                     if wparam == 0x0202:  # 松手：收尾，重排视频/重截毛玻璃交给窗口消息
                         end_resize()
@@ -1091,7 +1105,8 @@ def update_frame(hwnd, force=False):
     key = (r.left, r.top, W, H)
     now = time.time()
     blur_bg = None
-    if state['blur'] is not None and (state['blur'][0] == key or state['moving']):
+    hold = state['moving'] or state['bar_hold']
+    if state['blur'] is not None and (state['blur'][0] == key or hold):
         blur_bg = state['blur'][1]
     elif state['blur'] is not None and now - state['blur_ts'] <= 0.15:
         blur_bg = state['blur'][1]
@@ -1104,6 +1119,18 @@ def update_frame(hwnd, force=False):
     raw = premultiply(img).tobytes('raw', 'BGRA')
     draw_layered(hwnd, W, H, raw)
     state['drawn_size'] = size
+
+
+def settle_bar(hwnd):
+    """拖动/缩放收尾：先用旧背景立刻重画（不闪），稍后再重截真实背景。
+
+    直接重截会让 capture_blur 把操作栏刷成透明一瞬，用户看到的就是「操作栏消失
+    又出现」。这里先沿用缓存的那张模糊图把条子补上，220ms 后再悄悄换新背景。
+    """
+    state['moving'] = False
+    state['bar_hold'] = True
+    update_frame(hwnd)
+    user32.SetTimer(hwnd, TIMER_BLUR, 220, None)
 
 
 def in_close_button(hwnd, lparam):
@@ -1281,10 +1308,8 @@ def frame_proc(hwnd, msg, wparam, lparam):
         if wparam & 0xFFFF:
             raise_mirror()
         return 0
-    if msg == 0x0232:  # WM_EXITSIZEMOVE：拖动结束，重截毛玻璃背景
-        state['moving'] = False
-        state['blur'] = None
-        update_frame(hwnd)
+    if msg == 0x0232:  # WM_EXITSIZEMOVE：拖动结束
+        settle_bar(hwnd)
         return 0
     if msg == 0x0024:  # WM_GETMINMAXINFO
         mmi = ctypes.cast(lparam, ctypes.POINTER(MINMAXINFO)).contents
@@ -1297,9 +1322,15 @@ def frame_proc(hwnd, msg, wparam, lparam):
         if set_cursor_if_close(hwnd):
             return 1
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-    if msg == 0x0113:  # WM_TIMER：缩放期间轮询光标（视频区上的鼠标移动收不到）
+    if msg == 0x0113:  # WM_TIMER
         if wparam == TIMER_RESIZE and state['resizing']:
             do_resize(hwnd)
+            return 0
+        if wparam == TIMER_BLUR:
+            user32.KillTimer(hwnd, TIMER_BLUR)
+            state['bar_hold'] = False
+            state['blur'] = None
+            update_frame(hwnd, force=True)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE
@@ -1321,8 +1352,7 @@ def frame_proc(hwnd, msg, wparam, lparam):
     if msg == 0x0202:  # WM_LBUTTONUP
         if state['resizing']:
             end_resize()
-            state['blur'] = None
-            update_frame(hwnd)
+            settle_bar(hwnd)
             return 0
         if in_close_button(hwnd, lparam):
             hide_mirror()
@@ -1347,7 +1377,9 @@ def frame_proc(hwnd, msg, wparam, lparam):
 
 
 def hide_mirror():
+    """收进托盘：窗口从此只认托盘的唤出，点原来的屏幕位置不会再冒出来。"""
     f = state['frame']
+    state['hidden'] = True
     if f and user32.IsWindowVisible(f):
         user32.ShowWindow(f, 0)
         if state['child']:
@@ -1366,14 +1398,13 @@ def toggle_mirror():
         return
     visible = user32.IsWindowVisible(f)
     fg = user32.GetForegroundWindow()
-    on_top = bool(visible) and fg in (f, state['child'])
+    on_top = bool(visible) and fg in (f, state['child']) and not state['hidden']
     if on_top:
-        user32.ShowWindow(f, 0)
-        if state['child']:
-            user32.ShowWindow(state['child'], 0)
+        hide_mirror()
         log('toggle: hide (was front)')
         return
     # 显示：先把两个窗口放出来，再重绘、提到最前、抢前台，缺一步都会「看起来没反应」
+    state['hidden'] = False
     user32.ShowWindow(f, 5)
     if state['child']:
         user32.ShowWindow(state['child'], 5)
@@ -1433,6 +1464,13 @@ def watchdog(hwnd):
     # 每秒兜底：前台是魔芋时整体置前；否则至少保证视频紧贴 frame 下方，
     # 避免其它窗口插进两者之间，把视频区遮掉（只剩操作栏可见）
     f, ch = state['frame'], state['child']
+    if state['hidden']:
+        # 收进托盘期间：scrcpy 的 SDL 窗口偶尔会自己重新显示（或手机旋转触发重建），
+        # 这里每秒补收一次，保证「只有点托盘才会再出现」。
+        if f and user32.IsWindowVisible(f):
+            user32.ShowWindow(f, 0)
+        if ch and user32.IsWindow(ch) and user32.IsWindowVisible(ch):
+            user32.ShowWindow(ch, 0)
     if f and user32.IsWindowVisible(f) and ch and user32.IsWindow(ch):
         fg = user32.GetForegroundWindow()
         if fg in (f, ch, state['tray']):

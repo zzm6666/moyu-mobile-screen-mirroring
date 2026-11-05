@@ -221,13 +221,12 @@ class TestRectEdgeHit(unittest.TestCase):
 
 
 class TestGlassBar(unittest.TestCase):
-    """build_frame_image：操作栏毛玻璃——底色暗用深色玻璃、底色亮用白玻璃，且始终有颗粒感。"""
+    """build_frame_image：操作栏固定是「白色半透明毛玻璃」——高斯模糊 + 半透明白，无颗粒。"""
 
     W, H, TH = 259, 610, 38
 
-    def render(self, rgb, dark):
+    def render(self, rgb):
         from PIL import Image, ImageStat
-        m.state['bar_dark'] = dark
         m.state['close_hover'] = False
         bg = Image.new('RGB', (self.W, self.TH), rgb)
         out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W,
@@ -238,17 +237,28 @@ class TestGlassBar(unittest.TestCase):
         bar = out.crop((60, 2, self.W - 60, self.TH - 2)).convert('RGB')
         return ImageStat.Stat(bar)
 
-    def test_dark_backdrop_gives_dark_glass(self):
-        st = self.render((20, 20, 20), True)
-        self.assertLess(sum(st.mean) / 3, 110)
+    def test_dark_backdrop_still_white_glass(self):
+        """暗底也必须是白玻璃（用户明确要白色半透明，不要自适应变黑）。"""
+        dark_bar = sum(self.render((20, 20, 20)).mean) / 3
+        self.assertGreater(dark_bar, 105)  # 明显被白色玻璃提亮（原始底色只有 20）
 
-    def test_light_backdrop_gives_light_glass(self):
-        st = self.render((250, 250, 250), False)
-        self.assertGreater(sum(st.mean) / 3, 150)
+    def test_light_backdrop_glass_is_bright(self):
+        self.assertGreater(sum(self.render((250, 250, 250)).mean) / 3, 150)
 
-    def test_flat_backdrop_still_has_grain(self):
-        """纯色背景也必须看起来像磨砂玻璃：颗粒感让标准差不为 0。"""
-        self.assertGreater(min(self.render((120, 120, 120), False).stddev), 0.5)
+    def test_glass_stays_translucent(self):
+        """半透明：暗底上仍能看出背景色透上来（不是纯白实心），中间调应明显低于纯白 tint。"""
+        dark_bar = sum(self.render((20, 20, 20)).mean) / 3
+        self.assertLess(dark_bar, 235)
+
+    def test_flat_backdrop_stays_clean(self):
+        """纯色背景上玻璃必须干净：不加噪点/颗粒（用户明确嫌脏），同一行内几乎无起伏。"""
+        from PIL import Image, ImageStat
+        m.state['close_hover'] = False
+        bg = Image.new('RGB', (self.W, self.TH), (120, 120, 120))
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W,
+                                  self.H - self.TH, bg)
+        row = out.crop((60, 18, self.W - 60, 19)).convert('RGB')
+        self.assertLess(max(ImageStat.Stat(row).stddev), 1.5)
 
 
 class TestPickSerial(unittest.TestCase):
