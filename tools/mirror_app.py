@@ -1114,6 +1114,15 @@ def _owns_point(pt, f):
     return hwnd_value(user32.GetForegroundWindow()) in (f, ch)
 
 
+def hook_swallow(wparam, resizing):
+    """钩子里这条消息要不要吞掉（return 1）。
+
+    注意：WM_MOUSEMOVE(0x0200) 绝对不能吞 —— 低级鼠标钩子吞掉移动事件，系统就
+    不再移动光标，用户按下边缘后会发现"鼠标动不了，窗口也不跟着变"。
+    """
+    return bool(resizing) and wparam != 0x0200
+
+
 def mouse_hook_proc(n_code, wparam, lparam):
     """全局低级鼠标钩子：抓边缩放 + 点在魔芋任意区域时请求整体置前。
 
@@ -1130,9 +1139,12 @@ def mouse_hook_proc(n_code, wparam, lparam):
                     if wparam == 0x0202:  # 松手：收尾，重排视频/重截毛玻璃交给窗口消息
                         end_resize()
                         user32.PostMessageW(f, 0x0232, 0, 0)  # WM_EXITSIZEMOVE
-                    elif wparam == 0x0200:  # 拖拽中：钩子驱动缩放
+                    elif wparam == 0x0200:  # 拖拽中：驱动缩放（但不吞掉移动事件）
                         do_resize(f)
-                    return 1
+                        user32.SetCursor(
+                            user32.LoadCursorW(None, CURSOR_FOR_HIT[state['resize_hit']]))
+                    if hook_swallow(wparam, True):
+                        return 1
                 if wparam in (0x0201, 0x0204):  # 左/右键按下
                     pt = POINT()
                     user32.GetCursorPos(ctypes.byref(pt))

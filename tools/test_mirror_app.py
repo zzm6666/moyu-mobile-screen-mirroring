@@ -169,6 +169,24 @@ class TestLockAspect(unittest.TestCase):
             self.assertAlmostEqual(vw / vh, self.ASPECT, delta=0.01)
 
 
+class TestHookSwallow(unittest.TestCase):
+    """钩子里的吞消息策略：移动事件绝对不能被吞。
+
+    低级鼠标钩子 `return 1` 表示"这条消息我处理了，别再往下传"；对 WM_MOUSEMOVE
+    来说就等于**系统不再移动光标** —— 用户按下边缘后会发现鼠标动不了。
+    """
+
+    def test_move_not_swallowed_while_resizing(self):
+        self.assertFalse(m.hook_swallow(0x0200, True))
+
+    def test_release_swallowed_while_resizing(self):
+        self.assertTrue(m.hook_swallow(0x0202, True))
+
+    def test_nothing_swallowed_when_idle(self):
+        self.assertFalse(m.hook_swallow(0x0200, False))
+        self.assertFalse(m.hook_swallow(0x0201, False))
+
+
 class TestFitWithinBottom(unittest.TestCase):
     """fit_within_bottom：高度顶出工作区底边时整体上移让位。"""
 
