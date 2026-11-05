@@ -62,8 +62,8 @@ ICON_LEFT = 9  # 图标左边距
 # 分层窗口系统不会给阴影，只能自己在外扩出来的一圈里画：窗口比可见内容四周各
 # 大 SHADOW_PAD，外面那圈画模糊的黑色圆角矩形，里面照旧画操作栏/留透明洞。
 SHADOW_PAD = 10  # 四周外扩像素（也等于阴影能扩散的最大距离）
-SHADOW_BLUR = 4.0  # 高斯模糊半径：越小越贴边、越大越飘
-SHADOW_ALPHA = 120  # 阴影最深处的 alpha（0~255）：淡淡的，不抢画面
+SHADOW_BLUR = 3.0  # 高斯模糊半径：越小越贴边、越大越飘
+SHADOW_ALPHA = 60  # 阴影最深处的 alpha（0~255）：淡淡的，不抢画面
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -738,18 +738,22 @@ def win_rect(l, t, r, b, pad=SHADOW_PAD):
 def add_shadow(img, pad=SHADOW_PAD, blur=SHADOW_BLUR, alpha=SHADOW_ALPHA):
     """给内容图层加一圈淡淡的整窗投影，返回 (W+2pad, H+2pad) 的新画布。
 
-    做法：按内容轮廓画一个圆角矩形蒙版 → 高斯模糊 → 当黑色半透明图层铺在底下，
-    再把内容原样贴回中心。模糊只发生在外扩出来的一圈里，内容像素一个都不改。
+    做法：按内容轮廓画一个圆角矩形蒙版 → 高斯模糊 → **把内容轮廓以内的部分抠掉**
+    （只留边框外的投影，否则模糊会渗进来，把视频区那些透明像素压暗）→ 当黑色半透明
+    图层铺在底下，再把内容原样贴回中心。内容像素一个都不改。
     pad=0 时原样返回（方便对比/回退）。
     """
     if pad <= 0:
         return img.copy()
     w, h = img.size
     out = Image.new('RGBA', (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+    box = [pad, pad, pad + w - 1, pad + h - 1]
     mask = Image.new('L', out.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        [pad, pad, pad + w - 1, pad + h - 1], radius=CORNER_R, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle(box, radius=CORNER_R, fill=255)
     mask = mask.filter(ImageFilter.GaussianBlur(blur))
+    hole = Image.new('L', out.size, 0)
+    ImageDraw.Draw(hole).rounded_rectangle(box, radius=CORNER_R, fill=255)
+    mask = ImageChops.subtract(mask, hole)
     shadow = Image.new('RGBA', out.size, (0, 0, 0, max(0, min(255, int(alpha)))))
     out.paste(shadow, (0, 0), mask)
     out.alpha_composite(img, (pad, pad))

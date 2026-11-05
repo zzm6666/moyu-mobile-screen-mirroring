@@ -549,6 +549,18 @@ class TestAddShadow(unittest.TestCase):
         self.assertLess(a, 200)  # 淡：不能是实心
         self.assertLess(r, 140)
 
+    def test_no_shadow_inside_content(self):
+        """投影只许出现在边框外：内容矩形内的透明像素（视频区）不能被压暗。
+
+        注意四角是圆角轮廓之外（那里有投影是对的），所以采样点取四边中点与内部。
+        """
+        p = m.SHADOW_PAD
+        out = m.add_shadow(Image.new('RGBA', (60, 40), (0, 0, 0, 0)))
+        for xy in ((p, p + 20), (p + 59, p + 20), (p + 30, p), (p + 30, p + 39),
+                   (p + 6, p + 6), (p + 30, p + 20), (p + 53, p + 33)):
+            self.assertEqual(out.getpixel(xy)[3], 0, 'shadow leaked inside at %s' % (xy,))
+        self.assertGreater(out.getpixel((p - 1, p + 20))[3], 5)  # 圈上还有阴影
+
     def test_outer_corners_transparent(self):
         out = m.add_shadow(Image.new('RGBA', (60, 40), (255, 255, 255, 255)))
         w, h = out.size
