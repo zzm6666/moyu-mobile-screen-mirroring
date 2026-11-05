@@ -45,7 +45,9 @@ CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
 BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
 SEAM_WHITE = (255, 255, 255, 255)  # 操作栏与画面之间那 1px 分界线：纯白不透明（用户指定）
-OVERSCAN = 2  # 视频窗口比可见区大这么多像素：scrcpy 整数缩放会在自己边上留 1px 底色
+OVERSCAN = 2  # 视频窗口比可见区大 2 像素：scrcpy 整数缩放会在自己右/下留 1~2px 黑底，
+              # 放大后这块底色被圆角裁剪区挡在可见区之外。注意凡是要摆放视频窗口的地方
+              # 都必须走 child_box()，直接摆 calc_video_rect() 的裸尺寸会让画面抖动。
               # （右边/下边），Win11 还会给顶层窗口描 1px 边框。把窗口放大并往左上外扩，
               # 再用 SetWindowRgn 裁回可见区，这些边就都落到可见区之外 —— 画面正好铺满。
 TEXT_COLOR = (56, 58, 66, 255)
@@ -530,6 +532,12 @@ def start_scrcpy():
     args = [SCRCPY, '-s', serial,
             '--window-title=' + TITLE,
             '--window-borderless',
+            # 关掉 scrcpy 自己的窗口长宽比锁定：否则它会按自己的比例调整窗口尺寸，
+            # 和我们摆放的 overscan 尺寸来回打架，拖动时右/下会闪出黑边。
+            '--no-window-aspect-ratio-lock',
+            # 画面铺满整个窗口，窗口内部不再留 1px 黑底；窗口比可见区大 2px，
+            # 多出来的部分被圆角裁剪区挡掉，形变约 0.8%，肉眼看不出来。
+            '--render-fit=stretched',
             '--window-x=0', '--window-y=0',
             '--window-width=%d' % CFG['w'], '--window-height=%d' % CFG['h'],
             '--max-fps=%d' % CFG['fps'],
@@ -1314,7 +1322,10 @@ def frame_proc(hwnd, msg, wparam, lparam):
         vx, vy, vw, vh = calc_video_rect(rc.right - rc.left, rc.bottom - rc.top)
         ch = state['child']
         if ch and user32.IsWindow(ch):
-            user32.SetWindowPos(ch, hwnd, rc.left + vx, rc.top + vy, vw, vh,
+            # 必须和 position_scrcpy 用同一套 child_box 尺寸，否则拖动时视频窗口在
+            # 「overscan 尺寸」和「裸尺寸」之间来回跳，画面会抖、边上会闪黑边。
+            bx, by, bw, bh = child_box(vx, vy, vw, vh)
+            user32.SetWindowPos(ch, hwnd, rc.left + bx, rc.top + by, bw, bh,
                                 SWP_NOACTIVATE)
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0047 or msg == 0x0005:  # WM_WINDOWPOSCHANGED / WM_SIZE

@@ -364,6 +364,33 @@ class TestCloseButton(unittest.TestCase):
         self.assertLess(self.region(True).getextrema()[0], self.region(False).getextrema()[0])
 
 
+class TestScrcpyFlags(unittest.TestCase):
+    """scrcpy 命令行必须带上这两条，否则右/下会闪出黑边。
+
+    - 关掉窗口长宽比锁定：不然它会把 overscan 后的尺寸改回精确比例，拖动时来回打架；
+    - render-fit=stretched：画面按窗口铺满，不再居中留 1px 黑底。
+    """
+
+    def test_fit_and_lock_flags(self):
+        src = open(m.__file__, encoding='utf-8').read()
+        self.assertIn("'--render-fit=stretched'", src)
+        self.assertIn("'--no-window-aspect-ratio-lock'", src)
+
+
+class TestDragPath(unittest.TestCase):
+    """拖动快路径（WM_MOVING）必须用 child_box 摆视频窗口。
+
+    直接摆 calc_video_rect() 的裸尺寸会让视频窗口在拖动时于 overscan 尺寸和裸尺寸之间
+    来回跳，画面会抖、右/下会闪出黑边。
+    """
+
+    def test_moving_uses_child_box(self):
+        src = open(m.__file__, encoding='utf-8').read()
+        i = src.index('if msg == 0x0216')
+        j = src.index('return user32.DefWindowProcW', i)
+        self.assertIn('child_box(', src[i:j])
+
+
 class TestPickSerial(unittest.TestCase):
     """pick_serial：配置串号在线就用它，不在线自动退回在线设备（无线调试端口会变）。"""
 
