@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""魔芋 —— 手机投屏小窗（毛玻璃外框 + 自绘操作栏版）。
+"""魔芋 —— 手机投屏小窗（白色半透明外框 + 自绘操作栏版）。
 
-- 自绘无边框圆角窗口：顶部毛玻璃操作栏 + 右侧关闭按钮，可拖动、可缩放
+- 自绘无边框圆角窗口：顶部白色半透明操作栏 + 右侧关闭按钮，可拖动、可缩放
 - scrcpy 画面作为独立窗口垫在外框中间的透明洞里，按手机宽高比自适应、不变形
 - 视频区点击穿透到 scrcpy（保留鼠标反控），操作栏/边框用于拖动和缩放
 - 托盘图标：左键显示/隐藏，右键菜单「显示/隐藏投屏」「退出」
@@ -19,8 +19,7 @@ import sys
 import threading
 import time
 
-from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont,
-                 ImageStat)
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -37,7 +36,6 @@ NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 WM_TRAY = 0x8001
 WM_APP_RAISE = 0x8002  # 点击视频区时请求整体置前
 TIMER_RESIZE = 3  # 缩放期间的轮询定时器（鼠标压在视频区上时收不到 WM_MOUSEMOVE）
-TIMER_BLUR = 4  # 拖动/缩放结束后延迟重截毛玻璃背景（立刻重截会让操作栏闪一下）
 ID_TOGGLE = 1001
 ID_EXIT = 1002
 CREATE_NO_WINDOW = 0x08000000
@@ -45,18 +43,15 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 146)  # 白色玻璃（上）：暗背景上也要读作「白」，同时透出背后色块
+TINT_TOP = (255, 255, 255, 146)  # 白色半透明（上）：暗背景上也要读作「白」
 TINT_BOTTOM = (240, 246, 255, 112)  # 越往下越透，形成玻璃厚度感
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (104, 108, 118, 255)  # 关闭 × 默认中性灰，白玻璃上要有足够对比
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
 MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
-BLUR_RADIUS = 12  # 高斯模糊半径：够柔但不糊死（34 会把背景糊成一片灰）
 ICON_SIZE = 20  # 操作栏左侧应用图标边长
 ICON_LEFT = 9  # 图标左边距
-SATURATION = 1.55  # 背景饱和度增益：毛玻璃透出的颜色更"活"
-BRIGHTEN = 1.25  # 背景提亮：玻璃要「透亮」，压暗底时才有通透感
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -422,11 +417,10 @@ state = {
     'aspect': 1080 / 2376, 'video_rect': (0, 0, 0, 0), 'close_hover': False,
     'orient': None, 'user_moved': False, 'region_key': None,
     'resizing': False, 'resize_hit': 0, 'resize_pt': (0, 0), 'resize_rect': (0, 0, 0, 0),
-    'blur': None, 'blur_key': None, 'blur_ts': 0.0, 'moving': False,
+    'moving': False,
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
     'hidden': False,  # 用户点了 × / 托盘「隐藏投屏」：收进托盘，只能靠托盘再唤出
-    'bar_hold': False,  # 拖动结束后短暂沿用旧背景，避免立刻重截造成操作栏闪一下
     'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
 }
@@ -704,96 +698,19 @@ def premultiply(img):
                                 ImageChops.multiply(b, a), a))
 
 
-def blank_layered(hwnd, W, H):
-    """把分层窗口刷成全透明：让窗口在画面上「让开」，好让桌面的真实内容露出来。"""
-    draw_layered(hwnd, W, H, bytes(W * H * 4))
-
-
-def grab_rect(x, y, w, h):
-    """GDI BitBlt 直接抓屏幕上一小块。
-
-    PIL 的 ImageGrab 会先把整个虚拟屏幕截下来再裁，实测 34ms；操作栏只有 260x38，
-    BitBlt 2~3ms 就够。这段耗时直接等于「操作栏空白多久」，所以必须抠。
-    """
-    hdc_screen = user32.GetDC(None)
-    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-    bmi = BITMAPINFO()
-    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.bmiHeader.biWidth = w
-    bmi.bmiHeader.biHeight = -h
-    bmi.bmiHeader.biPlanes = 1
-    bmi.bmiHeader.biBitCount = 32
-    bmi.bmiHeader.biCompression = 0
-    pbits = ctypes.c_void_p()
-    hbmp = gdi32.CreateDIBSection(hdc_mem, ctypes.byref(bmi), 0, ctypes.byref(pbits),
-                                  None, 0)
-    old = gdi32.SelectObject(hdc_mem, hbmp)
-    gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, x, y, 0x00CC0020)  # SRCCOPY
-    buf = ctypes.string_at(pbits, w * h * 4)
-    gdi32.SelectObject(hdc_mem, old)
-    gdi32.DeleteObject(hbmp)
-    gdi32.DeleteDC(hdc_mem)
-    user32.ReleaseDC(None, hdc_screen)
-    return Image.frombuffer('RGB', (w, h), buf, 'raw', 'BGRX', 0, 1)
-
-
-def capture_blur(hwnd):
-    """截取操作栏背后**真实的桌面内容**并模糊，作为毛玻璃底。
-
-    不能直接 Grad 当前屏幕 —— 此时本窗口正是可见状态，截到的是自己刚画的那条
-    操作栏，模糊之后永远是一片均匀的浅色，看起来「根本没有毛玻璃」（实测条带
-    内 RGB 标准差只有 5~9，而真实背景在 40+）。所以先把窗口刷成全透明、
-    等合成器吐一帧，再只截操作栏那一条；update_frame 随后会立刻重画回来。
-    """
-    r = RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(r))
-    W = r.right - r.left
-    H = r.bottom - r.top
-    if W <= 0 or H <= 0:
-        return None
-    th = max(1, min(TOOLBAR_H, H))
-    t0 = time.perf_counter()
-    blank_layered(hwnd, W, H)
-    # 不需要 DwmFlush：实测（MOYU_BLUR_PROBE 对比）刷透明后立刻 BitBlt，抓到的就是
-    # 真实桌面（mean/stddev 与 flush 后完全一致），省掉这一等就是省掉 16ms 的空白帧。
-    img = grab_rect(r.left, r.top, r.right - r.left, th)
-    if img is None or img.size[0] <= 0:
-        return None
-    try:
-        st = ImageStat.Stat(img)
-        log('blur: strip %dx%d stddev=%.1f blank=%.0fms'
-            % (img.width, img.height, st.stddev[0],
-               (time.perf_counter() - t0) * 1000))
-    except Exception:
-        pass
-    img = img.filter(ImageFilter.GaussianBlur(radius=BLUR_RADIUS))
-    # 把透出来的颜色调鲜艳、提亮（相当于 Windows 亚克力的亮度层），
-    # 否则隔着半透明 tint 看就是一片灰白，不像玻璃
-    img = ImageEnhance.Color(img).enhance(SATURATION)
-    return ImageEnhance.Brightness(img).enhance(BRIGHTEN)
-
-
-def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
+def build_frame_image(W, H, vx, vy, vw, vh):
     """只绘制顶部操作栏：上方两个圆角、下方直角与视频无缝衔接；视频区全透明。
 
+    操作栏是真半透明：画布从全透明起手，只叠一层白色竖向渐变 tint，靠分层窗口的
+    per-pixel alpha 直接透出背后的桌面。**不做截屏模糊**——截屏方案每次都得先把
+    窗口刷成全透明再抓背景，刷的那一下加一次重画，就是用户看到的「操作栏消失又
+    出现」。整条路径已删除，操作栏从此不需要「刷新背景」。
     整条操作栏在 SS 倍超采样画布上绘制后 LANCZOS 缩回，圆角/文字/图形统一抗锯齿。
     """
     th = min(TOOLBAR_H, H)
     sW, sH = W * SS, th * SS
 
-    # 背景：模糊后的屏幕内容（毛玻璃底）。capture_blur 现在只截操作栏那一条，
-    # 高度就等于 th；老缓存若是整窗高度，也只取顶部 th 行。
-    if blur_bg is not None:
-        bg = blur_bg.convert('RGBA')
-        if bg.size[1] != th:
-            bg = bg.crop((0, 0, min(bg.size[0], W), min(bg.size[1], th)))
-        if bg.size != (W, th):
-            bg = bg.resize((W, th), Image.LANCZOS)
-        bg = bg.resize((sW, sH), Image.LANCZOS)
-    else:
-        bg = Image.new('RGBA', (sW, sH), (248, 249, 252, 255))
-
-    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感（固定白色玻璃）
+    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感（alpha 即窗口透过率）
     top_c, bot_c = TINT_TOP, TINT_BOTTOM
     rows = []
     for y in range(sH):
@@ -802,8 +719,7 @@ def build_frame_image(W, H, vx, vy, vw, vh, blur_bg=None):
                           for i in range(4)))
     grad = Image.new('RGBA', (1, sH))
     grad.putdata(rows)
-    grad = grad.resize((sW, sH))
-    bar = Image.alpha_composite(bg, grad)
+    bar = grad.resize((sW, sH))
 
     # UI 图层（独立图层再合成，保证半透明像素正确）
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))
@@ -1007,6 +923,11 @@ CURSOR_FOR_HIT = {10: 32644, 11: 32644, 12: 32645, 15: 32645,
                   13: 32642, 14: 32643, 16: 32643, 17: 32642}
 
 
+def drag_start_raises(hit):
+    """Only resize edges retain raise-on-press; toolbar caption drags do not."""
+    return 10 <= hit <= 17
+
+
 def edge_hit(r, x, y, grab=EDGE_GRAB, toolbar=TOOLBAR_H):
     """抓边判定：操作栏（顶部 toolbar 高那一条）整块只用于拖动，不算抓边。"""
     if r is None:
@@ -1107,35 +1028,16 @@ def update_frame(hwnd, force=False):
     # 否则每一次 WM_WINDOWPOSCHANGED 都要白跑十几毫秒，反过来又把视频拖后。
     if not force and state['moving'] and state['drawn_size'] == size:
         return
-    key = (r.left, r.top, W, H)
-    now = time.time()
-    blur_bg = None
-    hold = state['moving'] or state['bar_hold']
-    if state['blur'] is not None and (state['blur'][0] == key or hold):
-        blur_bg = state['blur'][1]
-    elif state['blur'] is not None and now - state['blur_ts'] <= 0.15:
-        blur_bg = state['blur'][1]
-    else:
-        blur_bg = capture_blur(hwnd)
-        if blur_bg is not None:
-            state['blur'] = (key, blur_bg)
-            state['blur_ts'] = now
-    img = build_frame_image(W, H, vx, vy, vw, vh, blur_bg)
+    img = build_frame_image(W, H, vx, vy, vw, vh)
     raw = premultiply(img).tobytes('raw', 'BGRA')
     draw_layered(hwnd, W, H, raw)
     state['drawn_size'] = size
 
 
 def settle_bar(hwnd):
-    """拖动/缩放收尾：先用旧背景立刻重画（不闪），稍后再重截真实背景。
-
-    直接重截会让 capture_blur 把操作栏刷成透明一瞬，用户看到的就是「操作栏消失
-    又出现」。这里先沿用缓存的那张模糊图把条子补上，220ms 后再悄悄换新背景。
-    """
+    """拖动/缩放结束后保留现有操作栏图像，不触发会清空可见窗口的重截。"""
     state['moving'] = False
-    state['bar_hold'] = True
     update_frame(hwnd)
-    user32.SetTimer(hwnd, TIMER_BLUR, 220, None)
 
 
 def in_close_button(hwnd, lparam):
@@ -1291,10 +1193,10 @@ def end_resize():
 def frame_proc(hwnd, msg, wparam, lparam):
     if msg == 0x0084:  # WM_NCHITTEST
         return frame_hittest(hwnd, lparam)
-    if msg == 0x00A1:  # WM_NCLBUTTONDOWN：拖动/缩放前激活窗口
-        user32.SetForegroundWindow(hwnd)
-        raise_mirror()
-        if 10 <= wparam <= 17:
+    if msg == 0x00A1:  # WM_NCLBUTTONDOWN：缩放前激活；操作栏拖动不触发 Z 序重排
+        if drag_start_raises(wparam):
+            user32.SetForegroundWindow(hwnd)
+            raise_mirror()
             start_resize(hwnd, wparam)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1302,9 +1204,7 @@ def frame_proc(hwnd, msg, wparam, lparam):
         state['moving'] = True
         state['user_moved'] = True  # 用户亲手挪过窗口，横竖屏切换不再自动归位
         return 0
-    if msg == 0x0006:  # WM_ACTIVATE：激活时整体置前，视频跟着一起到最前
-        if wparam & 0xFFFF:
-            raise_mirror()
+    if msg == 0x0006:  # WM_ACTIVATE：避免重复改 Z 序；系统已在激活期间处理 frame
         return 0
     if msg == 0x0232:  # WM_EXITSIZEMOVE：拖动结束
         settle_bar(hwnd)
@@ -1323,12 +1223,6 @@ def frame_proc(hwnd, msg, wparam, lparam):
     if msg == 0x0113:  # WM_TIMER
         if wparam == TIMER_RESIZE and state['resizing']:
             do_resize(hwnd)
-            return 0
-        if wparam == TIMER_BLUR:
-            user32.KillTimer(hwnd, TIMER_BLUR)
-            state['bar_hold'] = False
-            state['blur'] = None
-            update_frame(hwnd, force=True)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE

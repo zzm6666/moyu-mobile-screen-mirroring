@@ -250,21 +250,34 @@ class TestEdgeHit(unittest.TestCase):
 
 
 class TestGlassBar(unittest.TestCase):
-    """build_frame_image：操作栏固定是「白色半透明毛玻璃」——高斯模糊 + 半透明白，无颗粒。"""
+    """build_frame_image：操作栏是纯「白色半透明」——不截屏、不模糊，直接透出桌面。"""
 
     W, H, TH = 259, 610, 38
 
     def render(self, rgb):
         from PIL import Image, ImageStat
         m.state['close_hover'] = False
-        bg = Image.new('RGB', (self.W, self.TH), rgb)
+        # 用一块纯色当作桌面：操作栏的半透明像素直接叠在它上面
+        bg = Image.new('RGBA', (self.W, self.H), rgb + (255,))
         out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W,
-                                  self.H - self.TH, bg)
+                                  self.H - self.TH)
         self.assertEqual(out.size, (self.W, self.H))
         self.assertEqual(out.mode, 'RGBA')
+        bg.alpha_composite(out)
         # 只取纯背景区（避开图标/标题/关闭 ×）
-        bar = out.crop((60, 2, self.W - 60, self.TH - 2)).convert('RGB')
+        bar = bg.crop((60, 2, self.W - 60, self.TH - 2)).convert('RGB')
         return ImageStat.Stat(bar)
+
+    def test_no_backdrop_capture_any_dependency(self):
+        """操作栏不能依赖截屏：截屏必须先清空窗口，那一下就是「消失又出现」。"""
+        self.assertFalse(hasattr(m, 'capture_blur'))
+        self.assertFalse(hasattr(m, 'blank_layered'))
+
+    def test_bar_is_really_translucent(self):
+        m.state['close_hover'] = False
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
+        a = out.crop((90, 10, self.W - 70, 11)).getchannel('A')
+        self.assertLessEqual(a.getextrema()[1], 200)
 
     def test_dark_backdrop_still_white_glass(self):
         """暗底也必须是白玻璃（用户明确要白色半透明，不要自适应变黑）。"""
@@ -283,10 +296,11 @@ class TestGlassBar(unittest.TestCase):
         """纯色背景上玻璃必须干净：不加噪点/颗粒（用户明确嫌脏），同一行内几乎无起伏。"""
         from PIL import Image, ImageStat
         m.state['close_hover'] = False
-        bg = Image.new('RGB', (self.W, self.TH), (120, 120, 120))
+        bg = Image.new('RGBA', (self.W, self.H), (120, 120, 120, 255))
         out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W,
-                                  self.H - self.TH, bg)
-        row = out.crop((60, 18, self.W - 60, 19)).convert('RGB')
+                                  self.H - self.TH)
+        bg.alpha_composite(out)
+        row = bg.crop((60, 18, self.W - 60, 19)).convert('RGB')
         self.assertLess(max(ImageStat.Stat(row).stddev), 1.5)
 
 
