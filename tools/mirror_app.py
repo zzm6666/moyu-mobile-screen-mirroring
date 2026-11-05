@@ -44,8 +44,6 @@ CREATE_NO_WINDOW = 0x08000000
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
 BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
-SEAM_ALPHA = 224  # 操作栏与视频接缝那 1px 的半透明白线（盖住 scrcpy 的黑边）
-SEAM_ALPHA_SOFT = 110  # 接缝下面再一行很淡的白，过渡不硬
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (152, 157, 166, 255)  # 关闭 × 默认浅灰：白条上要淡，不抢注意力
 CLOSE_X_HOVER = (104, 109, 118, 255)  # 悬停时略变深（仍然轻，无红底）
@@ -776,13 +774,11 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     out = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     out.paste(bar, (0, 0))
-    # 接缝：视频窗口比例与手机画面差 1px 时，scrcpy 会给自己窗口的上下补 1px 黑边，
-    # 那条黑线正好露在操作栏下面（用户报的「操作栏和视频区之间有一条黑线」）。这里
-    # 用一条半透明白线盖住接缝：黑边被压成与操作栏同色，观感是玻璃面板的下沿。
+    # 接缝那 1px：视频窗口按整数缩放后总会在自己边缘留 1px 底色（scrcpy 清成黑），
+    # 它正好压在操作栏下沿，就是用户看到的那条「黑线」。这里用与操作栏同色的半透明
+    # 白盖住它 —— 观感上操作栏只是多了一行，接缝彻底消失。
     if th < H:
-        out.paste((255, 255, 255, SEAM_ALPHA), (0, th, W, th + 1))
-        if H - th > 2:
-            out.paste((255, 255, 255, SEAM_ALPHA_SOFT), (0, th + 1, W, th + 2))
+        out.paste((255, 255, 255, BAR_TINT[3]), (0, th, W, th + 1))
     return out
 
 
@@ -869,6 +865,30 @@ def wa_h():
     r = RECT()
     user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(r), 0)
     return r.bottom - r.top
+
+
+DWM_ROUND = 33  # DWMWA_WINDOW_CORNER_PREFERENCE
+DWM_BORDER = 34  # DWMWA_BORDER_COLOR
+DWM_COLOR_NONE = 0xFFFFFFFE  # DWMWA_COLOR_NONE：让系统不要再画那条边框
+
+
+def no_system_chrome(hwnd):
+    """去掉 Windows 11 给顶层窗口画的系统装饰。
+
+    两件事，都是为了让视频窗口与操作栏真正无缝：
+
+    * ``DWMWA_WINDOW_CORNER_PREFERENCE = DONOTROUND``：系统默认会把顶层窗口四角磨圆，
+      视频窗口一旦被磨圆，上沿两角就从操作栏底下露出桌面，形成一道「缝隙」。
+    * ``DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE``：**这就是操作栏下面那条「黑线」的元凶**。
+      Win11 会给每个顶层窗口画 1px 深色边框，视频窗口是独立的顶层窗口，它上边那条边框
+      正好压在接缝上，看起来像我们自己画的分界线。置成 COLOR_NONE 后系统不再画。
+    """
+    if not hwnd:
+        return False
+    val = ctypes.c_int(1)  # DWMWCP_DONOTROUND
+    dwmapi.DwmSetWindowAttribute(hwnd, DWM_ROUND, ctypes.byref(val), 4)
+    val = ctypes.c_uint(DWM_COLOR_NONE)
+    return dwmapi.DwmSetWindowAttribute(hwnd, DWM_BORDER, ctypes.byref(val), 4) == 0
 
 
 def position_scrcpy(vx, vy, vw, vh):
@@ -1392,12 +1412,7 @@ def watchdog(hwnd):
         if t:
             ex = user32.GetWindowLongW(t, -20)
             user32.SetWindowLongW(t, -20, ex | 0x08000000)  # WS_EX_NOACTIVATE，避免抢焦点
-            # Windows 11 默认会把顶层窗口四角磨圆（DWMWCP_ROUND=2）。视频窗口一旦被
-            # 磨圆，上沿两角就会从操作栏底下露出桌面，形成一道「缝隙」。这里显式关掉
-            # 系统圆角（DWMWCP_DONOTROUND=1），形状完全交给 SetWindowRgn 决定：
-            # 上沿直角紧贴操作栏，只有下面两角是圆的。
-            no_round = ctypes.c_int(1)
-            dwmapi.DwmSetWindowAttribute(t, 33, ctypes.byref(no_round), 4)
+            no_system_chrome(t)
             state['child'] = t
             r = RECT()
             user32.GetWindowRect(t, ctypes.byref(r))
@@ -1538,9 +1553,8 @@ def main():
     state['frame'] = user32.CreateWindowExW(
         0x00080000 | 0x00000080, CLASS_FRAME, '', 0x80000000,
         CFG['x'], CFG['y'], fw, fh, None, None, hinst, None)
-    # 外框用分层窗口逐像素 alpha 自己画圆角，关掉系统圆角避免叠加出毛边
-    no_round = ctypes.c_int(1)
-    dwmapi.DwmSetWindowAttribute(state['frame'], 33, ctypes.byref(no_round), 4)
+    # 外框用分层窗口逐像素 alpha 自己画圆角，关掉系统圆角/边框避免叠加出毛边
+    no_system_chrome(state['frame'])
     move_to_bottom_right()
     update_frame(state['frame'])
     user32.ShowWindow(state['frame'], 5)

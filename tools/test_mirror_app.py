@@ -391,29 +391,44 @@ class TestAdoptAspect(unittest.TestCase):
         self.assertAlmostEqual(m.adopt_aspect(None, 0.5), 0.5)
 
 
-class TestSeam(unittest.TestCase):
-    """接缝：操作栏与视频之间那条 1px 深的线要变成半透明白线。"""
+class TestVideoAreaClear(unittest.TestCase):
+    """接缝与视频区：只有接缝那 1px 可以画（用来盖住 scrcpy 的 1px 底色），其余必须全透明。"""
 
     W, H, TH = 259, 610, 38
 
-    def row(self, y):
-        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
-        return out.getpixel((self.W // 2, y))
+    def image(self):
+        return m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
 
-    def test_seam_row_is_translucent_white(self):
-        """接缝行是白色、但不透明——黑边被压成与操作栏同色的浅线。"""
-        r, g, b, a = self.row(self.TH)
+    def test_seam_masked_with_bar_color(self):
+        r, g, b, a = self.image().getpixel((self.W // 2, self.TH))
         self.assertEqual((r, g, b), (255, 255, 255))
-        self.assertTrue(0 < a < 255)
+        self.assertEqual(a, m.BAR_TINT[3])
 
-    def test_row_below_is_softer(self):
-        """接缝下面一行更淡，过渡不硬。"""
-        self.assertLess(self.row(self.TH + 1)[3], self.row(self.TH)[3])
-        self.assertGreater(self.row(self.TH + 1)[3], 0)
+    def test_rest_of_video_area_transparent(self):
+        out = self.image()
+        for y in range(self.TH + 1, self.H):
+            self.assertEqual(out.getpixel((self.W // 2, y))[3], 0)
 
-    def test_video_area_still_transparent(self):
-        """再往下必须是全透明，否则会挡住手机画面。"""
-        self.assertEqual(self.row(self.TH + 5)[3], 0)
+
+class TestNoSystemChrome(unittest.TestCase):
+    """Windows 11 的系统圆角/系统边框必须关掉。
+
+    那条「操作栏下面的黑线」就是 Win11 给顶层窗口画的 1px 边框（DWMWA_BORDER_COLOR=34），
+    视频窗口是独立顶层窗口，它上边的边框正好压在接缝上。
+    """
+
+    def test_constants(self):
+        self.assertEqual(m.DWM_ROUND, 33)
+        self.assertEqual(m.DWM_BORDER, 34)
+        self.assertEqual(m.DWM_COLOR_NONE, 0xFFFFFFFE)
+
+    def test_none_hwnd_is_noop(self):
+        self.assertFalse(m.no_system_chrome(0))
+
+    def test_both_windows_get_it(self):
+        """视频窗口（接缝）和外框（整窗边缘）都要调。"""
+        src = open(m.__file__, encoding='utf-8').read()
+        self.assertEqual(src.count('no_system_chrome('), 3)  # 定义 1 + 调用 2
 
 
 if __name__ == '__main__':
