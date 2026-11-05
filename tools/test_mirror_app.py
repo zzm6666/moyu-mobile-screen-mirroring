@@ -399,10 +399,11 @@ class TestVideoAreaClear(unittest.TestCase):
     def image(self):
         return m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
 
-    def test_seam_masked_with_bar_color(self):
+    def test_seam_is_pure_white(self):
+        """接缝那 1px 用户要纯白不透明，不要跟着操作栏半透明。"""
         r, g, b, a = self.image().getpixel((self.W // 2, self.TH))
         self.assertEqual((r, g, b), (255, 255, 255))
-        self.assertEqual(a, m.BAR_TINT[3])
+        self.assertEqual(a, 255)
 
     def test_right_column_masked_so_width_matches(self):
         """右边缘也要补齐，否则视频区看起来比操作栏窄 1px。"""
