@@ -754,12 +754,8 @@ def capture_blur(hwnd):
     th = max(1, min(TOOLBAR_H, H))
     t0 = time.perf_counter()
     blank_layered(hwnd, W, H)
-    try:
-        dwmapi.DwmFlush()
-    except Exception:
-        pass
-    # 不能再 sleep：空白帧多留一毫秒，用户就看到操作栏闪一下。DwmFlush 之后
-    # 直接抓已经能拿到真实桌面内容（实测条带标准差与藏窗后的地面真值一致）。
+    # 不需要 DwmFlush：实测（MOYU_BLUR_PROBE 对比）刷透明后立刻 BitBlt，抓到的就是
+    # 真实桌面（mean/stddev 与 flush 后完全一致），省掉这一等就是省掉 16ms 的空白帧。
     img = grab_rect(r.left, r.top, r.right - r.left, th)
     if img is None or img.size[0] <= 0:
         return None
@@ -1474,7 +1470,10 @@ def watchdog(hwnd):
     if f and user32.IsWindowVisible(f) and ch and user32.IsWindow(ch):
         fg = user32.GetForegroundWindow()
         if fg in (f, ch, state['tray']):
-            raise_mirror()
+            # 不要在这里 raise_mirror()：TOPMOST->NOTOPMOST 会让 DWM 重排一次合成，
+            # 分层窗口的操作栏会闪一下；每秒一次 = 用户拖动窗口时看到的「闪烁」。
+            # 真正的置前有两条路：点托盘（toggle/force_foreground）和点视频区（WM_APP_RAISE）。
+            pass
         else:
             sync_child_zorder()
     if state['child'] is None:
