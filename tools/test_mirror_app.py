@@ -341,39 +341,31 @@ class TestShouldRaise(unittest.TestCase):
         self.assertFalse(m.should_raise(10, owns=True))
 
 
-class TestShouldRaiseAfterGone(unittest.TestCase):
-    """刚在最前面的那个窗口被最小化/关掉时，魔芋要不要自己回到最前。
+class TestKeepAbove(unittest.TestCase):
+    """别的窗口最小化后，只把「本来压在它上面」的位次补回来。
 
-    只认「它刚才就是前台」：用户把它挪走是想看别的东西，这时候我们该露面；
-    别的窗口消失跟我们没关系，乱置前就成了抢焦点。
+    用户要的是：点别的窗口（含它的最小化按钮）不该让魔芋跳层。
+    唯一例外是「系统把另一个窗口提到魔芋前面，而那个窗口原本在魔芋后面」——
+    这时不补回来，魔芋就会整扇掉到那个窗口之下（用户报的「直接掉到浏览器之下」）。
     """
 
-    def test_foreground_window_gone_raises(self):
-        self.assertTrue(m.should_raise_after_gone(4242, 4242, True, False, False))
+    def test_we_were_above_target_keep_above(self):
+        order = [999, 4242, 111, 222]  # 999 在最前，4242 其次，111=浏览器
+        self.assertTrue(m.should_keep_above(order, 4242, 111))
 
-    def test_other_window_gone_does_nothing(self):
-        self.assertFalse(m.should_raise_after_gone(4242, 999, True, False, False))
+    def test_we_were_behind_target_do_nothing(self):
+        order = [999, 111, 4242]  # 浏览器在魔芋前面
+        self.assertFalse(m.should_keep_above(order, 4242, 111))
 
-    def test_no_previous_foreground_does_nothing(self):
-        self.assertFalse(m.should_raise_after_gone(4242, 0, True, False, False))
+    def test_missing_window_does_nothing(self):
+        self.assertFalse(m.should_keep_above([999], 4242, 111))
+        self.assertFalse(m.should_keep_above([], 4242, 111))
+        self.assertFalse(m.should_keep_above([4242], 4242, 111))
+        self.assertFalse(m.should_keep_above([4242, 111], 0, 111))
 
-    def test_hidden_window_never_comes_back(self):
-        self.assertFalse(m.should_raise_after_gone(4242, 4242, True, True, False))
-
-    def test_already_front_does_nothing(self):
-        self.assertFalse(m.should_raise_after_gone(4242, 4242, True, False, True))
-
-    def test_invisible_window_does_nothing(self):
-        self.assertFalse(m.should_raise_after_gone(4242, 4242, False, False, False))
-
-    def test_transient_foreground_does_nothing(self):
-        # 一闪而过的提示框/输入法候选当过后台焦点，它消失时不该把我们顶到前面
-        self.assertFalse(m.should_raise_after_gone(4242, 4242, True, False, False,
-                                                   fg_age=0.05))
-        self.assertFalse(m.should_raise_after_gone(4242, 4242, True, False, False,
-                                                   fg_age=m.FG_MIN_AGE - 0.01))
-        self.assertTrue(m.should_raise_after_gone(4242, 4242, True, False, False,
-                                                 fg_age=m.FG_MIN_AGE + 1))
+    def test_accepts_handle_wrappers(self):
+        # 真实调用里两侧可能是 c_void_p / int 混用
+        self.assertTrue(m.should_keep_above([ctypes.c_void_p(999), 4242, 111], 4242, 111))
 
 
 class TestGlassBar(unittest.TestCase):
