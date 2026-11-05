@@ -451,7 +451,7 @@ def mirror_visible():
     f = state['frame']
     if state['hidden'] or not f or not user32.IsWindowVisible(f):
         return False
-    return user32.GetForegroundWindow() in (f, state['child'])
+    return hwnd_value(user32.GetForegroundWindow()) in (hwnd_value(f), hwnd_value(state['child']))
 
 
 def list_devices():
@@ -657,6 +657,22 @@ def lock_aspect(l, t, r, b, hit, aspect, min_video=MIN_VIDEO):
     t = b - h if hit in (12, 13, 14) else t
     b = t + h
     return l, t, r, b
+
+
+def fit_within_bottom(l, t, r, b, bottom_limit, pad=SHADOW_PAD):
+    """高度顶出工作区底边时把整个矩形往上挪，返回调整后的 (l, t, r, b)。
+
+    窗口停在屏幕右下角时，往左拖左边缘会让高度一起变高、立刻顶到工作区底边，
+    如果只是「夹住尺寸」用户会觉得拖了没反应；这里改成上移让位，只要上方还有
+    空间（最多挪到 pad 处），尺寸就照常长。
+    """
+    overflow = b - bottom_limit
+    if overflow <= 0:
+        return l, t, r, b
+    shift = min(overflow, t - pad)
+    if shift <= 0:
+        return l, t, r, b
+    return l, t - shift, r, b - shift
 
 
 def rect_edge_hit(r, x, y, grab=EDGE_GRAB):
@@ -999,7 +1015,7 @@ def force_foreground(hwnd):
     if not hwnd or not user32.IsWindow(hwnd):
         return
     fg = user32.GetForegroundWindow()
-    if fg == hwnd:
+    if hwnd_value(fg) == hwnd_value(hwnd):
         return
     tid_fg = user32.GetWindowThreadProcessId(fg, None) if fg else 0
     tid_me = kernel32.GetCurrentThreadId()
@@ -1073,14 +1089,29 @@ def _inside_frame(pt, f):
     return True, hit, pt.y - c.top
 
 
+def hwnd_value(h):
+    """把 HWND 统一成 int。
+
+    `restype = wt.HWND` 的函数（GetForegroundWindow / WindowFromPoint / CreateWindowExW）
+    返回的是 `c_void_p`，而回调里拿到的、以及 state 里存的往往是 int；两者直接比较
+    **永远不相等**（c_void_p 只和 c_void_p 按值相等），会让「这点是不是我的窗口」「现在
+    是不是我在前台」这类判断恒为 False —— 于是鼠标按在视频区边缘既不缩放也不置前。
+    """
+    if isinstance(h, int):
+        return h
+    return int(getattr(h, 'value', 0) or 0)
+
+
 def _owns_point(pt, f):
     """该点当前是否由本程序接收（而不是被别的窗口盖住）。"""
-    ch = state['child']
-    if user32.WindowFromPoint(pt) in (f, ch):
+    f = hwnd_value(f)
+    ch = hwnd_value(state['child'])
+    hit = hwnd_value(user32.WindowFromPoint(pt))
+    if hit and (hit == f or (ch and hit == ch)):
         return True
     # 圆角/视频区是 alpha=0 的全透明像素，命中的会是底下别的窗口；此时只要
     # 自己就是前台窗口，就认为这一下确实点在我们身上。
-    return user32.GetForegroundWindow() in (f, ch)
+    return hwnd_value(user32.GetForegroundWindow()) in (f, ch)
 
 
 def mouse_hook_proc(n_code, wparam, lparam):
@@ -1298,6 +1329,8 @@ def do_resize(hwnd):
     wa_h_px, wa_w_px = wa_h(), wa_w()
     max_w = (r if hit in (10, 13, 16) else wa_w_px - SHADOW_PAD - l)
     max_h = (b if hit in (12, 13, 14) else wa_h_px - SHADOW_PAD - t)
+    if hit in (10, 11):  # 左右边：允许往上长（下面会整体上移让位）
+        max_h = max(max_h, wa_h_px - 2 * SHADOW_PAD)
     if hit in (10, 11, 13, 14, 16, 17):  # 横向：宽驱动高，两者一起受限
         w_cap = min(max_w, int((max_h - TOOLBAR_H - FRAME) * aspect) + 2 * FRAME)
         if r - l > w_cap:
@@ -1314,6 +1347,10 @@ def do_resize(hwnd):
                 b = t + h_cap
     # 需求3：视频区恒等于手机宽高比，缩到极限也不出黑边/拉伸
     l, t, r, b = lock_aspect(l, t, r, b, hit, aspect)
+    # 左右边缘把高顶到工作区底边时整体上移让位（贴底的窗口也能继续放大）；
+    # 上下边缘/四角的锚点就是那条边本身，不能挪，保持夹取行为。
+    if hit in (10, 11):
+        l, t, r, b = fit_within_bottom(l, t, r, b, wa_h_px - SHADOW_PAD)
     # 内容矩形换算回窗口矩形（外面那圈是投影）再落地
     wl, wt, wr, wb = win_rect(l, t, r, b)
     user32.SetWindowPos(hwnd, None, wl, wt, wr - wl, wb - wt, 0x0004)  # SWP_NOZORDER
@@ -1436,7 +1473,9 @@ def toggle_mirror():
         return
     visible = user32.IsWindowVisible(f)
     fg = user32.GetForegroundWindow()
-    on_top = bool(visible) and fg in (f, state['child']) and not state['hidden']
+    on_top = (bool(visible)
+              and hwnd_value(fg) in (hwnd_value(f), hwnd_value(state['child']))
+              and not state['hidden'])
     if on_top:
         hide_mirror()
         log('toggle: hide (was front)')
@@ -1450,7 +1489,8 @@ def toggle_mirror():
     raise_mirror()
     force_foreground(f)
     log('toggle: show (visible=%s fg=%s) -> visible=%s front=%s'
-        % (visible, fg, user32.IsWindowVisible(f), user32.GetForegroundWindow() == f))
+        % (visible, fg, user32.IsWindowVisible(f),
+           hwnd_value(user32.GetForegroundWindow()) == hwnd_value(f)))
 
 
 def show_menu(hwnd):
@@ -1511,7 +1551,7 @@ def watchdog(hwnd):
             user32.ShowWindow(ch, 0)
     if f and user32.IsWindowVisible(f) and ch and user32.IsWindow(ch):
         fg = user32.GetForegroundWindow()
-        if fg in (f, ch, state['tray']):
+        if hwnd_value(fg) in (hwnd_value(f), hwnd_value(ch), hwnd_value(state['tray'])):
             # 不要在这里 raise_mirror()：TOPMOST->NOTOPMOST 会让 DWM 重排一次合成，
             # 分层窗口的操作栏会闪一下；每秒一次 = 用户拖动窗口时看到的「闪烁」。
             # 真正的置前有两条路：点托盘（toggle/force_foreground）和点视频区（WM_APP_RAISE）。

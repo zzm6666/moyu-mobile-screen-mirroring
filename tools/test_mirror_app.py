@@ -3,6 +3,7 @@
 
 只测纯逻辑，不碰窗口、不碰 scrcpy。用 importlib 按路径加载 mirror_app.py。
 """
+import ctypes
 import importlib.util
 import os
 import unittest
@@ -166,6 +167,29 @@ class TestLockAspect(unittest.TestCase):
             l, t, r, b = m.lock_aspect(l, t, r + step * 7, b + step * 3, 17, self.ASPECT)
             vw, vh = video_of(l, t, r, b)
             self.assertAlmostEqual(vw / vh, self.ASPECT, delta=0.01)
+
+
+class TestFitWithinBottom(unittest.TestCase):
+    """fit_within_bottom：高度顶出工作区底边时整体上移让位。"""
+
+    LIMIT = 1042
+
+    def test_no_overflow_untouched(self):
+        self.assertEqual(m.fit_within_bottom(100, 300, 360, self.LIMIT, self.LIMIT),
+                         (100, 300, 360, self.LIMIT))
+
+    def test_small_overflow_shifts_up(self):
+        l, t, r, b = m.fit_within_bottom(100, 300, 360, self.LIMIT + 20, self.LIMIT)
+        self.assertEqual((l, t, r, b), (100, 280, 360, self.LIMIT))
+
+    def test_shift_capped_by_room_above(self):
+        """上方只剩 5px 余量时只上移 5px，不把窗口顶出屏幕。"""
+        l, t, r, b = m.fit_within_bottom(100, 15, 360, self.LIMIT + 500, self.LIMIT)
+        self.assertEqual((l, t, r, b), (100, 10, 360, self.LIMIT + 495))
+
+    def test_no_room_returns_input(self):
+        self.assertEqual(m.fit_within_bottom(100, 10, 360, self.LIMIT + 30, self.LIMIT),
+                         (100, 10, 360, self.LIMIT + 30))
 
 
 class TestClampRadius(unittest.TestCase):
@@ -572,6 +596,48 @@ class TestAddShadow(unittest.TestCase):
         out = m.add_shadow(src, pad=0)
         self.assertEqual(out.size, (20, 20))
         self.assertEqual(out.getpixel((0, 0)), (1, 2, 3, 255))
+
+
+class TestHwndValue(unittest.TestCase):
+    """HWND 有时是 c_void_p（restype=wt.HWND 的函数返回）、有时是 int（回调里拿到），
+    直接比较永远 False —— 统一成 int 再比。"""
+
+    def test_int_passthrough(self):
+        self.assertEqual(m.hwnd_value(1234), 1234)
+
+    def test_cvoid_p_unwrapped(self):
+        self.assertEqual(m.hwnd_value(ctypes.c_void_p(5678)), 5678)
+
+    def test_none_is_zero(self):
+        self.assertEqual(m.hwnd_value(None), 0)
+
+
+class TestOwnsPoint(unittest.TestCase):
+    """按在视频区边缘时，命中的是 scrcpy 子窗口（不是 frame）：必须认成「自己的」。"""
+
+    def test_child_window_hit_counts_as_ours(self):
+        saved = (m.user32.WindowFromPoint, m.user32.GetForegroundWindow,
+                 m.state.get('child'))
+        try:
+            m.user32.WindowFromPoint = lambda pt: ctypes.c_void_p(4242)
+            m.user32.GetForegroundWindow = lambda: ctypes.c_void_p(7)
+            m.state['child'] = 4242  # int，与 c_void_p 不同型
+            self.assertTrue(m._owns_point(m.POINT(), 11))
+        finally:
+            (m.user32.WindowFromPoint, m.user32.GetForegroundWindow,
+             m.state['child']) = saved
+
+    def test_other_window_not_ours(self):
+        saved = (m.user32.WindowFromPoint, m.user32.GetForegroundWindow,
+                 m.state.get('child'))
+        try:
+            m.user32.WindowFromPoint = lambda pt: ctypes.c_void_p(999)
+            m.user32.GetForegroundWindow = lambda: ctypes.c_void_p(999)
+            m.state['child'] = 4242
+            self.assertFalse(m._owns_point(m.POINT(), 11))
+        finally:
+            (m.user32.WindowFromPoint, m.user32.GetForegroundWindow,
+             m.state['child']) = saved
 
 
 if __name__ == '__main__':
