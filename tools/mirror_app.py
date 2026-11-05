@@ -506,18 +506,23 @@ def get_phone_aspect():
 
 
 def adopt_aspect(cur, measured, tol=0.02):
-    """只有「明显变了」才采纳测到的宽高比（手机旋转），否则保持原值。
+    """只有「手机真的转了方向」才采纳测到的宽高比，否则保持原值。
 
     视频窗口的尺寸是我们自己按 cur 摆出来的，等它出现后再量，量到的就是自己摆的
-    值。无条件采纳会让 aspect 被自己的取整误差污染（真值 0.4545 → 量成 0.4528），
-    视频区比例与真实画面差 1px，scrcpy 就在自己窗口上下补黑边——操作栏下面那条
-    黑线就是这么来的。
+    值（还多出 overscan 那几个像素）。无条件采纳会让 aspect 被自己的取整误差污染：
+    真值 0.4545 量成 0.4528 → 视频区比真实画面差 1px，scrcpy 就在自己窗口上下补黑边；
+    更糟的是量到 → 改窗口 → 再量到 会形成每秒一次的**正反馈**，宽高比一路漂到 2.0，
+    窗口莫名其妙变成横屏。所以同方向下只接受 20% 以上的变化，其它一律当噪声。
     """
     if not measured or measured <= 0:
         return cur
     if not cur or cur <= 0:
         return measured
-    return measured if abs(measured - cur) > tol else cur
+    # 竖↔横是硬信号：方向都变了，直接采纳
+    if (cur < 1) != (measured < 1):
+        return measured
+    # 同方向：只有大幅变化（比如手机镜像分辨率变了）才采纳
+    return measured if abs(measured - cur) > 0.2 * max(cur, measured) else cur
 
 
 def start_scrcpy():
@@ -786,16 +791,17 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     bar = bar.resize((W, th), Image.LANCZOS)
     bar.putalpha(ImageChops.multiply(bar.getchannel('A'), mask))
-    # 底边不再强行刷成不透明：与画面的分界由下面那 1px 纯白线负责，
-    # 这一行保持普通半透明，白线才显得细（否则 37/38 两行都白，看起来 2px 粗）。
+    # 底边不强行刷成不透明：与画面的分界由下面那 1px 纯白线负责，
+    # 这一行保持普通半透明，白线才显得细（否则连续两行都白，看起来像 2px 粗线）。
 
     out = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     out.paste(bar, (0, 0))
-    # 接缝那 1px：操作栏与画面之间的分界线，按用户要求纯白不透明。
-    # 右侧/下边不再补色 —— 那 1px 是 scrcpy 自己留的底色，靠 OVERSCAN 把窗口放大一圈
-    # 并裁回可见区解决；在可见区里再铺半透明白只会变成一条灰边。
+    # 接缝那 1px 白线：视频窗口自己最上面那一行带 1px 深色描边，压在操作栏下沿会
+    # 透成一条灰线；白线正好盖在它上面（位置 = 视频窗口第一行 = th - OVERSCAN）。
+    # 白线以下的行保持透明，画面从那里开始，所以白线始终只有 1px。
     if th < H:
-        out.paste(SEAM_WHITE, (0, th, W, th + 1))
+        line_y = max(0, th - OVERSCAN)
+        out.paste(SEAM_WHITE, (0, line_y, W, line_y + 1))
     return out
 
 
@@ -1450,9 +1456,10 @@ def watchdog(hwnd):
             state['child'] = t
             r = RECT()
             user32.GetWindowRect(t, ctypes.byref(r))
-            w, h = r.right - r.left, r.bottom - r.top
-            if w > 50 and h > 50:
-                state['aspect'] = adopt_aspect(state['aspect'], w / h)
+            # 量出来的尺寸含 overscan，先减掉再算比例，否则每秒都会「量到自己的误差」
+            mw, mh = r.right - r.left - 2 * OVERSCAN, r.bottom - r.top - 2 * OVERSCAN
+            if mw > 50 and mh > 50:
+                state['aspect'] = adopt_aspect(state['aspect'], mw / mh)
                 log('aspect from scrcpy = %.4f' % state['aspect'])
             ensure_frame_orientation()
             update_frame(state['frame'])
@@ -1460,12 +1467,14 @@ def watchdog(hwnd):
             return
     else:
         if user32.IsWindow(state['child']):
-            # 跟随 scrcpy 窗口实际宽高比（反映手机旋转方向）
+            # 跟随 scrcpy 窗口实际宽高比（反映手机旋转方向）。量到的尺寸含 overscan，
+            # 必须先减掉，否则每秒都会量到自己的误差、窗口尺寸被一点点推着走。
             r = RECT()
             user32.GetWindowRect(state['child'], ctypes.byref(r))
-            w, h = r.right - r.left, r.bottom - r.top
-            if w > 50 and h > 50:
-                a = adopt_aspect(state['aspect'], w / h)
+            mw = r.right - r.left - 2 * OVERSCAN
+            mh = r.bottom - r.top - 2 * OVERSCAN
+            if mw > 50 and mh > 50:
+                a = adopt_aspect(state['aspect'], mw / mh)
                 if abs(a - state['aspect']) > 1e-9:
                     state['aspect'] = a
                     ensure_frame_orientation()

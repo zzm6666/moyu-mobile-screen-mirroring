@@ -422,6 +422,11 @@ class TestAdoptAspect(unittest.TestCase):
     def test_rotation_adopted(self):
         self.assertAlmostEqual(m.adopt_aspect(1080 / 2376, 2376 / 1080), 2376 / 1080)
 
+    def test_slow_drift_rejected(self):
+        """横屏时每秒量到的值会差 1% 左右：不能采纳，否则 aspect 一路漂到 2.0、窗口变横屏。"""
+        self.assertAlmostEqual(m.adopt_aspect(2.2331, 2.2119), 2.2331)
+        self.assertAlmostEqual(m.adopt_aspect(0.4545, 0.4528), 0.4545)
+
     def test_empty_measured_keeps_current(self):
         self.assertAlmostEqual(m.adopt_aspect(0.5, 0), 0.5)
         self.assertAlmostEqual(m.adopt_aspect(0.5, None), 0.5)
@@ -439,21 +444,27 @@ class TestVideoAreaClear(unittest.TestCase):
         return m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
 
     def test_seam_is_pure_white(self):
-        """接缝那 1px 用户要纯白不透明，不要跟着操作栏半透明。"""
-        r, g, b, a = self.image().getpixel((self.W // 2, self.TH))
+        """白线盖在视频窗口第一行上（那一行带深色描边），用户要纯白不透明。"""
+        r, g, b, a = self.image().getpixel((self.W // 2, self.TH - m.OVERSCAN))
         self.assertEqual((r, g, b), (255, 255, 255))
         self.assertEqual(a, 255)
 
     def test_seam_line_is_only_one_pixel_thick(self):
-        """白线只有 1px：上一行必须还是普通半透明操作栏，否则看起来像 2px 粗线。"""
+        """白线只有 1px：上下两行都不能是纯白，否则看起来像粗线。"""
         out = self.image()
-        self.assertEqual(out.getpixel((self.W // 2, self.TH - 1))[3], m.BAR_TINT[3])
-        self.assertEqual(out.getpixel((self.W // 2, self.TH))[3], 255)
-        self.assertEqual(out.getpixel((self.W // 2, self.TH + 1))[3], 0)
+        y = self.TH - m.OVERSCAN
+        self.assertEqual(out.getpixel((self.W // 2, y - 1))[3], m.BAR_TINT[3])
+        self.assertEqual(out.getpixel((self.W // 2, y))[3], 255)
+        self.assertEqual(out.getpixel((self.W // 2, y + 1))[3], m.BAR_TINT[3])
+
+    def test_first_video_row_not_covered(self):
+        """白线不能压到画面：视频区第一行必须全透明。"""
+        self.assertEqual(self.image().getpixel((self.W // 2, self.TH))[3], 0)
 
     def test_seam_reaches_right_edge(self):
         """白线要贯穿整个宽度，不能被右边缘补丁切断。"""
-        self.assertEqual(self.image().getpixel((self.W - 1, self.TH))[3], 255)
+        self.assertEqual(
+            self.image().getpixel((self.W - 1, self.TH - m.OVERSCAN))[3], 255)
 
     def test_right_column_stays_transparent(self):
         """右边缘不再补色：画面靠 overscan 铺到边，补一条半透明白反而成灰边。"""
