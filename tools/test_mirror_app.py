@@ -341,31 +341,31 @@ class TestShouldRaise(unittest.TestCase):
         self.assertFalse(m.should_raise(10, owns=True))
 
 
-class TestKeepAbove(unittest.TestCase):
-    """别的窗口最小化后，只把「本来压在它上面」的位次补回来。
+class TestReleaseTarget(unittest.TestCase):
+    """临时置顶到期后怎么落脚：保持「最小化之前」的相对位次，不跳层也不闪。
 
-    用户要的是：点别的窗口（含它的最小化按钮）不该让魔芋跳层。
-    唯一例外是「系统把另一个窗口提到魔芋前面，而那个窗口原本在魔芋后面」——
-    这时不补回来，魔芋就会整扇掉到那个窗口之下（用户报的「直接掉到浏览器之下」）。
+    用户要的是：点别的窗口（含它的最小化按钮）不该让魔芋跳层，也不该让它闪一下
+    被浏览器盖住。做法是先把自身临时置顶挡住过渡，再按原相对位次落脚。
     """
 
-    def test_we_were_above_target_keep_above(self):
-        order = [999, 4242, 111, 222]  # 999 在最前，4242 其次，111=浏览器
-        self.assertTrue(m.should_keep_above(order, 4242, 111))
+    def test_we_were_above_now_fg_stay_on_top(self):
+        order = [999, 4242, 111, 222]  # 4242(魔芋) 在 111(浏览器) 之上
+        self.assertEqual(m.release_target(order, 4242, 111), 0)
 
-    def test_we_were_behind_target_do_nothing(self):
-        order = [999, 111, 4242]  # 浏览器在魔芋前面
-        self.assertFalse(m.should_keep_above(order, 4242, 111))
+    def test_we_were_below_now_fg_go_below_it(self):
+        order = [999, 111, 4242]
+        self.assertEqual(m.release_target(order, 4242, 111), 111)
 
-    def test_missing_window_does_nothing(self):
-        self.assertFalse(m.should_keep_above([999], 4242, 111))
-        self.assertFalse(m.should_keep_above([], 4242, 111))
-        self.assertFalse(m.should_keep_above([4242], 4242, 111))
-        self.assertFalse(m.should_keep_above([4242, 111], 0, 111))
+    def test_unknown_windows_keep_default(self):
+        self.assertEqual(m.release_target([], 4242, 111), 0)
+        self.assertEqual(m.release_target([999, 111], 0, 111), 0)
+        self.assertEqual(m.release_target([999, 111], 4242, 111), 0)
+        self.assertEqual(m.release_target([4242, 111], 4242, 0), 0)
+        self.assertEqual(m.release_target([4242, 111], 4242, 4242), 0)
 
     def test_accepts_handle_wrappers(self):
-        # 真实调用里两侧可能是 c_void_p / int 混用
-        self.assertTrue(m.should_keep_above([ctypes.c_void_p(999), 4242, 111], 4242, 111))
+        # 真实调用里 now_fg 可能是 c_void_p，me 是 int
+        self.assertEqual(m.release_target([999, 111, 4242], 4242, ctypes.c_void_p(111)), 111)
 
 
 class TestGlassBar(unittest.TestCase):

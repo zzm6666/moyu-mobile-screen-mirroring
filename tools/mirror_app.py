@@ -80,7 +80,7 @@ WH_MOUSE_LL = 14
 # 挡在魔芋前面的那个窗口被最小化/关闭后，我们该重新露面；但系统此刻正在切激活，
 # 立刻抢会被它自己的激活覆盖，所以投递一个延迟消息再置前。
 TIMER_RAISE = 5
-RAISE_DELAY_MS = 160
+RAISE_HOLD_MS = 400
 EVENT_SYSTEM_FOREGROUND = 0x0003
 EVENT_SYSTEM_MINIMIZESTART = 0x0016
 EVENT_OBJECT_DESTROY = 0x8001
@@ -467,8 +467,7 @@ state = {
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
     'winevent': None,  # 前台/最小化事件钩子
-    'z_before': None,  # 别人开始最小化那一刻的 Z 序快照（谁在谁前面）
-    'z_target': 0,  # 那扇被最小化的窗口
+    'z_order': None,  # 别人开始最小化那一刻的 Z 序快照
     'hidden': False,  # 用户点了 × / 托盘「隐藏投屏」：收进托盘，只能靠托盘再唤出
     'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
@@ -1270,18 +1269,22 @@ def top_level_order():
     return order
 
 
-def should_keep_above(order, me, target):
-    """别的窗口被最小化后，要不要把魔芋重新托到 target 之上。
+def release_target(order, me, now_fg):
+    """临时置顶到期后该怎么落脚（返回要插到谁下面，0 表示保持默认）。
 
-    只补回「本来就压在 target 之上」的位次：用户看到的应该是「什么都没发生」。
-    魔芋本来就垫在 target 后面时一律不动 —— 那才是「点别的窗口影响了魔芋」。
+    别的窗口最小化时系统会把另一个窗口激活并提到最前，为了不让用户看到「闪一下」，
+    我们在这段时间临时 TOPMOST；到期后：
+    - 原本就压在 now_fg 之上 → 返回 0：撤销 TOPMOST 后落在普通窗带最前，仍在它上面；
+    - 原本垫在 now_fg 之下 → 返回 now_fg：插回它下面，绝不跳层；
+    - 判断不了（快照缺失/前台未知）→ 返回 0，保持默认。
     """
-    me, target = hwnd_value(me), hwnd_value(target)
-    if not me or not target or me == target:
-        return False
-    if me not in order or target not in order:
-        return False
-    return order.index(me) < order.index(target)
+    me, now_fg = hwnd_value(me), hwnd_value(now_fg)
+    if not me or not now_fg or me == now_fg:
+        return 0
+    try:
+        return 0 if order.index(me) < order.index(now_fg) else now_fg
+    except (ValueError, AttributeError):
+        return 0
 
 
 
@@ -1312,8 +1315,9 @@ def is_real_window(h):
 def foreground_event_proc(hook, event, hwnd, id_object, id_child, tid, ms):
     """WinEvent 回调（跑在消息循环里）：只盯「别的真实窗口开始最小化」。
 
-    这里只拍一张 Z 序快照并投递延迟消息，真正的补救交给 TIMER_RAISE：系统此刻
-    正在切激活，立刻动手会被它自己的激活覆盖掉。
+    系统会在这之后把另一个窗口激活并提到最前，魔芋会先被盖住、再由我们托回来，
+    用户看到的就是「闪一下」。所以在这一刻就抢先把自己临时置顶（TOPMOST）挡住
+    这段过渡，并记下原来的邻居当锚点；RAISE_HOLD_MS 之后由 TIMER_RAISE 复位。
     """
     try:
         if event != EVENT_SYSTEM_MINIMIZESTART:
@@ -1327,9 +1331,11 @@ def foreground_event_proc(hook, event, hwnd, id_object, id_child, tid, ms):
         fg = hwnd_value(user32.GetForegroundWindow())
         if fg == f:
             return  # 前台本来就是魔芋，被最小化的是它后面那扇，跟我们无关
-        state['z_before'] = top_level_order()
-        state['z_target'] = h
-        user32.SetTimer(f, TIMER_RAISE, RAISE_DELAY_MS, None)
+        state['z_order'] = top_level_order()
+        user32.SetWindowPos(f, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        log('raise: hold topmost to avoid flicker')
+        user32.SetTimer(f, TIMER_RAISE, RAISE_HOLD_MS, None)
     except Exception:
         pass
 
@@ -1582,22 +1588,23 @@ def frame_proc(hwnd, msg, wparam, lparam):
             do_resize(hwnd)
             return 0
         if wparam == TIMER_RAISE:
-            # 别的窗口被最小化后，系统会把另一个窗口激活并提到它前面。如果魔芋原本
-            # 就压在那个窗口之上，这里把位次补回来（视觉上「什么都没发生」）；
-            # 原本就垫在后面则不动，绝不主动抢到最前。
+            # 临时置顶到期：撤销 TOPMOST 并按「最小化之前的相对位次」落脚。
+            # 原本在对方之上 -> 落在普通窗带最前（仍在它上面）；
+            # 原本在对方之下 -> 插回它下面。层级和最小化之前一致，也不闪。
             user32.KillTimer(hwnd, TIMER_RAISE)
-            order_before = state['z_before'] or []
-            target = state['z_target'] or 0
-            state['z_before'], state['z_target'] = None, 0
-            if not state['hidden'] and user32.IsWindowVisible(hwnd):
-                now_fg = hwnd_value(user32.GetForegroundWindow())
-                keep = should_keep_above(order_before, hwnd, now_fg)
-                if not keep and not now_fg:
-                    keep = should_keep_above(order_before, hwnd, target)
-                if keep:
-                    # 只补 Z 序，不抢焦点：用户的输入焦点该跟着他自己点的窗口走
-                    log('raise: keep above the window that was behind us')
-                    raise_mirror()
+            order_before = state['z_order'] or []
+            state['z_order'] = None
+            now_fg = hwnd_value(user32.GetForegroundWindow())
+            below = release_target(order_before, hwnd, now_fg)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            if (below and below != hwnd_value(hwnd)
+                    and user32.IsWindow(below) and user32.IsWindowVisible(below)):
+                # hWndInsertAfter = below → 插到它之后，也就是它底下
+                user32.SetWindowPos(hwnd, below, 0, 0, 0, 0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            sync_child_zorder()
+            log('raise: released topmost below=%s fg=%s' % (below, now_fg))
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE
