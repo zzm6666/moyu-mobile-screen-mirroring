@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -57,6 +57,13 @@ MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
 ICON_SIZE = 20  # 操作栏左侧应用图标边长
 ICON_LEFT = 9  # 图标左边距
+
+# --- 整窗投影（操作栏 + 视频区一起投）---
+# 分层窗口系统不会给阴影，只能自己在外扩出来的一圈里画：窗口比可见内容四周各
+# 大 SHADOW_PAD，外面那圈画模糊的黑色圆角矩形，里面照旧画操作栏/留透明洞。
+SHADOW_PAD = 10  # 四周外扩像素（也等于阴影能扩散的最大距离）
+SHADOW_BLUR = 4.0  # 高斯模糊半径：越小越贴边、越大越飘
+SHADOW_ALPHA = 120  # 阴影最深处的 alpha（0~255）：淡淡的，不抢画面
 
 # --- 窗口 Z 序 ---
 HWND_TOP = 0
@@ -713,6 +720,43 @@ def child_box(vx, vy, vw, vh, overscan=OVERSCAN):
     return (vx - overscan, vy - overscan, vw + 2 * overscan, vh + 2 * overscan)
 
 
+def content_size(win_w, win_h, pad=SHADOW_PAD):
+    """窗口尺寸 → 可见内容尺寸（去掉四周的投影外扩）。"""
+    return max(0, int(win_w) - 2 * pad), max(0, int(win_h) - 2 * pad)
+
+
+def content_rect(l, t, r, b, pad=SHADOW_PAD):
+    """窗口矩形（屏幕坐标）→ 可见内容的矩形。"""
+    return int(l) + pad, int(t) + pad, int(r) - pad, int(b) - pad
+
+
+def win_rect(l, t, r, b, pad=SHADOW_PAD):
+    """可见内容的矩形 → 窗口矩形（向外扩出投影用的一圈）。"""
+    return int(l) - pad, int(t) - pad, int(r) + pad, int(b) + pad
+
+
+def add_shadow(img, pad=SHADOW_PAD, blur=SHADOW_BLUR, alpha=SHADOW_ALPHA):
+    """给内容图层加一圈淡淡的整窗投影，返回 (W+2pad, H+2pad) 的新画布。
+
+    做法：按内容轮廓画一个圆角矩形蒙版 → 高斯模糊 → 当黑色半透明图层铺在底下，
+    再把内容原样贴回中心。模糊只发生在外扩出来的一圈里，内容像素一个都不改。
+    pad=0 时原样返回（方便对比/回退）。
+    """
+    if pad <= 0:
+        return img.copy()
+    w, h = img.size
+    out = Image.new('RGBA', (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+    mask = Image.new('L', out.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        [pad, pad, pad + w - 1, pad + h - 1], radius=CORNER_R, fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(blur))
+    shadow = Image.new('RGBA', out.size, (0, 0, 0, max(0, min(255, int(alpha)))))
+    out.paste(shadow, (0, 0), mask)
+    out.alpha_composite(img, (pad, pad))
+    return out
+
+
+
 def apply_child_round_region(vw, vh):
     """给视频窗口（scrcpy）套圆角裁剪区：四角外真正透出桌面，不是覆盖色块。
 
@@ -862,7 +906,9 @@ def ensure_frame_orientation():
     if orient == state['orient']:
         return
     state['orient'] = orient
-    fw, fh, vw, vh = frame_size_for_aspect(state['aspect'])
+    cw, ch = frame_size_for_aspect(state['aspect'])[:2]
+    # 外框要带四周的投影外扩，内容尺寸加回去才是真正的窗口尺寸
+    fw, fh = cw + 2 * SHADOW_PAD, ch + 2 * SHADOW_PAD
     r = RECT()
     user32.GetWindowRect(f, ctypes.byref(r))
     x, y = r.left, r.top
@@ -875,7 +921,7 @@ def ensure_frame_orientation():
     user32.SetWindowPos(f, None, x, y, fw, fh, 0x0004)  # SWP_NOZORDER
     update_frame(f)
     log('orientation -> %s (%dx%d) at (%d,%d) moved=%s'
-        % (orient, fw, fh, x, y, state.get('user_moved')))
+        % (orient, cw, ch, x, y, state.get('user_moved')))
 
 
 def wa_w():
@@ -923,7 +969,9 @@ def position_scrcpy(vx, vy, vw, vh):
     user32.GetWindowRect(f, ctypes.byref(fr))
     # 显式插到 frame 正下方：不用 HWND_TOP，避免 Z 序被其它机制反复打乱
     bx, by, bw, bh = child_box(vx, vy, vw, vh)
-    user32.SetWindowPos(ch, f, fr.left + bx, fr.top + by, bw, bh, SWP_NOACTIVATE)
+    # 可见内容的原点在窗口内偏移 SHADOW_PAD（外面那圈是投影）
+    user32.SetWindowPos(ch, f, fr.left + SHADOW_PAD + bx, fr.top + SHADOW_PAD + by,
+                        bw, bh, SWP_NOACTIVATE)
     apply_child_round_region(vw, vh)
 
 
@@ -1008,12 +1056,17 @@ def press_should_raise(dy, toolbar=TOOLBAR_H):
 
 
 def _inside_frame(pt, f):
-    """屏幕点是否在 frame 外框内，给出它属于哪条抓边（0=不是抓边）与相对高度。"""
+    """屏幕点是否在 frame 外框内，给出它属于哪条抓边（0=不是抓边）与相对内容顶的高度。"""
     r = RECT()
     user32.GetWindowRect(f, ctypes.byref(r))
     if not (r.left <= pt.x < r.right and r.top <= pt.y < r.bottom):
         return False, 0, 0
-    return True, edge_hit(r, pt.x, pt.y), pt.y - r.top
+    # 抓边/操作栏都按「可见内容」的矩形算：外面那圈是投影，不算内容
+    c = RECT()
+    c.left, c.top, c.right, c.bottom = content_rect(r.left, r.top, r.right, r.bottom)
+    # 操作栏整条（连它上面那圈投影）都不算抓边：顶部留给拖动
+    hit = edge_hit(c, pt.x, pt.y, toolbar=TOOLBAR_H + SHADOW_PAD)
+    return True, hit, pt.y - c.top
 
 
 def _owns_point(pt, f):
@@ -1084,8 +1137,8 @@ def remove_mouse_hook():
 def update_frame(hwnd, force=False):
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
-    W = r.right - r.left
-    H = r.bottom - r.top
+    # 窗口比可见内容四周各大 SHADOW_PAD（那圈画投影），一切几何都按内容尺寸算
+    W, H = content_size(r.right - r.left, r.bottom - r.top)
     if W <= 0 or H <= 0:
         return
     vx, vy, vw, vh = calc_video_rect(W, H)
@@ -1100,9 +1153,9 @@ def update_frame(hwnd, force=False):
     # 否则每一次 WM_WINDOWPOSCHANGED 都要白跑十几毫秒，反过来又把视频拖后。
     if not force and state['moving'] and state['drawn_size'] == size:
         return
-    img = build_frame_image(W, H, vx, vy, vw, vh)
+    img = add_shadow(build_frame_image(W, H, vx, vy, vw, vh))
     raw = premultiply(img).tobytes('raw', 'BGRA')
-    draw_layered(hwnd, W, H, raw)
+    draw_layered(hwnd, W + 2 * SHADOW_PAD, H + 2 * SHADOW_PAD, raw)
     state['drawn_size'] = size
 
 
@@ -1117,8 +1170,9 @@ def in_close_button(hwnd, lparam):
     y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
     r = RECT()
     user32.GetClientRect(hwnd, ctypes.byref(r))
-    W = r.right
-    return x >= W - CLOSE_W and y < TOOLBAR_H
+    pad = SHADOW_PAD
+    cw = r.right - 2 * pad  # 可见内容宽度
+    return x >= pad + cw - CLOSE_W and pad <= y < pad + TOOLBAR_H
 
 
 def set_cursor_if_close(hwnd):
@@ -1127,8 +1181,9 @@ def set_cursor_if_close(hwnd):
     user32.ScreenToClient(hwnd, ctypes.byref(pt))
     r = RECT()
     user32.GetClientRect(hwnd, ctypes.byref(r))
-    W = r.right
-    if pt.x >= W - CLOSE_W and pt.y < TOOLBAR_H:
+    pad = SHADOW_PAD
+    cw = r.right - 2 * pad
+    if pt.x >= pad + cw - CLOSE_W and pad <= pt.y < pad + TOOLBAR_H:
         user32.SetCursor(user32.LoadCursorW(None, 32649))  # IDC_HAND
         return True
     return False
@@ -1150,15 +1205,18 @@ def frame_hittest(hwnd, lparam):
     r = RECT()
     user32.GetClientRect(hwnd, ctypes.byref(r))
     cx, cy = pt.x, pt.y
-    W, H = r.right, r.bottom
+    W, H = r.right, r.bottom  # 窗口尺寸（含四周投影外扩）
+    pad = SHADOW_PAD
+    iw, ih = W - 2 * pad, H - 2 * pad  # 可见内容尺寸
     # 操作栏整条只用于拖动（含关闭按钮），不参与缩放，所以先处理它
-    if cy < TOOLBAR_H:
-        if cx >= W - CLOSE_W:
+    if cy < pad + TOOLBAR_H:
+        if cx >= pad + iw - CLOSE_W and cy >= pad:
             return 1  # HTCLIENT（关闭按钮）
         return 2  # HTCAPTION（拖动）
-    left = cx < RESIZE_EDGE
-    right = cx > W - RESIZE_EDGE
-    bottom = cy > H - RESIZE_EDGE
+    # 抓边带贴着可见内容的边缘（往外延伸进投影那一圈，更好抓）
+    left = cx < pad + RESIZE_EDGE
+    right = cx > pad + iw - RESIZE_EDGE
+    bottom = cy > pad + ih - RESIZE_EDGE
     if left and bottom:
         return 16
     if right and bottom:
@@ -1169,6 +1227,9 @@ def frame_hittest(hwnd, lparam):
         return 11
     if bottom:
         return 15
+    # 投影那一圈既不是内容也不是抓边：不吃鼠标，直接让给下面的窗口/桌面
+    if cx < pad or cx >= pad + iw or cy >= pad + ih:
+        return -1  # HTTRANSPARENT
     return 1
 
 
@@ -1185,7 +1246,8 @@ def start_resize(hwnd, hit):
     state['resize_pt'] = (pt.x, pt.y)
     r = RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
-    state['resize_rect'] = (r.left, r.top, r.right, r.bottom)
+    # 缩放全程按「可见内容」矩形算，投影那一圈不参与（否则多算 2*SHADOW_PAD）
+    state['resize_rect'] = content_rect(r.left, r.top, r.right, r.bottom)
     # 用定时器轮询光标驱动缩放：鼠标压在被 scrcpy 覆盖的视频区上时，frame 拿不到
     # WM_MOUSEMOVE（SetCapture 也救不回来），只有轮询才是稳的。
     user32.SetTimer(hwnd, TIMER_RESIZE, 10, None)
@@ -1227,10 +1289,11 @@ def do_resize(hwnd):
             t = b - min_h
         else:
             b = t + min_h
-    # 不许缩放到屏幕外：被拖动的那条边是锚点，对边向工作区内收
+    # 不许缩放到屏幕外：被拖动的那条边是锚点，对边向工作区内收；
+    # 另一侧还要留出投影那一圈（SHADOW_PAD），不能让阴影顶出屏幕
     wa_h_px, wa_w_px = wa_h(), wa_w()
-    max_w = (r if hit in (10, 13, 16) else wa_w_px - l)
-    max_h = (b if hit in (12, 13, 14) else wa_h_px - t)
+    max_w = (r if hit in (10, 13, 16) else wa_w_px - SHADOW_PAD - l)
+    max_h = (b if hit in (12, 13, 14) else wa_h_px - SHADOW_PAD - t)
     if hit in (10, 11, 13, 14, 16, 17):  # 横向：宽驱动高，两者一起受限
         w_cap = min(max_w, int((max_h - TOOLBAR_H - FRAME) * aspect) + 2 * FRAME)
         if r - l > w_cap:
@@ -1247,7 +1310,9 @@ def do_resize(hwnd):
                 b = t + h_cap
     # 需求3：视频区恒等于手机宽高比，缩到极限也不出黑边/拉伸
     l, t, r, b = lock_aspect(l, t, r, b, hit, aspect)
-    user32.SetWindowPos(hwnd, None, l, t, r - l, b - t, 0x0004)  # SWP_NOZORDER
+    # 内容矩形换算回窗口矩形（外面那圈是投影）再落地
+    wl, wt, wr, wb = win_rect(l, t, r, b)
+    user32.SetWindowPos(hwnd, None, wl, wt, wr - wl, wb - wt, 0x0004)  # SWP_NOZORDER
 
 
 def end_resize():
@@ -1283,8 +1348,9 @@ def frame_proc(hwnd, msg, wparam, lparam):
         return 0
     if msg == 0x0024:  # WM_GETMINMAXINFO
         mmi = ctypes.cast(lparam, ctypes.POINTER(MINMAXINFO)).contents
-        mmi.ptMinTrackSize.x = 2 * FRAME + MIN_VIDEO
-        mmi.ptMinTrackSize.y = TOOLBAR_H + FRAME + MIN_VIDEO
+        # 系统按窗口尺寸（含投影外扩）算跟踪下限，所以两边都要加回 2*SHADOW_PAD
+        mmi.ptMinTrackSize.x = 2 * FRAME + MIN_VIDEO + 2 * SHADOW_PAD
+        mmi.ptMinTrackSize.y = TOOLBAR_H + FRAME + MIN_VIDEO + 2 * SHADOW_PAD
         return 0
     if msg == 0x0020:  # WM_SETCURSOR
         if state['resizing']:
@@ -1325,14 +1391,15 @@ def frame_proc(hwnd, msg, wparam, lparam):
         # 必须在 frame 真正被挪走之前把视频窗口放到同一位置，两者才会在同一帧里
         # 一起动；等 WM_WINDOWPOSCHANGED 再补就已经晚一步，看起来就是「脱节」。
         rc = ctypes.cast(lparam, ctypes.POINTER(RECT)).contents
-        vx, vy, vw, vh = calc_video_rect(rc.right - rc.left, rc.bottom - rc.top)
+        cvx, cvy, cvw, cvh = content_size(rc.right - rc.left, rc.bottom - rc.top)
+        vx, vy, vw, vh = calc_video_rect(cvx, cvy)
         ch = state['child']
         if ch and user32.IsWindow(ch):
             # 必须和 position_scrcpy 用同一套 child_box 尺寸，否则拖动时视频窗口在
             # 「overscan 尺寸」和「裸尺寸」之间来回跳，画面会抖、边上会闪黑边。
             bx, by, bw, bh = child_box(vx, vy, vw, vh)
-            user32.SetWindowPos(ch, hwnd, rc.left + bx, rc.top + by, bw, bh,
-                                SWP_NOACTIVATE)
+            user32.SetWindowPos(ch, hwnd, rc.left + SHADOW_PAD + bx,
+                                rc.top + SHADOW_PAD + by, bw, bh, SWP_NOACTIVATE)
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0047 or msg == 0x0005:  # WM_WINDOWPOSCHANGED / WM_SIZE
         update_frame(hwnd)
@@ -1591,8 +1658,8 @@ def main():
     user32.SetTimer(state['tray'], 1, 1000, None)
 
     register(CLASS_FRAME, frame_proc)
-    fw = CFG['w'] + 2 * FRAME
-    fh = CFG['h'] + TOOLBAR_H + FRAME
+    fw = CFG['w'] + 2 * FRAME + 2 * SHADOW_PAD
+    fh = CFG['h'] + TOOLBAR_H + FRAME + 2 * SHADOW_PAD
     state['frame'] = user32.CreateWindowExW(
         0x00080000 | 0x00000080, CLASS_FRAME, '', 0x80000000,
         CFG['x'], CFG['y'], fw, fh, None, None, hinst, None)
@@ -1601,7 +1668,8 @@ def main():
     move_to_bottom_right()
     update_frame(state['frame'])
     user32.ShowWindow(state['frame'], 5)
-    log('main: frame hwnd=%s size=%dx%d' % (state['frame'], fw, fh))
+    log('main: frame hwnd=%s size=%dx%d (content %dx%d, shadow pad=%d)'
+        % (state['frame'], fw, fh, fw - 2 * SHADOW_PAD, fh - 2 * SHADOW_PAD, SHADOW_PAD))
     install_mouse_hook()
 
     threading.Thread(target=start_scrcpy, daemon=True).start()

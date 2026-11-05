@@ -7,6 +7,8 @@ import importlib.util
 import os
 import unittest
 
+from PIL import Image
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, 'mirror_app.py')
 
@@ -506,6 +508,58 @@ class TestNoSystemChrome(unittest.TestCase):
         """视频窗口（接缝）和外框（整窗边缘）都要调。"""
         src = open(m.__file__, encoding='utf-8').read()
         self.assertEqual(src.count('no_system_chrome('), 3)  # 定义 1 + 调用 2
+
+
+class TestShadowPad(unittest.TestCase):
+    """整窗投影：窗口比可见内容四周各外扩 SHADOW_PAD，几何换算必须成对。"""
+
+    def test_content_size_strips_pad(self):
+        p = m.SHADOW_PAD
+        self.assertEqual(m.content_size(260 + 2 * p, 610 + 2 * p), (260, 610))
+
+    def test_content_size_never_negative(self):
+        self.assertEqual(m.content_size(4, 4), (0, 0))
+
+    def test_rect_round_trip(self):
+        p = m.SHADOW_PAD
+        self.assertEqual(m.content_rect(100 - p, 200 - p, 360 + p, 810 + p), (100, 200, 360, 810))
+        self.assertEqual(m.win_rect(100, 200, 360, 810), (100 - p, 200 - p, 360 + p, 810 + p))
+
+
+class TestAddShadow(unittest.TestCase):
+    """淡淡的整窗投影：只在外扩的那一圈画黑色半透明，内容像素不许被改。"""
+
+    def test_canvas_grows_by_pad(self):
+        p = m.SHADOW_PAD
+        out = m.add_shadow(Image.new('RGBA', (60, 40), (10, 20, 30, 255)))
+        self.assertEqual(out.size, (60 + 2 * p, 40 + 2 * p))
+
+    def test_content_pixels_untouched(self):
+        p = m.SHADOW_PAD
+        out = m.add_shadow(Image.new('RGBA', (60, 40), (10, 20, 30, 255)))
+        self.assertEqual(out.getpixel((p, p)), (10, 20, 30, 255))
+        self.assertEqual(out.getpixel((p + 59, p + 39)), (10, 20, 30, 255))
+
+    def test_faint_dark_ring_outside(self):
+        p = m.SHADOW_PAD
+        out = m.add_shadow(Image.new('RGBA', (60, 40), (255, 255, 255, 255)))
+        # 紧贴内容左侧那一列有淡淡阴影，且是暗色（不是白色描边）
+        r, g, b, a = out.getpixel((p - 1, p + 20))
+        self.assertGreater(a, 10)
+        self.assertLess(a, 200)  # 淡：不能是实心
+        self.assertLess(r, 140)
+
+    def test_outer_corners_transparent(self):
+        out = m.add_shadow(Image.new('RGBA', (60, 40), (255, 255, 255, 255)))
+        w, h = out.size
+        for xy in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+            self.assertEqual(out.getpixel(xy)[3], 0)
+
+    def test_zero_pad_is_passthrough(self):
+        src = Image.new('RGBA', (20, 20), (1, 2, 3, 255))
+        out = m.add_shadow(src, pad=0)
+        self.assertEqual(out.size, (20, 20))
+        self.assertEqual(out.getpixel((0, 0)), (1, 2, 3, 255))
 
 
 if __name__ == '__main__':
