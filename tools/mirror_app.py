@@ -43,8 +43,7 @@ CREATE_NO_WINDOW = 0x08000000
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
-TINT_TOP = (255, 255, 255, 146)  # 白色半透明（上）：暗背景上也要读作「白」
-TINT_BOTTOM = (240, 246, 255, 112)  # 越往下越透，形成玻璃厚度感
+BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (104, 108, 118, 255)  # 关闭 × 默认中性灰，白玻璃上要有足够对比
 CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
@@ -701,8 +700,8 @@ def premultiply(img):
 def build_frame_image(W, H, vx, vy, vw, vh):
     """只绘制顶部操作栏：上方两个圆角、下方直角与视频无缝衔接；视频区全透明。
 
-    操作栏是真半透明：画布从全透明起手，只叠一层白色竖向渐变 tint，靠分层窗口的
-    per-pixel alpha 直接透出背后的桌面。**不做截屏模糊**——截屏方案每次都得先把
+    操作栏是真半透明：整条刷一层**不带渐变**的白色（alpha 就是透过率），靠分层窗口
+    的 per-pixel alpha 直接透出背后的桌面。**不做截屏模糊**——截屏方案每次都得先把
     窗口刷成全透明再抓背景，刷的那一下加一次重画，就是用户看到的「操作栏消失又
     出现」。整条路径已删除，操作栏从此不需要「刷新背景」。
     整条操作栏在 SS 倍超采样画布上绘制后 LANCZOS 缩回，圆角/文字/图形统一抗锯齿。
@@ -710,16 +709,8 @@ def build_frame_image(W, H, vx, vy, vw, vh):
     th = min(TOOLBAR_H, H)
     sW, sH = W * SS, th * SS
 
-    # 竖向渐变 tint：上亮下略沉，比纯半透明更有玻璃质感（alpha 即窗口透过率）
-    top_c, bot_c = TINT_TOP, TINT_BOTTOM
-    rows = []
-    for y in range(sH):
-        t = y / max(1, sH - 1)
-        rows.append(tuple(int(top_c[i] + (bot_c[i] - top_c[i]) * t)
-                          for i in range(4)))
-    grad = Image.new('RGBA', (1, sH))
-    grad.putdata(rows)
-    bar = grad.resize((sW, sH))
+    # 纯色白（无竖向渐变）：透明度足够高，背后的字/色块只留一点点，文字始终清晰
+    bar = Image.new('RGBA', (sW, sH), BAR_TINT)
 
     # UI 图层（独立图层再合成，保证半透明像素正确）
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))

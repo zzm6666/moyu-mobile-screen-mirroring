@@ -274,15 +274,39 @@ class TestGlassBar(unittest.TestCase):
         self.assertFalse(hasattr(m, 'blank_layered'))
 
     def test_bar_is_really_translucent(self):
+        """仍是半透明，但透明度要足够高（文字优先），不是全不透明。"""
         m.state['close_hover'] = False
         out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
         a = out.crop((90, 10, self.W - 70, 11)).getchannel('A')
-        self.assertLessEqual(a.getextrema()[1], 200)
+        self.assertGreaterEqual(a.getextrema()[1], 200)
+        self.assertLess(a.getextrema()[1], 255)
 
-    def test_dark_backdrop_still_white_glass(self):
-        """暗底也必须是白玻璃（用户明确要白色半透明，不要自适应变黑）。"""
+    def test_bar_has_no_vertical_gradient(self):
+        """操作栏是纯色白，不允许竖向渐变（用户明确不要渐变）。"""
+        from PIL import Image
+        m.state['close_hover'] = False
+        bg = Image.new('RGBA', (self.W, self.H), (120, 120, 120, 255))
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
+        bg.alpha_composite(out)
+        top = sum(bg.crop((90, 4, self.W - 70, 5)).convert('RGB').getpixel((0, 0)))
+        bottom = sum(bg.crop((90, 32, self.W - 70, 33)).convert('RGB').getpixel((0, 0)))
+        self.assertLessEqual(abs(top - bottom), 3)
+
+    def test_dark_backdrop_still_white(self):
+        """暗底也必须读作白色：提高不透明度后，背后深色最多只让条子略沉。"""
         dark_bar = sum(self.render((20, 20, 20)).mean) / 3
-        self.assertGreater(dark_bar, 105)  # 明显被白色玻璃提亮（原始底色只有 20）
+        self.assertGreater(dark_bar, 210)  # 原始底色只有 20，必须被白色压上去
+
+    def test_text_contrast_on_dark_backdrop(self):
+        """文字清晰度：暗底上标题文字必须比条子底色暗出足够多（对比度）。"""
+        from PIL import Image
+        m.state['close_hover'] = False
+        bg = Image.new('RGBA', (self.W, self.H), (20, 20, 20, 255))
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
+        bg.alpha_composite(out)
+        title = bg.crop((38, 10, 70, 26)).convert('L')
+        bar = bg.crop((90, 10, self.W - 70, 26)).convert('L')
+        self.assertGreater(bar.getextrema()[0] - title.getextrema()[0], 100)
 
     def test_light_backdrop_glass_is_bright(self):
         self.assertGreater(sum(self.render((250, 250, 250)).mean) / 3, 150)
