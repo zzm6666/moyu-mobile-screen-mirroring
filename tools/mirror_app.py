@@ -45,8 +45,8 @@ CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
 BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
 TEXT_COLOR = (56, 58, 66, 255)
-CLOSE_X_COLOR = (104, 108, 118, 255)  # 关闭 × 默认中性灰，白玻璃上要有足够对比
-CLOSE_X_HOVER = (44, 46, 54, 255)  # 悬停时 × 变深（无红底）
+CLOSE_X_COLOR = (152, 157, 166, 255)  # 关闭 × 默认浅灰：白条上要淡，不抢注意力
+CLOSE_X_HOVER = (104, 109, 118, 255)  # 悬停时略变深（仍然轻，无红底）
 MARGIN = 16  # 窗口与屏幕右边/底部（任务栏上沿）的统一边距
 VIDEO_LONG = 572  # 视频区长边（竖屏=高，横屏=宽），保持不变形切换
 ICON_SIZE = 20  # 操作栏左侧应用图标边长
@@ -732,7 +732,7 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     # 关闭 ×：自绘圆头细线，hover 仅变深，不加红底
     cx, cy = sW - (CLOSE_W * SS) // 2, sH // 2
-    half, lw = 6 * SS, 2 * SS
+    half, lw = int(4.5 * SS), int(1.5 * SS)  # 尺寸明显收小、线条变细（比标题轻得多）
     x_color = CLOSE_X_HOVER if state['close_hover'] else CLOSE_X_COLOR
     d.line([(cx - half, cy - half), (cx + half, cy + half)], fill=x_color, width=lw)
     d.line([(cx + half, cy - half), (cx - half, cy + half)], fill=x_color, width=lw)

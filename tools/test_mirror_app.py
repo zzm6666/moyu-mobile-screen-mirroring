@@ -328,6 +328,30 @@ class TestGlassBar(unittest.TestCase):
         self.assertLess(max(ImageStat.Stat(row).stddev), 1.5)
 
 
+class TestCloseButton(unittest.TestCase):
+    """关闭 ×：比标题更轻——颜色浅、尺寸小，白条上不抢注意力。"""
+
+    W, H, TH = 259, 610, 38
+
+    def region(self, hover=False):
+        m.state['close_hover'] = hover
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
+        return out.crop((self.W - m.CLOSE_W, 0, self.W, self.TH)).convert('L')
+
+    def test_cross_is_light(self):
+        """颜色浅：× 最深的像素也远浅于文字色（56）。"""
+        self.assertGreaterEqual(self.region().getextrema()[0], 130)
+
+    def test_cross_is_small(self):
+        """尺寸小：× 覆盖的像素占关闭区不到 6%。"""
+        px = list(self.region().getdata())
+        dark = sum(1 for v in px if v < 200)
+        self.assertLess(dark, len(px) * 0.06)
+
+    def test_hover_still_darkens(self):
+        self.assertLess(self.region(True).getextrema()[0], self.region(False).getextrema()[0])
+
+
 class TestPickSerial(unittest.TestCase):
     """pick_serial：配置串号在线就用它，不在线自动退回在线设备（无线调试端口会变）。"""
 
