@@ -392,7 +392,7 @@ class TestAdoptAspect(unittest.TestCase):
 
 
 class TestVideoAreaClear(unittest.TestCase):
-    """接缝与视频区：只有接缝那 1px 可以画（用来盖住 scrcpy 的 1px 底色），其余必须全透明。"""
+    """接缝与右边缘那 1px 用操作栏同色补齐（scrcpy 整数取整会留 1px 底色），其余全透明。"""
 
     W, H, TH = 259, 610, 38
 
@@ -403,6 +403,15 @@ class TestVideoAreaClear(unittest.TestCase):
         r, g, b, a = self.image().getpixel((self.W // 2, self.TH))
         self.assertEqual((r, g, b), (255, 255, 255))
         self.assertEqual(a, m.BAR_TINT[3])
+
+    def test_right_column_masked_so_width_matches(self):
+        """右边缘也要补齐，否则视频区看起来比操作栏窄 1px。"""
+        self.assertEqual(self.image().getpixel((self.W - 1, self.TH + 50))[3],
+                         m.BAR_TINT[3])
+
+    def test_bottom_corner_stays_clear(self):
+        """底部圆角区域不能画，否则会在圆角外冒出直角。"""
+        self.assertEqual(self.image().getpixel((self.W - 1, self.H - 2))[3], 0)
 
     def test_rest_of_video_area_transparent(self):
         out = self.image()
