@@ -44,6 +44,8 @@ CREATE_NO_WINDOW = 0x08000000
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
 BAR_TINT = (255, 255, 255, 224)  # 白色半透明（无渐变）：224/255 够白，文字始终清晰
+SEAM_ALPHA = 224  # 操作栏与视频接缝那 1px 的半透明白线（盖住 scrcpy 的黑边）
+SEAM_ALPHA_SOFT = 110  # 接缝下面再一行很淡的白，过渡不硬
 TEXT_COLOR = (56, 58, 66, 255)
 CLOSE_X_COLOR = (152, 157, 166, 255)  # 关闭 × 默认浅灰：白条上要淡，不抢注意力
 CLOSE_X_HOVER = (104, 109, 118, 255)  # 悬停时略变深（仍然轻，无红底）
@@ -499,6 +501,21 @@ def get_phone_aspect():
     return 1080 / 2376
 
 
+def adopt_aspect(cur, measured, tol=0.02):
+    """只有「明显变了」才采纳测到的宽高比（手机旋转），否则保持原值。
+
+    视频窗口的尺寸是我们自己按 cur 摆出来的，等它出现后再量，量到的就是自己摆的
+    值。无条件采纳会让 aspect 被自己的取整误差污染（真值 0.4545 → 量成 0.4528），
+    视频区比例与真实画面差 1px，scrcpy 就在自己窗口上下补黑边——操作栏下面那条
+    黑线就是这么来的。
+    """
+    if not measured or measured <= 0:
+        return cur
+    if not cur or cur <= 0:
+        return measured
+    return measured if abs(measured - cur) > tol else cur
+
+
 def start_scrcpy():
     serial = state.get('serial') or resolve_serial()
     state['aspect'] = get_phone_aspect()
@@ -759,6 +776,13 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     out = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     out.paste(bar, (0, 0))
+    # 接缝：视频窗口比例与手机画面差 1px 时，scrcpy 会给自己窗口的上下补 1px 黑边，
+    # 那条黑线正好露在操作栏下面（用户报的「操作栏和视频区之间有一条黑线」）。这里
+    # 用一条半透明白线盖住接缝：黑边被压成与操作栏同色，观感是玻璃面板的下沿。
+    if th < H:
+        out.paste((255, 255, 255, SEAM_ALPHA), (0, th, W, th + 1))
+        if H - th > 2:
+            out.paste((255, 255, 255, SEAM_ALPHA_SOFT), (0, th + 1, W, th + 2))
     return out
 
 
@@ -1379,7 +1403,7 @@ def watchdog(hwnd):
             user32.GetWindowRect(t, ctypes.byref(r))
             w, h = r.right - r.left, r.bottom - r.top
             if w > 50 and h > 50:
-                state['aspect'] = w / h
+                state['aspect'] = adopt_aspect(state['aspect'], w / h)
                 log('aspect from scrcpy = %.4f' % state['aspect'])
             ensure_frame_orientation()
             update_frame(state['frame'])
@@ -1392,8 +1416,8 @@ def watchdog(hwnd):
             user32.GetWindowRect(state['child'], ctypes.byref(r))
             w, h = r.right - r.left, r.bottom - r.top
             if w > 50 and h > 50:
-                a = w / h
-                if abs(a - state['aspect']) > 0.02:
+                a = adopt_aspect(state['aspect'], w / h)
+                if abs(a - state['aspect']) > 1e-9:
                     state['aspect'] = a
                     ensure_frame_orientation()
                     update_frame(state['frame'])

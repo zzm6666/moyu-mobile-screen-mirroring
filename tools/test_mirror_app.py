@@ -369,5 +369,52 @@ class TestPickSerial(unittest.TestCase):
         self.assertEqual(m.pick_serial('', []), '')
 
 
+class TestAdoptAspect(unittest.TestCase):
+    """adopt_aspect：只有手机真的转了方向才改宽高比。
+
+    视频窗口尺寸是按 aspect 摆出来的，等它出现后再量就是量到自己摆的值；无条件采纳
+    会让 aspect 被取整误差污染（0.4545 → 0.4528），视频区与真实画面差 1px，scrcpy 就
+    在自己窗口上下补黑边——操作栏下面那条黑线就是这么来的。
+    """
+
+    def test_tiny_rounding_ignored(self):
+        self.assertAlmostEqual(m.adopt_aspect(1080 / 2376, 259 / 572), 1080 / 2376)
+
+    def test_rotation_adopted(self):
+        self.assertAlmostEqual(m.adopt_aspect(1080 / 2376, 2376 / 1080), 2376 / 1080)
+
+    def test_empty_measured_keeps_current(self):
+        self.assertAlmostEqual(m.adopt_aspect(0.5, 0), 0.5)
+        self.assertAlmostEqual(m.adopt_aspect(0.5, None), 0.5)
+
+    def test_empty_current_takes_measured(self):
+        self.assertAlmostEqual(m.adopt_aspect(None, 0.5), 0.5)
+
+
+class TestSeam(unittest.TestCase):
+    """接缝：操作栏与视频之间那条 1px 深的线要变成半透明白线。"""
+
+    W, H, TH = 259, 610, 38
+
+    def row(self, y):
+        out = m.build_frame_image(self.W, self.H, 0, self.TH, self.W, self.H - self.TH)
+        return out.getpixel((self.W // 2, y))
+
+    def test_seam_row_is_translucent_white(self):
+        """接缝行是白色、但不透明——黑边被压成与操作栏同色的浅线。"""
+        r, g, b, a = self.row(self.TH)
+        self.assertEqual((r, g, b), (255, 255, 255))
+        self.assertTrue(0 < a < 255)
+
+    def test_row_below_is_softer(self):
+        """接缝下面一行更淡，过渡不硬。"""
+        self.assertLess(self.row(self.TH + 1)[3], self.row(self.TH)[3])
+        self.assertGreater(self.row(self.TH + 1)[3], 0)
+
+    def test_video_area_still_transparent(self):
+        """再往下必须是全透明，否则会挡住手机画面。"""
+        self.assertEqual(self.row(self.TH + 5)[3], 0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
