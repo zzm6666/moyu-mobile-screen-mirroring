@@ -169,6 +169,24 @@ class TestLockAspect(unittest.TestCase):
             self.assertAlmostEqual(vw / vh, self.ASPECT, delta=0.01)
 
 
+class TestHideFromTaskbar(unittest.TestCase):
+    """scrcpy 自己的窗口要摘掉任务栏按钮（否则出现安卓图标，点开是裸视频窗口）。"""
+
+    def test_constants(self):
+        self.assertEqual(m.GWL_EXSTYLE, -20)
+        self.assertEqual(m.WS_EX_TOOLWINDOW, 0x00000080)
+        self.assertEqual(m.SWP_FRAMECHANGED, 0x0020)
+
+    def test_invalid_hwnd_is_noop(self):
+        self.assertFalse(m.hide_from_taskbar(0))
+        self.assertFalse(m.hide_from_taskbar(None))
+
+    def test_child_window_gets_it(self):
+        with open(SRC, encoding='utf-8') as f:
+            src = f.read()
+        self.assertIn('hide_from_taskbar(t)', src)
+
+
 class TestHookSwallow(unittest.TestCase):
     """钩子里的吞消息策略：移动事件绝对不能被吞。
 

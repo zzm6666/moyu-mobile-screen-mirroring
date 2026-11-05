@@ -69,6 +69,10 @@ SHADOW_ALPHA = 60  # 阴影最深处的 alpha（0~255）：淡淡的，不抢画
 HWND_TOP = 0
 HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+SWP_NOZORDER, SWP_FRAMECHANGED = 0x0004, 0x0020
+# --- 窗口扩展样式 ---
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080  # 不进任务栏、不进 Alt+Tab
 TRAY_CLICK_GUARD = 0.35  # 秒；双击托盘只算一次，避免「显示→立刻又隐藏」
 WH_MOUSE_LL = 14
 
@@ -980,6 +984,27 @@ def no_system_chrome(hwnd):
     return dwmapi.DwmSetWindowAttribute(hwnd, DWM_BORDER, ctypes.byref(val), 4) == 0
 
 
+def hide_from_taskbar(hwnd):
+    """把 scrcpy 自己的窗口从任务栏和 Alt+Tab 里摘掉。
+
+    scrcpy 是独立进程，它的 SDL 窗口默认带一个任务栏按钮（图标是安卓小机器人）。
+    点它会把那个光秃秃的视频窗口提到最前 —— 用户看到的就是「单独一个纯净的投屏
+    区域」。我们只想要它的画面，不想要它的身份，所以补上 WS_EX_TOOLWINDOW；
+    改完必须发 SWP_FRAMECHANGED，任务栏按钮是 Shell 缓存的，不发不刷新。
+    """
+    h = hwnd_value(hwnd)
+    if not h or not user32.IsWindow(h):
+        return False
+    ex = user32.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+    if not ex & WS_EX_TOOLWINDOW:
+        user32.SetWindowLongW(h, GWL_EXSTYLE, ctypes.c_long(ex | WS_EX_TOOLWINDOW))
+    user32.SetWindowPos(h, None, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                        | SWP_FRAMECHANGED)
+    ex2 = user32.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
+    return bool(ex2 & WS_EX_TOOLWINDOW)
+
+
 def position_scrcpy(vx, vy, vw, vh):
     ch = state['child']
     f = state['frame']
@@ -1573,9 +1598,11 @@ def watchdog(hwnd):
     if state['child'] is None:
         t = target_hwnd()
         if t:
-            ex = user32.GetWindowLongW(t, -20)
-            user32.SetWindowLongW(t, -20, ex | 0x08000000)  # WS_EX_NOACTIVATE，避免抢焦点
+            ex = user32.GetWindowLongW(t, GWL_EXSTYLE)
+            user32.SetWindowLongW(t, GWL_EXSTYLE, ex | 0x08000000)  # WS_EX_NOACTIVATE，避免抢焦点
             no_system_chrome(t)
+            # 摘掉 scrcpy 自己的任务栏按钮（那个安卓图标，点开就是"纯净的视频窗口"）
+            log('child hide-from-taskbar=%s' % hide_from_taskbar(t))
             state['child'] = t
             r = RECT()
             user32.GetWindowRect(t, ctypes.byref(r))
