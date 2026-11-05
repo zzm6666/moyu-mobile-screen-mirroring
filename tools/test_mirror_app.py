@@ -405,6 +405,17 @@ class TestVideoAreaClear(unittest.TestCase):
         self.assertEqual((r, g, b), (255, 255, 255))
         self.assertEqual(a, 255)
 
+    def test_seam_line_is_only_one_pixel_thick(self):
+        """白线只有 1px：上一行必须还是普通半透明操作栏，否则看起来像 2px 粗线。"""
+        out = self.image()
+        self.assertEqual(out.getpixel((self.W // 2, self.TH - 1))[3], m.BAR_TINT[3])
+        self.assertEqual(out.getpixel((self.W // 2, self.TH))[3], 255)
+        self.assertEqual(out.getpixel((self.W // 2, self.TH + 1))[3], 0)
+
+    def test_seam_reaches_right_edge(self):
+        """白线要贯穿整个宽度，不能被右边缘补丁切断。"""
+        self.assertEqual(self.image().getpixel((self.W - 1, self.TH))[3], 255)
+
     def test_right_column_masked_so_width_matches(self):
         """右边缘也要补齐，否则视频区看起来比操作栏窄 1px。"""
         self.assertEqual(self.image().getpixel((self.W - 1, self.TH + 50))[3],

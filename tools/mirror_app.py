@@ -732,8 +732,6 @@ def build_frame_image(W, H, vx, vy, vw, vh):
     ui = Image.new('RGBA', (sW, sH), (0, 0, 0, 0))
     d = ImageDraw.Draw(ui)
     d.line([(0, 0), (sW, 0)], fill=(255, 255, 255, 120), width=SS)  # 顶部玻璃高光
-    # 底部内侧高光：把操作栏与视频的接缝压成一条亮线，看起来是一体式玻璃面板
-    d.line([(0, sH - SS), (sW, sH - SS)], fill=(255, 255, 255, 82), width=SS)
 
     # 左上角：应用图标（圆形，圆外透明），替代原先手绘的鱼形标记
     isz = ICON_SIZE * SS
@@ -768,10 +766,8 @@ def build_frame_image(W, H, vx, vy, vw, vh):
 
     bar = bar.resize((W, th), Image.LANCZOS)
     bar.putalpha(ImageChops.multiply(bar.getchannel('A'), mask))
-    # 强制底边完全不透明，与视频区严丝合缝
-    a = bar.getchannel('A')
-    ImageDraw.Draw(a).line([(0, th - 1), (W, th - 1)], fill=255)
-    bar.putalpha(a)
+    # 底边不再强行刷成不透明：与画面的分界由下面那 1px 纯白线负责，
+    # 这一行保持普通半透明，白线才显得细（否则 37/38 两行都白，看起来 2px 粗）。
 
     out = Image.new('RGBA', (W, H), (0, 0, 0, 0))
     out.paste(bar, (0, 0))
@@ -782,7 +778,7 @@ def build_frame_image(W, H, vx, vy, vw, vh):
     # 底部圆角那几行不铺，否则会在圆角之外画出直角。
     if th < H:
         out.paste(SEAM_WHITE, (0, th, W, th + 1))
-        out.paste((255, 255, 255, BAR_TINT[3]), (W - 1, th, W, max(th, H - CORNER_R)))
+        out.paste((255, 255, 255, BAR_TINT[3]), (W - 1, th + 1, W, max(th + 1, H - CORNER_R)))
     return out
 
 
