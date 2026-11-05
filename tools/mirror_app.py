@@ -428,6 +428,8 @@ state = {
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
     'bar_dark': False,  # 操作栏背后是深色底 → 用深色玻璃 tint
+    'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
+    'retries': 0,  # scrcpy 意外退出后的自动重连次数
 }
 
 
@@ -447,6 +449,44 @@ def mirror_visible():
     return user32.GetForegroundWindow() in (f, state['child'])
 
 
+def list_devices():
+    """adb devices 里当前在线的设备序列号（offline / unauthorized 不算）。"""
+    try:
+        r = subprocess.run([ADB, 'devices'], stdin=subprocess.DEVNULL,
+                           capture_output=True, creationflags=CREATE_NO_WINDOW,
+                           timeout=8)
+        out = r.stdout.decode('utf-8', errors='ignore')
+    except Exception:
+        return []
+    devs = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == 'device':
+            devs.append(parts[0])
+    return devs
+
+
+def pick_serial(cfg_serial, devices):
+    """优先用配置里的串号；它不在线时退回在线设备。
+
+    手机的无線调试端口每次重开都会变（38493 → 43847 → …），写死在配置里必然失效，
+    所以配置串号只是「首选」，不在线就自动用 adb 当前唯一在线的设备。
+    """
+    if cfg_serial and cfg_serial in devices:
+        return cfg_serial
+    return devices[0] if devices else cfg_serial
+
+
+def resolve_serial():
+    serial = pick_serial(CFG['serial'], list_devices())
+    if serial != CFG['serial']:
+        log('serial: cfg=%s 不在线，改用 %s' % (CFG['serial'], serial))
+    else:
+        log('serial: 使用 %s' % serial)
+    state['serial'] = serial
+    return serial
+
+
 def has_audio_device():
     try:
         return winmm.waveOutGetNumDevs() > 0
@@ -456,7 +496,7 @@ def has_audio_device():
 
 def get_phone_aspect():
     try:
-        r = subprocess.run([ADB, '-s', CFG['serial'], 'shell', 'wm', 'size'],
+        r = subprocess.run([ADB, '-s', state['serial'], 'shell', 'wm', 'size'],
                            stdin=subprocess.DEVNULL, capture_output=True,
                            creationflags=CREATE_NO_WINDOW, timeout=8)
         m = re.search(r'(\d+)x(\d+)', r.stdout.decode('utf-8', errors='ignore'))
@@ -468,13 +508,15 @@ def get_phone_aspect():
 
 
 def start_scrcpy():
+    serial = state.get('serial') or resolve_serial()
     state['aspect'] = get_phone_aspect()
-    try:
-        subprocess.run([ADB, 'connect', CFG['serial']], stdin=subprocess.DEVNULL,
-                       capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=8)
-    except Exception:
-        pass
-    args = [SCRCPY, '-s', CFG['serial'],
+    if re.match(r'^[\d.]+:\d+$', serial or ''):
+        try:
+            subprocess.run([ADB, 'connect', serial], stdin=subprocess.DEVNULL,
+                           capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=8)
+        except Exception:
+            pass
+    args = [SCRCPY, '-s', serial,
             '--window-title=' + TITLE,
             '--window-borderless',
             '--window-x=0', '--window-y=0',
@@ -1438,6 +1480,16 @@ def watchdog(hwnd):
     if p is None:
         return
     if p.poll() is not None and not state['quitting']:
+        log('scrcpy exit rc=%s' % p.returncode)
+        state['retries'] = state.get('retries', 0) + 1
+        # 手机无线调试端口会变、也可能短暂掉线：只要还有在线设备就自动重连两次
+        if state['retries'] <= 2 and list_devices():
+            state['proc'] = None
+            state['child'] = None
+            state['serial'] = None
+            log('scrcpy retry %d' % state['retries'])
+            threading.Thread(target=start_scrcpy, daemon=True).start()
+            return
         fail('投屏进程已退出。\n请确认手机无线调试已开启，且 config.json 里的 IP 与端口正确。')
         quit_app()
         return

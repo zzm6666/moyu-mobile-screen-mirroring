@@ -251,5 +251,22 @@ class TestGlassBar(unittest.TestCase):
         self.assertGreater(min(self.render((120, 120, 120), False).stddev), 0.5)
 
 
+class TestPickSerial(unittest.TestCase):
+    """pick_serial：配置串号在线就用它，不在线自动退回在线设备（无线调试端口会变）。"""
+
+    CFG = '192.168.137.198:38493'
+
+    def test_config_serial_online(self):
+        self.assertEqual(m.pick_serial(self.CFG, ['emulator-5554', self.CFG]), self.CFG)
+
+    def test_config_serial_offline_falls_back(self):
+        self.assertEqual(m.pick_serial(self.CFG, ['adb-abc._adb-tls-connect._tcp']),
+                         'adb-abc._adb-tls-connect._tcp')
+
+    def test_no_device_keeps_config(self):
+        self.assertEqual(m.pick_serial(self.CFG, []), self.CFG)
+        self.assertEqual(m.pick_serial('', []), '')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
