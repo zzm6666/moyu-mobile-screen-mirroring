@@ -323,6 +323,24 @@ class TestPressRaise(unittest.TestCase):
         self.assertTrue(m.press_should_raise(m.TOOLBAR_H + 200))
 
 
+class TestShouldRaise(unittest.TestCase):
+    """should_raise：只有「点在自己窗口上」+「点在视频区」才请求置前。
+
+    少了 owns 这一条，窗口被别的程序盖住时，点那个程序的任意位置都会把魔芋顶到
+    最前（用户：我点的是别的窗口，怎么魔芋跳出来了）。
+    """
+
+    def test_covered_window_click_does_not_raise(self):
+        self.assertFalse(m.should_raise(m.TOOLBAR_H + 200, owns=False))
+        self.assertFalse(m.should_raise(0, owns=False))
+
+    def test_own_video_area_still_raises(self):
+        self.assertTrue(m.should_raise(m.TOOLBAR_H + 200, owns=True))
+
+    def test_own_toolbar_still_only_drags(self):
+        self.assertFalse(m.should_raise(10, owns=True))
+
+
 class TestGlassBar(unittest.TestCase):
     """build_frame_image：操作栏是纯「白色半透明」——不截屏、不模糊，直接透出桌面。"""
 

@@ -1094,9 +1094,21 @@ def edge_hit(r, x, y, grab=EDGE_GRAB, toolbar=TOOLBAR_H):
     return rect_edge_hit(r, x, y, grab)
 
 
+def should_raise(dy, owns, toolbar=TOOLBAR_H):
+    """这一下按下要不要请求把窗口置前。
+
+    两个条件缺一不可：
+    * `owns`：这一下确实落在自己窗口上（或被自己窗口挡着的视频窗口上）。少了它，
+      窗口被别的窗口盖住时，点那个窗口的任意位置都会把魔芋顶上来（用户会觉得
+      "我点的是别的程序，怎么魔芋蹦出来了"）。
+    * `dy >= toolbar`：按在视频区才置前；按在操作栏是在拖动窗口，顺带置前会让
+      Z 序抖一下（TOPMOST→NOTOPMOST），拖动一开始就看到接缝处闪。
+    """
+    return bool(owns) and press_should_raise(dy, toolbar)
+
+
 def press_should_raise(dy, toolbar=TOOLBAR_H):
-    """按住视频区要请求置前；按住操作栏不请求 —— 那是在拖动窗口，顺带置前会让
-    Z 序抖一下（TOPMOST→NOTOPMOST），拖动一开始就看到接缝处闪。"""
+    """按住视频区要请求置前；按住操作栏不请求（详见 should_raise）。"""
     return dy >= toolbar
 
 
@@ -1178,7 +1190,7 @@ def mouse_hook_proc(n_code, wparam, lparam):
                         user32.SetForegroundWindow(f)
                         start_resize(f, hit)
                         return 1
-                    if inside and press_should_raise(dy):
+                    if inside and should_raise(dy, _owns_point(pt, f)):
                         # 只有按住视频区才请求置前；按住操作栏是拖动的开始，
                         # 这时再 TOPMOST→NOTOPMOST 会让接缝闪一下。
                         user32.PostMessageW(state['tray'], WM_APP_RAISE, 0, 0)
