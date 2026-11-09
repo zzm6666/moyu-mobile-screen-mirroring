@@ -91,6 +91,19 @@ python tools\build_installer.py
 
 > 没有代码签名证书，别人首次运行安装包时 Windows SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」即可。
 
+### 被安全软件拦截时怎么办
+
+没有签名的安装包容易被安全软件误判，实测（腾讯电脑管家）有两种表现：
+
+- 直接弹「文件包含病毒或潜在的垃圾软件」并把安装包删掉；
+- 或者装到一半静默失败，此时用 `/LOG=路径` 重装一次就能看到真实原因，常见的是
+  `IPersistFile::Save failed; code 0x80070005`（创建快捷方式被拒）和
+  `RegCreateKeyEx failed; code 5`（写卸载信息被拒）。
+
+处理办法：把安装包加入安全软件的信任区/允许运行，或在弹窗里选「允许」后重装；也可以只信任解压出来的 `魔芋.exe`。程序本身不联网写注册表以外的系统位置，配置和日志都在 `%APPDATA%\魔芋`。
+
+安装包和 exe 都可以自查有没有被改过：`certutil -hashfile <文件> SHA256`。
+
 ## 自动更新
 
 配置文件里的 `update_repo` 指向 GitHub 仓库（默认 `zzm6666/moyu-mobile-screen-mirroring`）：
