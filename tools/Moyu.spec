@@ -6,6 +6,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('app.ico', '.'), ('app_icon.png', '.'),
+           # 默认配置随包走：打包版首次运行会把它当种子复制到 %APPDATA%\魔芋\config.json
+           ('config.json', '.'),
            # 把 adb/scrcpy 一起打进包：换台机器解压就能用，不再依赖 D:\moyu\tools
            ('scrcpy-win64-v5.0.1/*', 'scrcpy')],
     hiddenimports=[],

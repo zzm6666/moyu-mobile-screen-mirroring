@@ -92,7 +92,7 @@ FG_MIN_AGE = 0.3  # 秒；前台得当了这么久才算「用户真的在用这
 GW_OWNER = 4
 
 DEFAULT_CFG = {
-    'serial': '192.168.137.198:38493',
+    'serial': '',   # 留空 = 启动时自动查找在线设备（USB 或已配对的无线调试）
     'title': '魔芋',
     'x': 1636,
     'y': 448,
@@ -171,15 +171,19 @@ except Exception:
 def load_cfg():
     cfg = dict(DEFAULT_CFG)
     path = CONFIG_PATH
-    # 打包版第一次跑：把 exe 旁边那份 config.json 当种子拷进 %APPDATA%
+    # 打包版第一次跑：把包里那份 config.json 当种子拷进 %APPDATA%
+    # （onedir 模式下 datas 落在 _internal 里，所以两个位置都找一遍）
     if FROZEN and not os.path.exists(path):
-        seed = os.path.join(APP_HOME, 'config.json')
-        if os.path.exists(seed):
+        for seed in (os.path.join(APP_HOME, 'config.json'),
+                     os.path.join(RES_HOME, 'config.json')):
+            if not os.path.exists(seed):
+                continue
             try:
                 with open(seed, 'r', encoding='utf-8') as f:
                     seed_cfg = json.load(f)
                 if isinstance(seed_cfg, dict):
                     save_cfg(path, seed_cfg)
+                break
             except Exception:
                 pass
     if os.path.exists(path):
