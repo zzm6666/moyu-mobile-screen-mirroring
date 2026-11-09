@@ -699,13 +699,18 @@ def open_connect_wizard():
 
 
 def start_scrcpy():
-    devices = list_devices()
-    if not devices:
-        # 一台可用设备都没有：与其弹一句看不懂的错误，不如直接把连接向导摆出来
-        log('scrcpy: 没有在线设备，改走连接向导')
+    # 先自己找手机：在线设备 → 上次的 IP:端口 → mDNS 发现；都没有才弹向导
+    auto = connect_ui.try_auto_connect(ADB, CFG.get('serial'))
+    if not auto:
+        log('scrcpy: 自动查找设备失败，改走连接向导')
         open_connect_wizard()
         return
-    serial = state.get('serial') if state.get('serial') in devices else resolve_serial(devices)
+    if auto != CFG.get('serial'):
+        CFG['serial'] = auto
+        save_cfg(CONFIG_PATH, CFG)
+        log('serial: 自动连上 %s（已写回配置）' % auto)
+    state['serial'] = auto
+    serial = auto
     state['aspect'] = get_phone_aspect()
     if re.match(r'^[\d.]+:\d+$', serial or ''):
         try:

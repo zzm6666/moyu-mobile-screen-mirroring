@@ -120,6 +120,44 @@ class TestConnectOnly(unittest.TestCase):
         self.assertEqual(serial, '')
 
 
+class TestTryAutoConnect(unittest.TestCase):
+    """启动时的自动查找：在线设备 → 上次的 IP:端口 → mDNS。"""
+
+    def _runner(self, table):
+        calls = []
+
+        def run(cmd, timeout=25):
+            calls.append(cmd)
+            key = ' '.join(cmd[1:3])
+            return 0, table.get(key, '')
+        run.calls = calls
+        return run
+
+    def test_uses_online_device_first(self):
+        run = self._runner({'devices': 'List of devices attached\nR58M1\tdevice\n'})
+        self.assertEqual(c.try_auto_connect('adb.exe', '', run), 'R58M1')
+
+    def test_reconnects_last_ip_port(self):
+        run = self._runner({'devices': 'List of devices attached\n\n',
+                            'connect 192.168.1.5:43773': 'connected to 192.168.1.5:43773',
+                            'mdns services': ''})
+        self.assertEqual(c.try_auto_connect('adb.exe', '192.168.1.5:43773', run),
+                         '192.168.1.5:43773')
+
+    def test_falls_back_to_mdns(self):
+        run = self._runner({'devices': 'List of devices attached\n\n',
+                            'connect 192.168.1.5:41001': 'connected to 192.168.1.5:41001',
+                            'mdns services': ('List of discovered mdns services\n'
+                                              'adb-x\t_adb-tls-connect._tcp.\t192.168.1.5:41001\n')})
+        self.assertEqual(c.try_auto_connect('adb.exe', '192.168.1.5:43773', run),
+                         '192.168.1.5:41001')
+
+    def test_nothing_found(self):
+        run = self._runner({'devices': 'List of devices attached\n\n',
+                            'mdns services': 'List of discovered mdns services\n'})
+        self.assertEqual(c.try_auto_connect('adb.exe', '192.168.1.5:43773', run), '')
+
+
 class TestParseMdns(unittest.TestCase):
     def test_picks_matching_ip(self):
         text = ('List of discovered mdns services\n'

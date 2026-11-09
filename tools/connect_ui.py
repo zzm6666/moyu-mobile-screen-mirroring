@@ -176,6 +176,34 @@ def connect_only(adb, ip_port, runner=run_cmd):
     return False, '连接失败：' + (out or '').strip()[:160], ''
 
 
+def try_auto_connect(adb, cfg_serial, runner=run_cmd):
+    """启动时先自己找手机，找到就返回串号，找不到返回空串（此时才需要弹向导）。
+
+    顺序：
+      1. `adb devices` 里已有在线设备（USB 或上次连过的无线）→ 直接用；
+      2. 配置里那个 `IP:端口` 再 connect 一次（端口没变就能直接连上）；
+      3. `adb mdns services` 找 `_adb-tls-connect._tcp`（优先同 IP，其次任意一台）→ connect。
+    这样「手机无线调试开着且之前配对过」的日常场景基本是零输入。
+    """
+    devs = list_online(adb, runner)
+    if devs:
+        return devs[0]
+    cands = []
+    cfg_serial = (cfg_serial or '').strip()
+    if IP_PORT_RE.match(cfg_serial):
+        cands.append(cfg_serial)
+    ip = _ip_of(cfg_serial) if cands else ''
+    rc, out = runner([adb, 'mdns', 'services'])
+    found = parse_mdns_services(out, ip) or parse_mdns_services(out, '')
+    if found and found not in cands:
+        cands.append(found)
+    for c in cands:
+        ok, msg, serial = connect_only(adb, c, runner)
+        if ok:
+            return serial
+    return ''
+
+
 def pair_then_connect(adb, ip_port, code, runner=run_cmd):
     """配对 + 找到真正的「连接端口」再连。
 
