@@ -1,17 +1,21 @@
-# 构建产物与二进制依赖不入库（源仓库只留可读代码/配置/脚本）
+# ---- 运行 / 打包产物（可重新生成，不入库）----
 tools/build/
 tools/dist/
 tools/__pycache__/
-tools/scrcpy-win64-*/
-tools/backups/
+__pycache__/
+*.pyc
+
+# ---- 部署目录（本地运行用的成品，不是源码）----
 tools/魔芋/
-tools/魔芋.exe
-tools/*.zip
 
-# 运行日志与调试截图
-tools/*.log
-tools/*.png
-tools/.verify/
+# ---- 第三方二进制：scrcpy 5.0.1 ----
+# 26 MB 的外部发行物，不随仓库分发；见 README「准备 scrcpy」一节
+tools/scrcpy-win64-*/
 
-# PyInstaller 中间文件
+# ---- 运行日志与临时文件 ----
+*.log
+*.zip
 *.spec.bak
+
+# ---- 个人开发日志（仅本地保留）----
+.workbuddy/
