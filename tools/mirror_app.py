@@ -16,12 +16,14 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 import connect_ui  # 连接手机向导（纯 ctypes Win32），只在没有在线设备时用
+import updater  # 版本比较 / 查 GitHub Releases / 下载安装包（无 GUI）
 
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
@@ -41,6 +43,11 @@ TIMER_RESIZE = 3  # 缩放期间的轮询定时器（鼠标压在视频区上时
 ID_TOGGLE = 1001
 ID_EXIT = 1002
 ID_CONNECT = 1003
+ID_UPDATE = 1004
+WM_APP_UPDATE = 0x8003   # 后台检查完更新，请 UI 线程弹窗
+WM_APP_QUIT = 0x8004     # 后台线程请求退出（窗口只能在主线程销毁）
+UPDATE_FOUND, UPDATE_LATEST, UPDATE_NO_REPO, UPDATE_FAILED = 0, 1, 2, 3
+UPDATE_INTERVAL = 24 * 3600  # 自动检查更新的最小间隔（秒）；托盘手动检查不受限
 CREATE_NO_WINDOW = 0x08000000
 
 # --- 操作栏视觉 ---
@@ -101,6 +108,8 @@ DEFAULT_CFG = {
     'fps': 60,
     'bitrate': '4M',
     'max_size': 720,
+    'update_repo': 'zzm6666/moyu-mobile-screen-mirroring',  # 自动更新来源（GitHub 仓库）
+    'last_update_check': 0,  # 上次成功检查更新的时间戳（秒），用于 24 小时节流
 }
 
 
@@ -117,6 +126,23 @@ def app_dir():
 def resource_dir():
     """只读资源目录：打包后是 PyInstaller 的 _internal（sys._MEIPASS）。"""
     return getattr(sys, '_MEIPASS', None) or app_dir()
+
+
+def read_version():
+    """读版本号：单一来源是随包的 version.txt（tools/version.txt）。
+
+    读不到就退回 '0.0.0'——宁可显示成未知，也不要把版本号抄两份维护。
+    """
+    for cand in (os.path.join(resource_dir(), 'version.txt'),
+                 os.path.join(app_dir(), 'version.txt')):
+        try:
+            with open(cand, 'r', encoding='utf-8') as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except Exception:
+            pass
+    return '0.0.0'
 
 
 def find_scrcpy_dir(app_path, res_path):
@@ -210,6 +236,7 @@ SCRCPY = os.path.join(SCRCPY_DIR, 'scrcpy.exe') if SCRCPY_DIR else 'scrcpy.exe'
 ICO = os.path.join(RES_HOME, 'app.ico')
 # 操作栏里贴的应用图标（圆形，圆外透明）；app.ico 供托盘与 exe 资源使用
 APP_ICON = os.path.join(RES_HOME, 'app_icon.png')
+VERSION = read_version()  # 来自随包的 version.txt（见 tools/version.txt）
 
 
 def log(msg):
@@ -220,7 +247,8 @@ def log(msg):
         pass
 
 
-log('--- start, BASE=%s frozen=%s scrcpy_dir=%s' % (BASE, FROZEN, SCRCPY_DIR or '(未找到)'))
+log('--- start, v%s BASE=%s frozen=%s scrcpy_dir=%s'
+    % (VERSION, BASE, FROZEN, SCRCPY_DIR or '(未找到)'))
 
 _ICON_CACHE = {}
 
@@ -545,6 +573,8 @@ state = {
     'hidden': False,  # 用户点了 × / 托盘「隐藏投屏」：收进托盘，只能靠托盘再唤出
     'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
+    'update': None,  # 查到的新版本 info（updater.release_info 的返回值）
+    'update_err': '',  # 最近一次检查更新失败的原因（手动检查时展示给用户）
 }
 
 
@@ -1846,6 +1876,7 @@ def show_menu(hwnd):
     open_text = '隐藏投屏' if mirror_visible() else '显示投屏'
     user32.AppendMenuW(hmenu, 0x0000, ID_TOGGLE, open_text)
     user32.AppendMenuW(hmenu, 0x0000, ID_CONNECT, '连接手机…')
+    user32.AppendMenuW(hmenu, 0x0000, ID_UPDATE, '检查更新…')
     user32.AppendMenuW(hmenu, 0x0800, 0, None)
     user32.AppendMenuW(hmenu, 0x0000, ID_EXIT, '退出')
     pt = POINT()
@@ -1885,6 +1916,118 @@ def quit_app():
         user32.DestroyWindow(state['tray'])
     else:
         user32.PostQuitMessage(0)
+
+
+def check_update(manual=False):
+    """查 GitHub 最新发布；有新版本就投递 WM_APP_UPDATE 让 UI 线程弹窗。
+
+    在后台线程里跑（网络会阻塞），所以这里只做网络与判定，不碰窗口。
+    """
+    repo = (CFG.get('update_repo') or '').strip()
+    if not repo:
+        log('update: 未配置 update_repo，跳过检查')
+        if manual:
+            user32.PostMessageW(state['tray'], WM_APP_UPDATE, 0, UPDATE_NO_REPO)
+        return
+    log('update: 检查 %s（当前 v%s）' % (repo, VERSION))
+    info, err = updater.fetch_latest(repo)
+    if info is None:
+        log('update: 检查失败 %s' % err)
+        state['update_err'] = err
+        if manual:
+            user32.PostMessageW(state['tray'], WM_APP_UPDATE, 0, UPDATE_FAILED)
+        return
+    CFG['last_update_check'] = int(time.time())
+    save_cfg(CONFIG_PATH, CFG)
+    if not updater.is_newer(info['version'], VERSION):
+        log('update: 已是最新（远端 v%s）' % info['version'])
+        if manual:
+            user32.PostMessageW(state['tray'], WM_APP_UPDATE, 0, UPDATE_LATEST)
+        return
+    state['update'] = info
+    log('update: 有新版本 v%s（当前 v%s）%s'
+        % (info['version'], VERSION, info['url'] or '（这次发布没有安装包）'))
+    user32.PostMessageW(state['tray'], WM_APP_UPDATE, 0, UPDATE_FOUND)
+
+
+def on_update_found(kind):
+    """UI 线程：把检查结果告诉用户（自动检查只在有新版本时打扰）。"""
+    info = state['update'] or {}
+    ver = info.get('version') or ''
+    if kind == UPDATE_LATEST:
+        user32.MessageBoxW(None, '当前已是最新版本 v%s。' % VERSION, APP_NAME, 0x40)
+        return
+    if kind == UPDATE_NO_REPO:
+        user32.MessageBoxW(
+            None,
+            '还没有配置更新来源，「检查更新」暂时用不了。\n\n'
+            '在配置文件里把 update_repo 填成「用户名/仓库名」\n（例如 yourname/moyu），保存后重启即可。\n\n'
+            '配置文件：\n%s' % CONFIG_PATH, APP_NAME, 0x40)
+        return
+    if kind == UPDATE_FAILED:
+        user32.MessageBoxW(
+            None,
+            '检查更新失败（网络不可用或访问 GitHub 超时）。\n\n%s' % (state['update_err'] or ''),
+            APP_NAME, 0x30)
+        return
+    if not info.get('url'):
+        if info.get('page') and user32.MessageBoxW(
+                None, '发现新版本 v%s（当前 v%s），但这次发布没有附带安装包。\n\n打开发布页面手动下载？'
+                      % (ver, VERSION), APP_NAME, 0x04 | 0x20) == 6:
+            try:
+                os.startfile(info['page'])
+            except Exception as e:
+                log('update: 打开页面失败 %s' % e)
+        return
+    if user32.MessageBoxW(
+            None,
+            '发现新版本 v%s（当前 v%s）。\n\n现在下载并安装吗？\n'
+            '安装时魔芋会自动退出，装完请重新打开。' % (ver, VERSION),
+            APP_NAME, 0x04 | 0x20) != 6:
+        log('update: 用户暂不更新')
+        return
+    threading.Thread(target=download_installer, args=(info,), daemon=True).start()
+
+
+def download_installer(info):
+    """后台线程：下载安装包并启动它；随后请求主线程退出（窗口只能主线程销毁）。"""
+    ver = re.sub(r'[^0-9A-Za-z._-]', '', info.get('version') or 'new')
+    dest = os.path.join(tempfile.gettempdir(), 'Moyu-Setup-%s.exe' % ver)
+    log('update: 开始下载 %s' % info.get('url'))
+    ok, err = updater.download(info['url'], dest)
+    if not ok:
+        log('update: 下载失败 %s' % err)
+        user32.MessageBoxW(None, '安装包下载失败：\n%s\n\n可以到发布页面手动下载。' % err, APP_NAME, 0x30)
+        return
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        size = 0
+    log('update: 下载完成 %s (%d B)，启动安装器' % (dest, size))
+    try:
+        # /SILENT 静默安装、/CLOSEAPPLICATIONS 让安装器自己关掉正在运行的魔芋
+        subprocess.Popen([dest, '/SILENT', '/CLOSEAPPLICATIONS', '/NORESTART', '/SUPPRESSMSGBOXES'],
+                         close_fds=True)
+    except Exception as e:
+        log('update: 启动安装器失败 %s' % e)
+        user32.MessageBoxW(None, '安装包已下载到：\n%s\n\n请手动双击运行。' % dest, APP_NAME, 0x40)
+        return
+    user32.PostMessageW(state['tray'], WM_APP_QUIT, 0, 0)
+
+
+def maybe_check_update():
+    """启动后后台检查一次（24 小时内不重复）。没配仓库/断网都静默跳过。"""
+    repo = (CFG.get('update_repo') or '').strip()
+    if not repo:
+        return
+    try:
+        last = float(CFG.get('last_update_check') or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if time.time() - last < UPDATE_INTERVAL:
+        log('update: 距上次检查不足 24 小时，跳过')
+        return
+    check_update(manual=False)
 
 
 def watchdog(hwnd):
@@ -1971,6 +2114,12 @@ def tray_proc(hwnd, msg, wparam, lparam):
         raise_mirror()
         force_foreground(state['frame'])
         return 0
+    if msg == WM_APP_UPDATE:
+        on_update_found(lparam)
+        return 0
+    if msg == WM_APP_QUIT:
+        quit_app()
+        return 0
     if msg == WM_TRAY:
         evt = lparam & 0xFFFF  # 兼容 NOTIFYICON_VERSION_4（事件在 LOWORD，图标 id 在 HIWORD）
         if evt == 0x0205:
@@ -1993,6 +2142,9 @@ def tray_proc(hwnd, msg, wparam, lparam):
             toggle_mirror()
         elif mid == ID_CONNECT:
             open_connect_wizard()
+        elif mid == ID_UPDATE:
+            threading.Thread(target=check_update, kwargs={'manual': True},
+                             daemon=True).start()
         elif mid == ID_EXIT:
             quit_app()
         return 0
@@ -2072,6 +2224,7 @@ def main():
     install_foreground_hook()
 
     threading.Thread(target=start_scrcpy, daemon=True).start()
+    threading.Thread(target=maybe_check_update, daemon=True).start()
 
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

@@ -55,6 +55,54 @@ pyinstaller --noconfirm --distpath tools\dist --workpath tools\build tools\Moyu.
 
 产物在 `tools/dist/Moyu/`，把里面的内容整体拷到一个目录、把 `Moyu.exe` 改成 `魔芋.exe` 即可（自带 `_internal/scrcpy`，zip 发给别人解压就能用）。
 
+## 版本号规则
+
+版本号只有一个来源：**`tools/version.txt`**（一行，例如 `1.0.0`）。
+
+- 程序启动时读它，日志第一行会打印 `--- start, v1.0.0 ...`，托盘「检查更新…」也用它比较
+- 打包时它被复制进 `_internal/version.txt`；编译安装器时由 `tools/build_installer.py` 注入 `{#MyAppVersion}`
+- 发版前只改这一个文件，然后打 tag、出安装包
+
+遵循 [语义化版本](https://semver.org/lang/zh-CN/) `主.次.修订`：
+
+| 变更 | 例子 |
+|---|---|
+| 主版本：不兼容的改动（配置格式、连接方式大改） | `1.0.0 → 2.0.0` |
+| 次版本：新增功能，向后兼容 | `1.0.0 → 1.1.0` |
+| 修订：只修 bug | `1.0.0 → 1.0.1` |
+
+预发布可写 `1.0.0-beta.1`（比较时小于同号正式版）。
+
+## 构建安装包
+
+```bat
+python tools\build_installer.py
+```
+
+一条命令做四件事：读 `tools/version.txt` → PyInstaller 打包 → 铺到 `tools\魔芋\` → 调 Inno Setup 编译 `installer\moyu.iss`。
+
+产物：`dist-installer\魔芋-Setup-<版本>.exe`
+
+- 默认装到 `%LOCALAPPDATA%\Programs\魔芋`，**不需要管理员权限**，安装向导里可以改目录
+- 自带卸载器；卸载时会问要不要连 `%APPDATA%\魔芋` 里的配置和日志一起删
+- 只编安装器（跳过 PyInstaller）：`python tools\build_installer.py --skip-pyinstaller`
+- 需要 [Inno Setup 6](https://jrsoftware.org/isdl.php)：`winget install --id JRSoftware.InnoSetup -e`
+- 想要中文安装向导：把 `ChineseSimplified.isl` 放进 `installer\` 目录（Inno 官方包不含简体中文），脚本会自动应用
+
+> 没有代码签名证书，别人首次运行安装包时 Windows SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」即可。
+
+## 自动更新
+
+配置文件里的 `update_repo` 指向 GitHub 仓库（默认 `zzm6666/moyu-mobile-screen-mirroring`）：
+
+- 启动后台检查：距上次检查满 24 小时才查一次，**只有发现新版本才弹窗**，断网/未配置都静默跳过
+- 托盘右键「检查更新…」：立即检查，并把失败原因也告诉用户
+- 有新版本时：确认 → 下载到临时目录 → 静默启动安装器（安装器会自己关掉正在运行的魔芋）→ 程序退出
+
+发版流程：改 `tools/version.txt` → `python tools\build_installer.py` → 在 GitHub 建一个 **tag 为版本号**（如 `v1.0.1`）的 Release → 把 `魔芋-Setup-<版本>.exe` 传上去当附件。
+
+> 安装包文件名以 `-setup.exe` 结尾会被优先选中；找不到就取 Release 里第一个 `.exe`。
+
 ## 连接手机
 
 **无线（推荐，一次配对）**
@@ -84,25 +132,36 @@ pyinstaller --noconfirm --distpath tools\dist --workpath tools\build tools\Moyu.
   "w": 260, "h": 572,
   "fps": 60,
   "bitrate": "4M",
-  "max_size": 720
+  "max_size": 720,
+  "update_repo": "zzm6666/moyu-mobile-screen-mirroring",  // 留空 = 不自动检查更新
+  "last_update_check": 0                                  // 上次检查时间戳，程序自己维护
 }
 ```
+
+> 配置里出现新字段时会自动补默认值，旧配置不用手动改。
 
 ## 项目结构
 
 ```
 moyu/
+├─ LICENSE                       MIT
+├─ installer/
+│  ├─ moyu.iss                   Inno Setup 安装脚本
+│  └─ ChineseSimplified.isl      可选：中文安装向导语言包
 ├─ tools/
-│  ├─ mirror_app.py            主程序：窗口、绘制、托盘、缩放、连接逻辑
-│  ├─ connect_ui.py            连接向导（纯 ctypes 实现的对话框）
-│  ├─ Moyu.spec                PyInstaller 打包配置
-│  ├─ config.json              默认配置（首次运行复制到 %APPDATA%）
-│  ├─ make_icon.py             app_256.png → 圆形 app_icon.png / app.ico
-│  ├─ app_256.png              图标源图
-│  ├─ app_icon.png             操作栏用的圆形图标
-│  ├─ app.ico                  exe 与托盘图标
-│  ├─ dev.bat                  源码方式启动
-│  └─ scrcpy-win64-v5.0.1/     第三方 scrcpy（自行下载）
+│  ├─ mirror_app.py              主程序：窗口、绘制、托盘、缩放、连接、更新检查
+│  ├─ connect_ui.py              连接向导（纯 ctypes 实现的对话框）
+│  ├─ updater.py                 版本比较 / 查 GitHub Releases / 下载安装包
+│  ├─ build_installer.py         一键出安装包
+│  ├─ Moyu.spec                  PyInstaller 打包配置
+│  ├─ version.txt                版本号（唯一来源）
+│  ├─ config.json                默认配置（首次运行复制到 %APPDATA%）
+│  ├─ make_icon.py               app_256.png → 圆形 app_icon.png / app.ico
+│  ├─ app_256.png                图标源图
+│  ├─ app_icon.png               操作栏用的圆形图标
+│  ├─ app.ico                    exe 与托盘图标
+│  ├─ dev.bat                    源码方式启动
+│  └─ scrcpy-win64-v5.0.1/       第三方 scrcpy（自行下载，打包时内置）
 └─ .gitignore
 ```
 
@@ -119,3 +178,9 @@ moyu/
 - 视频窗口外扩 overscan + scrcpy `--render-fit=stretched`，消除整数缩放留下的 1~2 px 黑边
 - 全局低级鼠标钩子处理边缘缩放：视频窗口盖住了主窗口的边，`WM_NCHITTEST` 收不到那些点
 - 鼠标注入用来做自动化验收（`mouse_event` 的 `LEFTDOWN=0x0002` / `LEFTUP=0x0004`）
+
+## 许可与第三方
+
+- 本项目代码：[MIT](LICENSE)
+- [scrcpy](https://github.com/Genymobile/scrcpy)（含 `adb`）：Apache-2.0，安装目录里的 `_internal\scrcpy\LICENSE.txt` 已随包分发
+- [Pillow](https://python-pillow.org/)：HPND / MIT-CMU

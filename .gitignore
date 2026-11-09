@@ -19,3 +19,6 @@ tools/scrcpy-win64-*/
 
 # ---- 个人开发日志（仅本地保留）----
 .workbuddy/
+
+# ---- 安装包产物（构建生成，分发用 Release）----
+dist-installer/
