@@ -21,6 +21,8 @@ import time
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
+import connect_ui  # 连接手机向导（纯 ctypes Win32），只在没有在线设备时用
+
 APP_NAME = '魔芋'
 CLASS_TRAY = 'CapyMirrorTray'
 CLASS_FRAME = 'CapyMirrorFrame'
@@ -38,6 +40,7 @@ WM_APP_RAISE = 0x8002  # 点击视频区时请求整体置前
 TIMER_RESIZE = 3  # 缩放期间的轮询定时器（鼠标压在视频区上时收不到 WM_MOUSEMOVE）
 ID_TOGGLE = 1001
 ID_EXIT = 1002
+ID_CONNECT = 1003
 CREATE_NO_WINDOW = 0x08000000
 
 # --- 操作栏视觉 ---
@@ -101,25 +104,84 @@ DEFAULT_CFG = {
 }
 
 
-def base_dir():
+APP_NAME = '魔芋'
+
+
+def app_dir():
+    """exe 所在目录；源码期就是本文件所在目录（tools/）。"""
     if getattr(sys, 'frozen', False):
-        here = os.path.dirname(sys.executable)
-    else:
-        here = os.path.dirname(os.path.abspath(__file__))
-    if os.path.isdir(os.path.join(here, 'scrcpy-win64-v5.0.1')):
-        return here
-    for cand in (r'D:\moyu\tools',):
-        if os.path.isdir(os.path.join(cand, 'scrcpy-win64-v5.0.1')):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_dir():
+    """只读资源目录：打包后是 PyInstaller 的 _internal（sys._MEIPASS）。"""
+    return getattr(sys, '_MEIPASS', None) or app_dir()
+
+
+def find_scrcpy_dir(app_path, res_path):
+    """找含 scrcpy.exe 的目录，找不到返回空串。
+
+    打包时把整份 scrcpy 塞进 _internal\\scrcpy；源码期直接用
+    tools\\scrcpy-win64-v5.0.1。以前这里硬编码回落 D:\\moyu\\tools，
+    换台机器就打不开投屏，已去掉。
+    """
+    for cand in (os.path.join(res_path, 'scrcpy'),
+                 os.path.join(res_path, 'scrcpy-win64-v5.0.1'),
+                 os.path.join(app_path, 'scrcpy'),
+                 os.path.join(app_path, 'scrcpy-win64-v5.0.1')):
+        if os.path.isfile(os.path.join(cand, 'scrcpy.exe')):
             return cand
-    return here
+    return ''
 
 
-BASE = base_dir()
+def config_path(app_path, res_path, frozen, appdata=None):
+    """配置文件路径：打包后放 %APPDATA%\\魔芋\\（exe 所在目录常没有写权限）。"""
+    if frozen:
+        root = appdata if appdata is not None else os.environ.get('APPDATA', '') or app_path
+        return os.path.join(root, APP_NAME, 'config.json')
+    return os.path.join(app_path, 'config.json')
+
+
+def save_cfg(path, cfg):
+    """把配置写回磁盘（自动建目录）；失败返回 False，不抛异常。"""
+    try:
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            os.makedirs(parent, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+FROZEN = bool(getattr(sys, 'frozen', False))
+APP_HOME = app_dir()          # exe 目录
+RES_HOME = resource_dir()     # 只读资源目录（打包后是 _internal）
+CONFIG_PATH = config_path(APP_HOME, RES_HOME, FROZEN)
+BASE = os.path.dirname(CONFIG_PATH)   # 数据目录：config.json 与 app.log 都放这里
+try:
+    # 打包版首次运行时 %APPDATA%\魔芋 还不存在，先建出来，否则日志和配置都写不进去
+    os.makedirs(BASE, exist_ok=True)
+except Exception:
+    pass
 
 
 def load_cfg():
     cfg = dict(DEFAULT_CFG)
-    path = os.path.join(BASE, 'config.json')
+    path = CONFIG_PATH
+    # 打包版第一次跑：把 exe 旁边那份 config.json 当种子拷进 %APPDATA%
+    if FROZEN and not os.path.exists(path):
+        seed = os.path.join(APP_HOME, 'config.json')
+        if os.path.exists(seed):
+            try:
+                with open(seed, 'r', encoding='utf-8') as f:
+                    seed_cfg = json.load(f)
+                if isinstance(seed_cfg, dict):
+                    save_cfg(path, seed_cfg)
+            except Exception:
+                pass
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f:
@@ -131,12 +193,19 @@ def load_cfg():
 
 CFG = load_cfg()
 TITLE = CFG['title']
-SCRCPY_DIR = os.path.join(BASE, 'scrcpy-win64-v5.0.1')
-ADB = os.path.join(SCRCPY_DIR, 'adb.exe')
-SCRCPY = os.path.join(SCRCPY_DIR, 'scrcpy.exe')
-ICO = os.path.join(getattr(sys, '_MEIPASS', BASE), 'app.ico')
+SCRCPY_DIR = find_scrcpy_dir(APP_HOME, RES_HOME)
+if not SCRCPY_DIR and not FROZEN:
+    # 源码期保留老习惯：本机 scrcpy 一直放在 D:\moyu\tools 下
+    for cand in (r'D:\moyu\tools',):
+        SCRCPY_DIR = find_scrcpy_dir(cand, cand)
+        if SCRCPY_DIR:
+            break
+# 找不到随包的 scrcpy 时退回裸命令名，让系统按 PATH 找（至少能给出可读错误）
+ADB = os.path.join(SCRCPY_DIR, 'adb.exe') if SCRCPY_DIR else 'adb.exe'
+SCRCPY = os.path.join(SCRCPY_DIR, 'scrcpy.exe') if SCRCPY_DIR else 'scrcpy.exe'
+ICO = os.path.join(RES_HOME, 'app.ico')
 # 操作栏里贴的应用图标（圆形，圆外透明）；app.ico 供托盘与 exe 资源使用
-APP_ICON = os.path.join(getattr(sys, '_MEIPASS', BASE), 'app_icon.png')
+APP_ICON = os.path.join(RES_HOME, 'app_icon.png')
 
 
 def log(msg):
@@ -147,7 +216,7 @@ def log(msg):
         pass
 
 
-log('--- start, BASE=%s frozen=%s' % (BASE, getattr(sys, 'frozen', False)))
+log('--- start, BASE=%s frozen=%s scrcpy_dir=%s' % (BASE, FROZEN, SCRCPY_DIR or '(未找到)'))
 
 _ICON_CACHE = {}
 
@@ -460,6 +529,7 @@ state = {
     'tray': None, 'frame': None, 'child': None, 'proc': None,
     'tray_click_ts': 0.0,
     'started_at': time.time(), 'quitting': False, 'error_shown': False,
+    'wizard_open': False,
     'aspect': 1080 / 2376, 'video_rect': (0, 0, 0, 0), 'close_hover': False,
     'orient': None, 'user_moved': False, 'region_key': None,
     'resizing': False, 'resize_hit': 0, 'resize_pt': (0, 0), 'resize_rect': (0, 0, 0, 0),
@@ -490,6 +560,40 @@ def mirror_visible():
     return hwnd_value(user32.GetForegroundWindow()) in (hwnd_value(f), hwnd_value(state['child']))
 
 
+def parse_devices(text):
+    """解析 `adb devices` 输出，返回状态为 device 的串号列表。"""
+    devs = []
+    for line in (text or '').splitlines()[1:]:
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == 'device':
+            devs.append(parts[0])
+    return devs
+
+
+def is_ip_port(serial):
+    """`192.168.1.5:43847` 这种无线调试串号（mDNS 串号不需要 adb connect）。"""
+    return bool(serial) and re.match(r'^[\d.]+:\d+$', str(serial)) is not None
+
+
+def valid_pair_code(code):
+    """无线调试的配对码固定 6 位数字。"""
+    return bool(code) and re.match(r'^\d{6}$', str(code).strip()) is not None
+
+
+def parse_pair_output(text):
+    """`adb pair` 的输出 → (是否成功, 给人看的提示)。"""
+    t = (text or '').strip()
+    if 'Successfully paired' in t:
+        return True, ''
+    if not t:
+        return False, '配对失败：adb 没有任何输出（检查 IP 与配对端口）'
+    for line in t.splitlines():
+        low = line.lower()
+        if 'failed' in low or 'error' in low or 'cannot' in low:
+            return False, line.strip()
+    return False, t.splitlines()[-1].strip()
+
+
 def list_devices():
     """adb devices 里当前在线的设备序列号（offline / unauthorized 不算）。"""
     try:
@@ -499,12 +603,7 @@ def list_devices():
         out = r.stdout.decode('utf-8', errors='ignore')
     except Exception:
         return []
-    devs = []
-    for line in out.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == 'device':
-            devs.append(parts[0])
-    return devs
+    return parse_devices(out)
 
 
 def pick_serial(cfg_serial, devices):
@@ -518,8 +617,10 @@ def pick_serial(cfg_serial, devices):
     return devices[0] if devices else cfg_serial
 
 
-def resolve_serial():
-    serial = pick_serial(CFG['serial'], list_devices())
+def resolve_serial(devices=None):
+    if devices is None:
+        devices = list_devices()
+    serial = pick_serial(CFG['serial'], devices)
     if serial != CFG['serial']:
         log('serial: cfg=%s 不在线，改用 %s' % (CFG['serial'], serial))
     else:
@@ -568,8 +669,43 @@ def adopt_aspect(cur, measured, tol=0.02):
     return measured if abs(measured - cur) > 0.2 * max(cur, measured) else cur
 
 
+def open_connect_wizard():
+    """弹「连接手机」向导；成功后把串号写回配置并重启 scrcpy。
+
+    只在没有在线设备、或用户从托盘菜单主动点进来时调用，平时不影响启动流程。
+    """
+    if state['wizard_open']:
+        log('wizard: 已经打开了，忽略重复请求')
+        return
+    state['wizard_open'] = True
+    log('wizard: open (adb=%s cfg=%s)' % (ADB, CONFIG_PATH))
+
+    def on_done(serial):
+        state['wizard_open'] = False
+        CFG['serial'] = serial
+        ok = save_cfg(CONFIG_PATH, CFG)
+        state['serial'] = serial
+        state['retries'] = 0
+        state['error_shown'] = False
+        log('wizard: serial=%s saved=%s -> %s' % (serial, ok, CONFIG_PATH))
+        threading.Thread(target=start_scrcpy, daemon=True).start()
+
+    def on_close():
+        # 用户直接关掉向导：把标记清掉，否则托盘菜单再点「连接手机…」会被当成重复请求
+        state['wizard_open'] = False
+        log('wizard: closed without connect')
+
+    connect_ui.show_wizard(ADB, on_done, on_log=log, on_close=on_close)
+
+
 def start_scrcpy():
-    serial = state.get('serial') or resolve_serial()
+    devices = list_devices()
+    if not devices:
+        # 一台可用设备都没有：与其弹一句看不懂的错误，不如直接把连接向导摆出来
+        log('scrcpy: 没有在线设备，改走连接向导')
+        open_connect_wizard()
+        return
+    serial = state.get('serial') if state.get('serial') in devices else resolve_serial(devices)
     state['aspect'] = get_phone_aspect()
     if re.match(r'^[\d.]+:\d+$', serial or ''):
         try:
@@ -1700,6 +1836,7 @@ def show_menu(hwnd):
     hmenu = user32.CreatePopupMenu()
     open_text = '隐藏投屏' if mirror_visible() else '显示投屏'
     user32.AppendMenuW(hmenu, 0x0000, ID_TOGGLE, open_text)
+    user32.AppendMenuW(hmenu, 0x0000, ID_CONNECT, '连接手机…')
     user32.AppendMenuW(hmenu, 0x0800, 0, None)
     user32.AppendMenuW(hmenu, 0x0000, ID_EXIT, '退出')
     pt = POINT()
@@ -1812,7 +1949,8 @@ def watchdog(hwnd):
             log('scrcpy retry %d' % state['retries'])
             threading.Thread(target=start_scrcpy, daemon=True).start()
             return
-        fail('投屏进程已退出。\n请确认手机无线调试已开启，且 config.json 里的 IP 与端口正确。')
+        fail('投屏进程已退出。\n请从托盘菜单「连接手机…」重新连接（或确认手机无线调试已开启）。'
+             '\n配置位置：%s' % CONFIG_PATH)
         quit_app()
         return
     if time.time() - state['started_at'] > 60:
@@ -1844,6 +1982,8 @@ def tray_proc(hwnd, msg, wparam, lparam):
         mid = wparam & 0xFFFF
         if mid == ID_TOGGLE:
             toggle_mirror()
+        elif mid == ID_CONNECT:
+            open_connect_wizard()
         elif mid == ID_EXIT:
             quit_app()
         return 0

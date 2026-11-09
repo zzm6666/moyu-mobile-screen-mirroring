@@ -5,7 +5,9 @@ a = Analysis(
     ['mirror_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('app.ico', '.'), ('app_icon.png', '.')],
+    datas=[('app.ico', '.'), ('app_icon.png', '.'),
+           # 把 adb/scrcpy 一起打进包：换台机器解压就能用，不再依赖 D:\moyu\tools
+           ('scrcpy-win64-v5.0.1/*', 'scrcpy')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

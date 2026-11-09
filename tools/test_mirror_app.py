@@ -721,5 +721,116 @@ class TestOwnsPoint(unittest.TestCase):
              m.state['child']) = saved
 
 
+class TestParseDevices(unittest.TestCase):
+    """adb devices 输出解析：只认状态是 device 的行。"""
+
+    def test_parses_online_devices(self):
+        text = ('List of devices attached\n'
+                '192.168.137.198:38493\tdevice\n'
+                'adb-bfd7e543-MoDo9u._adb-tls-connect._tcp\tdevice\n'
+                'OFFLINE123\toffline\n'
+                'UNAUTH123\tunauthorized\n\n')
+        self.assertEqual(
+            m.parse_devices(text),
+            ['192.168.137.198:38493',
+             'adb-bfd7e543-MoDo9u._adb-tls-connect._tcp'])
+
+    def test_empty_output(self):
+        self.assertEqual(m.parse_devices(''), [])
+        self.assertEqual(m.parse_devices('List of devices attached\n\n'), [])
+
+    def test_garbage_lines_ignored(self):
+        self.assertEqual(m.parse_devices('List of devices attached\nBAD LINE\n'), [])
+
+
+class TestPairHelpers(unittest.TestCase):
+    """配对相关的纯判断：IP:端口格式、6 位配对码、adb pair 输出。"""
+
+    def test_is_ip_port(self):
+        self.assertTrue(m.is_ip_port('192.168.137.198:43847'))
+        self.assertTrue(m.is_ip_port('10.0.0.2:1'))
+        self.assertFalse(m.is_ip_port('adb-bfd7e543-MoDo9u._adb-tls-connect._tcp'))
+        self.assertFalse(m.is_ip_port('192.168.1.2'))
+        self.assertFalse(m.is_ip_port(''))
+        self.assertFalse(m.is_ip_port(None))
+
+    def test_valid_pair_code(self):
+        self.assertTrue(m.valid_pair_code('835165'))
+        self.assertTrue(m.valid_pair_code(' 608474 '))
+        self.assertFalse(m.valid_pair_code('83516'))
+        self.assertFalse(m.valid_pair_code('8351650'))
+        self.assertFalse(m.valid_pair_code('83516a'))
+        self.assertFalse(m.valid_pair_code(''))
+        self.assertFalse(m.valid_pair_code(None))
+
+    def test_parse_pair_output(self):
+        ok, msg = m.parse_pair_output(
+            'Successfully paired to 192.168.137.198:43847 [guid=adb-bfd7e543-MoDo9u]')
+        self.assertTrue(ok)
+        self.assertEqual(msg, '')
+
+        ok, msg = m.parse_pair_output('Failed: Wrong password or connection was dropped.')
+        self.assertFalse(ok)
+        self.assertTrue(msg.startswith('Failed'))
+
+        ok, msg = m.parse_pair_output('')
+        self.assertFalse(ok)
+        self.assertTrue(msg)
+
+
+class TestPathsAndConfig(unittest.TestCase):
+    """打包后的路径：scrcpy 从资源目录找，配置写到 %APPDATA%。"""
+
+    def test_find_scrcpy_dir_prefers_bundled(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            app = os.path.join(d, 'app')
+            res = os.path.join(d, 'res')
+            for p in (os.path.join(res, 'scrcpy'), os.path.join(app, 'scrcpy-win64-v5.0.1')):
+                os.makedirs(p)
+                open(os.path.join(p, 'scrcpy.exe'), 'wb').close()
+            self.assertEqual(m.find_scrcpy_dir(app, res), os.path.join(res, 'scrcpy'))
+
+    def test_find_scrcpy_dir_skips_dir_without_exe(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            app = os.path.join(d, 'app')
+            res = os.path.join(d, 'res')
+            os.makedirs(os.path.join(res, 'scrcpy'))          # 空目录，没有 scrcpy.exe
+            ok = os.path.join(app, 'scrcpy-win64-v5.0.1')
+            os.makedirs(ok)
+            open(os.path.join(ok, 'scrcpy.exe'), 'wb').close()
+            self.assertEqual(m.find_scrcpy_dir(app, res), ok)
+
+    def test_find_scrcpy_dir_missing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(m.find_scrcpy_dir(d, d), '')
+
+    def test_config_path_frozen_uses_appdata(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = m.config_path('C:\\app', 'C:\\app\\_internal', True, d)
+            self.assertEqual(p, os.path.join(d, m.APP_NAME, 'config.json'))
+
+    def test_config_path_dev_uses_app_dir(self):
+        self.assertEqual(m.config_path('C:\\app', 'C:\\app', False, 'C:\\Users\\x\\AppData'),
+                         os.path.join('C:\\app', 'config.json'))
+
+    def test_save_cfg_roundtrip(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, '魔芋', 'config.json')
+            self.assertTrue(m.save_cfg(path, {'serial': 'x:1', 'w': 260}))
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.assertEqual(data['serial'], 'x:1')
+            self.assertEqual(data['w'], 260)
+
+    def test_save_cfg_bad_path_returns_false(self):
+        self.assertFalse(m.save_cfg(os.path.join('Z:\\', 'nope', 'config.json'), {'a': 1}))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
