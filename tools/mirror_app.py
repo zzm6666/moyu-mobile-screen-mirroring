@@ -50,6 +50,20 @@ UPDATE_FOUND, UPDATE_LATEST, UPDATE_NO_REPO, UPDATE_FAILED = 0, 1, 2, 3
 UPDATE_INTERVAL = 24 * 3600  # 自动检查更新的最小间隔（秒）；托盘手动检查不受限
 CREATE_NO_WINDOW = 0x08000000
 
+# --- 层级保持 ---
+# 别的窗口被最小化时，系统会把它「下一个」普通窗口激活并提到最前。魔芋是 tool window
+# （不在任务栏、不参与激活链），于是那个窗口直接盖到我们头上 —— 用户看到的是「层级下降」。
+# 我们只在「魔芋原本就压着所有普通窗口」的情况下，临时置顶占位 320ms 再落回普通层顶端，
+# 结果恰好等于最小化前的相对位次：既不会掉到别人下面，也不会从此一直压着别人。
+TIMER_LEVEL = 6  # 层级保持的释放定时器
+LEVEL_HOLD_MS = 320  # 占位时长：够系统完成激活与 Z 序重排，又短到看不出来
+EVENT_SYSTEM_MINIMIZESTART = 0x0016
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
+GW_OWNER = 4
+WS_EX_TOPMOST = 0x00000008
+MIN_APP_W, MIN_APP_H = 120, 60  # 真实应用窗口的最小尺寸（滤掉提示条/浮层）
+
 # --- 操作栏视觉 ---
 CORNER_R = 10  # 整窗四角统一圆角半径
 SS = 4  # 超采样倍率：圆角/文字/图形统一抗锯齿，边缘更平滑
@@ -525,6 +539,24 @@ user32.CallNextHookEx.restype = ctypes.c_ssize_t
 user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 user32.UnhookWindowsHookEx.restype = wt.BOOL
 
+# 层级保持用：监听「某窗口开始最小化」这个事件
+WINEVENTPROC = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND, wt.LONG, wt.LONG,
+                                  wt.DWORD, wt.DWORD)
+ENUMWINDOWSPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.SetWinEventHook.argtypes = [wt.DWORD, wt.DWORD, wt.HMODULE, WINEVENTPROC,
+                                   wt.DWORD, wt.DWORD, wt.DWORD]
+user32.SetWinEventHook.restype = wt.HANDLE
+user32.UnhookWinEvent.argtypes = [wt.HANDLE]
+user32.UnhookWinEvent.restype = wt.BOOL
+user32.EnumWindows.argtypes = [ENUMWINDOWSPROC, wt.LPARAM]
+user32.EnumWindows.restype = wt.BOOL
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+user32.GetWindow.restype = wt.HWND
+user32.GetWindowTextLengthW.argtypes = [wt.HWND]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.IsIconic.argtypes = [wt.HWND]
+user32.IsIconic.restype = wt.BOOL
+
 _PROC_REFS = []
 _FONT_CACHE = {}
 
@@ -544,6 +576,9 @@ state = {
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
     'update': None,  # 查到的新版本 info（updater.release_info 的返回值）
     'update_err': '',  # 最近一次检查更新失败的原因（手动检查时展示给用户）
+    'winevent': None,  # 层级保持用的 WinEvent 钩子句柄
+    'level_hold': False,  # 当前是否处于「临时置顶占位」状态
+    'level_order': None,  # 最小化事件发生瞬间的顶层窗口 Z 序快照
 }
 
 
@@ -1256,6 +1291,155 @@ CURSOR_FOR_HIT = {10: 32644, 11: 32644, 12: 32645, 15: 32645,
                   13: 32642, 14: 32643, 16: 32643, 17: 32642}
 
 
+def ex_topmost(h):
+    """窗口是否带 WS_EX_TOPMOST。
+
+    GetWindowLongW 的 restype 是 c_long，64 位下可能带回符号位，判位前先截回 32 位。
+    """
+    if not h or not user32.IsWindow(h):
+        return False
+    return bool((user32.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF) & WS_EX_TOPMOST)
+
+
+def is_app_window(h):
+    """是否「用户真正在用的应用窗口」：滤掉提示条、输入法候选、浮层这类噪声。"""
+    h = hwnd_value(h)
+    if not h or not user32.IsWindow(h) or not user32.IsWindowVisible(h):
+        return False
+    if (user32.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF) & WS_EX_TOOLWINDOW:
+        return False
+    if user32.GetWindow(h, GW_OWNER):  # 有 owner 的多是对话框/弹出窗
+        return False
+    if user32.GetWindowTextLengthW(h) <= 0:
+        return False
+    if user32.IsIconic(h):  # 已最小化的窗口只剩任务栏大小的矩形，别用尺寸否掉
+        return True
+    r = RECT()
+    if not user32.GetWindowRect(h, ctypes.byref(r)):
+        return False
+    return (r.right - r.left) >= MIN_APP_W and (r.bottom - r.top) >= MIN_APP_H
+
+
+def level_order():
+    """当前可见顶层窗口的 Z 序（前 → 后）。
+
+    枚举不过滤、回调里 try/except：早先加过过滤条件，回调一抛异常 EnumWindows 就提前
+    结束，拍出来的序是残缺的（表现为「我们的窗口不在列表里」）。
+    """
+    out = []
+
+    def _cb(h, lp):
+        try:
+            hh = hwnd_value(h)
+            if hh and user32.IsWindowVisible(hh):
+                out.append(hh)
+        except Exception:
+            pass
+        return True
+
+    fn = ENUMWINDOWSPROC(_cb)
+    _PROC_REFS.append(fn)
+    user32.EnumWindows(fn, 0)
+    return out
+
+
+def should_hold_level(order, me, minimizing):
+    """要不要为「别人最小化」临时置顶占位。
+
+    前提是魔芋原本就压着所有普通窗口 —— 压在我们上面的除了正在最小化的那个，只能是
+    topmost 窗口。这种情况下「占位 320ms 再落回普通层顶端」对用户完全无感，只是不让
+    系统把「下一个窗口」塞到我们头上；若魔芋本来就在某个普通窗口下面，就什么都不做，
+    免得又变成「跳到最前」。
+    """
+    me = hwnd_value(me)
+    minimizing = hwnd_value(minimizing)
+    order = [hwnd_value(h) for h in (order or [])]
+    if not me or me not in order:
+        return False
+    for h in order[:order.index(me)]:
+        if h == minimizing:
+            continue
+        if not ex_topmost(h):
+            return False
+    return True
+
+
+def _set_level(f, ch, topmost):
+    """整个窗口（含视频窗口）切到 topmost 或落回普通层，视频窗口始终压在 frame 正下方。"""
+    flags = SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE
+    after = HWND_TOPMOST if topmost else HWND_NOTOPMOST
+    user32.SetWindowPos(f, after, 0, 0, 0, 0, flags)
+    if ch and user32.IsWindow(ch):
+        user32.SetWindowPos(ch, after, 0, 0, 0, 0, flags)
+        user32.SetWindowPos(ch, f, 0, 0, 0, 0, flags)
+
+
+def hold_level(hwnd):
+    """临时置顶占位：此时本来就该在最上层，所以视觉上没有任何变化。"""
+    if state['level_hold']:
+        user32.SetTimer(hwnd, TIMER_LEVEL, LEVEL_HOLD_MS, None)  # 连着最小化多个：续期
+        return
+    state['level_hold'] = True
+    _set_level(hwnd, state['child'], True)
+    user32.SetTimer(hwnd, TIMER_LEVEL, LEVEL_HOLD_MS, None)
+    log('level: hold to keep above the window being minimized')
+
+
+def release_level(hwnd):
+    """落回普通层顶端 —— 正好等于最小化前的相对位次（在刚被激活的窗口之上）。"""
+    if not state['level_hold']:
+        return
+    state['level_hold'] = False
+    user32.KillTimer(hwnd, TIMER_LEVEL)
+    _set_level(hwnd, state['child'], False)
+    log('level: released to normal level')
+
+
+def level_event_proc(hook, event, hwnd, id_object, id_child, tid, ms):
+    """WinEvent 回调：只在「有窗口开始最小化」时出手。"""
+    try:
+        if event != EVENT_SYSTEM_MINIMIZESTART or state['quitting']:
+            return
+        f = state['frame']
+        if not f or state['hidden'] or not user32.IsWindowVisible(f):
+            return
+        # 拖动/缩放途中重排 Z 序会让分层窗口与视频窗口重新合成，接缝会闪一帧
+        if state['moving'] or state['resizing']:
+            return
+        target = hwnd_value(hwnd)
+        if not target or target in (hwnd_value(f), hwnd_value(state['child'])):
+            return
+        if not is_app_window(target):
+            return
+        order = level_order()
+        if not should_hold_level(order, f, target):
+            return
+        state['level_order'] = order
+        hold_level(f)
+    except Exception:
+        pass
+
+
+def install_level_hook():
+    if state['winevent']:
+        return state['winevent']
+    proc = WINEVENTPROC(level_event_proc)
+    _PROC_REFS.append(proc)
+    h = user32.SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART,
+                               None, proc, 0, 0,
+                               WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+    state['winevent'] = h
+    log('level hook=%s' % h)
+    return h
+
+
+def uninstall_level_hook():
+    h = state['winevent']
+    if h:
+        user32.UnhookWinEvent(h)
+    state['winevent'] = None
+
+
 def drag_start_raises(hit):
     """Only resize edges retain raise-on-press; toolbar caption drags do not."""
     return 10 <= hit <= 17
@@ -1629,6 +1813,9 @@ def frame_proc(hwnd, msg, wparam, lparam):
         if wparam == TIMER_RESIZE and state['resizing']:
             do_resize(hwnd)
             return 0
+        if wparam == TIMER_LEVEL:
+            release_level(hwnd)
+            return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE
         if state['resizing']:
@@ -1746,6 +1933,7 @@ def quit_app():
     if state['quitting']:
         return
     state['quitting'] = True
+    uninstall_level_hook()
     remove_mouse_hook()
     nid = NOTIFYICONDATAW()
     nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
@@ -2069,6 +2257,7 @@ def main():
     log('main: frame hwnd=%s size=%dx%d (content %dx%d, shadow pad=%d)'
         % (state['frame'], fw, fh, fw - 2 * SHADOW_PAD, fh - 2 * SHADOW_PAD, SHADOW_PAD))
     install_mouse_hook()
+    install_level_hook()  # 别人的窗口最小化时，别让系统把「下一个窗口」塞到我们头上
 
     threading.Thread(target=start_scrcpy, daemon=True).start()
     threading.Thread(target=maybe_check_update, daemon=True).start()
