@@ -7,7 +7,8 @@
 
 产物：
     tools\\魔芋\\魔芋.exe                 （onedir 绿色包，可直接 zip 分发）
-    dist-installer\\魔芋-Setup-<版本>.exe  （安装包）
+    dist-installer\\Moyu-Setup-<版本>.exe （安装包）
+    dist-installer\\Moyu-<版本>-portable.zip （便携版）
 """
 
 import os
@@ -91,11 +92,11 @@ def build_portable(version):
     import zipfile
     out_dir = os.path.join(ROOT, 'dist-installer')
     os.makedirs(out_dir, exist_ok=True)
-    zip_path = os.path.join(out_dir, '魔芋-%s-portable.zip' % version)
+    zip_path = os.path.join(out_dir, 'Moyu-%s-portable.zip' % version)
     stage = os.path.join(ROOT, 'dist-installer', '_portable')
     if os.path.isdir(stage):
         shutil.rmtree(stage, ignore_errors=True)
-    inner = os.path.join(stage, '魔芋-%s' % version)
+    inner = os.path.join(stage, 'Moyu-%s' % version)
     os.makedirs(inner, exist_ok=True)
     shutil.copytree(DEPLOY, inner, dirs_exist_ok=True)
     for extra in ('LICENSE', 'README.md'):
@@ -137,7 +138,7 @@ def main():
     build_portable(version)
     if not build_installer(version):
         return 1
-    target = os.path.join(ROOT, 'dist-installer', '魔芋-Setup-%s.exe' % version)
+    target = os.path.join(ROOT, 'dist-installer', 'Moyu-Setup-%s.exe' % version)
     print('\n完成：%s' % target if os.path.exists(target) else '\n编译命令已执行完，请检查 dist-installer 目录。')
     return 0
 

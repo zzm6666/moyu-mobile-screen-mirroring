@@ -38,7 +38,7 @@ PrivilegesRequiredOverridesAllowed=dialog
 AllowNoIcons=yes
 
 OutputDir=..\dist-installer
-OutputBaseFilename={#MyAppName}-Setup-{#MyAppVersion}
+OutputBaseFilename={#MyAppNameEn}-Setup-{#MyAppVersion}
 SetupIconFile=..\tools\app.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}

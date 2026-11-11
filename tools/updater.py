@@ -60,7 +60,7 @@ def pick_asset(release, want='-setup.exe'):
         if not url:
             continue
         low = name.lower()
-        if low.endswith(want):
+        if low.endswith(want) or ('setup' in low and low.endswith('.exe')):
             return url
         if not fallback and low.endswith('.exe'):
             fallback = url
