@@ -11,6 +11,12 @@ import urllib.error
 import urllib.request
 
 API = 'https://api.github.com/repos/%s/releases/latest'
+# API 有匿名限流（60 次/小时/IP，超了直接 403）。兜底走网页跳转：带着 HEAD 请求
+# releases/latest，GitHub 会 302 到 /releases/tag/vX.Y.Z，从落地地址取版本号即可，
+# 资产地址按我们的发布约定拼出来（发布时附件名固定是 Moyu-Setup-<版本>.exe）。
+LATEST_PAGE = 'https://github.com/%s/releases/latest'
+ASSET_URL = 'https://github.com/%s/releases/download/v%s/Moyu-Setup-%s.exe'
+_TAG_IN_URL = re.compile(r'/releases/tag/v?([0-9][0-9A-Za-z.\-]*)')
 TIMEOUT = 8
 UA = 'Moyu-Updater'
 
@@ -80,6 +86,31 @@ def release_info(release):
     }
 
 
+def resolve_by_redirect(repo, opener=None, timeout=TIMEOUT):
+    """不走 API 的兜底：HEAD releases/latest，从跳转后的地址里取版本号。
+
+    API 匿名限流时（HTTP 403）靠这条也能发现新版本，代价是拿不到发布说明、
+    资产直链只能按发布约定拼。
+    """
+    open_url = opener or urllib.request.urlopen
+    req = urllib.request.Request(LATEST_PAGE % repo, headers={'User-Agent': UA}, method='HEAD')
+    try:
+        with open_url(req, timeout=timeout) as resp:
+            final = resp.geturl() or ''
+    except Exception as e:
+        return None, '%s: %s' % (type(e).__name__, e)
+    m = _TAG_IN_URL.search(final)
+    if not m:
+        return None, '跳转地址里没有版本号'
+    ver = m.group(1)
+    return {
+        'version': ver,
+        'url': ASSET_URL % (repo, ver, ver),
+        'page': final,
+        'notes': '',
+    }, ''
+
+
 def fetch_latest(repo, opener=None, timeout=TIMEOUT):
     """查询最新 release，返回 (info, err)；err 为空表示成功。"""
     repo = (repo or '').strip()
@@ -91,13 +122,19 @@ def fetch_latest(repo, opener=None, timeout=TIMEOUT):
         with open_url(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode('utf-8', 'replace'))
     except urllib.error.HTTPError as e:
-        return None, 'HTTP %s' % e.code
+        api_err = 'HTTP %s' % e.code
     except Exception as e:                      # 断网/超时/证书问题都归到这里
-        return None, '%s: %s' % (type(e).__name__, e)
-    info = release_info(data)
-    if not info['version']:
-        return None, '发布里没有版本号'
-    return info, ''
+        api_err = '%s: %s' % (type(e).__name__, e)
+    else:
+        info = release_info(data)
+        if not info['version']:
+            return None, '发布里没有版本号'
+        return info, ''
+    # API 失败：换成网页跳转再试一次（匿名限流 403 也能拿到版本）
+    info, red_err = resolve_by_redirect(repo, opener=opener, timeout=timeout)
+    if info:
+        return info, ''
+    return None, api_err if api_err else red_err
 
 
 def download(url, dest, opener=None, timeout=60):
