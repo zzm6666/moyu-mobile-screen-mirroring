@@ -82,7 +82,9 @@ begin
     DataDir := ExpandConstant('{userappdata}\{#MyAppName}');
     if DirExists(DataDir) then
     begin
-      if MsgBox('是否同时删除配置和日志？' + #13#10 + #13#10 + DataDir, mbConfirmation, MB_YESNO) = IDYES then
+      // 用 SuppressibleMsgBox：静默卸载（/VERYSILENT）时不会卡在对话框上，默认保留配置
+      if SuppressibleMsgBox('是否同时删除配置和日志？' + #13#10 + #13#10 + DataDir,
+                            mbConfirmation, MB_YESNO, IDNO) = IDYES then
         DelTree(DataDir, True, True, True);
     end;
   end;
