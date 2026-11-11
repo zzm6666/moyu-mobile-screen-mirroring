@@ -81,7 +81,10 @@ python tools\build_installer.py
 
 一条命令做四件事：读 `tools/version.txt` → PyInstaller 打包 → 铺到 `tools\魔芋\` → 调 Inno Setup 编译 `installer\moyu.iss`。
 
-产物：`dist-installer\魔芋-Setup-<版本>.exe`
+产物：
+
+- `dist-installer\魔芋-Setup-<版本>.exe` —— 标准安装包（Inno Setup）
+- `dist-installer\魔芋-<版本>-portable.zip` —— 便携版（解压即用，内含 `install.ps1` 脚本安装器）
 
 - 默认装到 `%LOCALAPPDATA%\Programs\魔芋`，**不需要管理员权限**，安装向导里可以改目录
 - 自带卸载器；卸载时会问要不要连 `%APPDATA%\魔芋` 里的配置和日志一起删
@@ -90,6 +93,25 @@ python tools\build_installer.py
 - 想要中文安装向导：把 `ChineseSimplified.isl` 放进 `installer\` 目录（Inno 官方包不含简体中文），脚本会自动应用
 
 > 没有代码签名证书，别人首次运行安装包时 Windows SmartScreen 会提示「未知发布者」，点「更多信息 → 仍要运行」即可。
+
+### 便携版 / 脚本安装（安装包跑不起来时的兜底）
+
+个别机器上 Inno 的安装程序会在第一步就失败，报：
+
+```
+Setup was unable to create the directory "C:\Users\<你>\AppData\Local\Temp\is-XXXX.tmp".
+Error 5: 拒绝访问。
+```
+
+（实测出现在装过腾讯电脑管家的 Windows 11 上；同一个安装包里的文件搬运本身是好的。）这时用便携版：
+
+1. 解压 `魔芋-<版本>-portable.zip`
+2. 双击 `安装.cmd`（或者右键 `install.ps1` → 用 PowerShell 运行）
+
+`install.ps1` 做的事和安装包一样，但不经过 Setup：复制到 `%LOCALAPPDATA%\Programs\魔芋`、建开始菜单/桌面快捷方式、写 HKCU 卸载项（设置 → 应用 里能看到「魔芋」，可卸载）。安装目录里会生成 `卸载.cmd`。
+
+也可以不安装，直接双击解压出来的 `魔芋.exe` 当绿色版用。
+
 
 ### 被安全软件拦截时怎么办
 

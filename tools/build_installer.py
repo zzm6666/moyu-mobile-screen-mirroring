@@ -81,6 +81,50 @@ def build_installer(version):
     return run([iscc, '/Qp', '/DMyAppVersion=%s' % version, ISS], ROOT) == 0
 
 
+def build_portable(version):
+    """打便携版 zip：解压即用，另带 install.ps1 做「复制 + 快捷方式 + 卸载项」。
+
+    个别机器上 Inno 的安装程序会被安全软件/系统策略拒绝（
+    “Setup was unable to create the directory ... Error 5: 拒绝访问”），
+    这个 zip 是那种情况下的兜底分发方式。
+    """
+    import zipfile
+    out_dir = os.path.join(ROOT, 'dist-installer')
+    os.makedirs(out_dir, exist_ok=True)
+    zip_path = os.path.join(out_dir, '魔芋-%s-portable.zip' % version)
+    stage = os.path.join(ROOT, 'dist-installer', '_portable')
+    if os.path.isdir(stage):
+        shutil.rmtree(stage, ignore_errors=True)
+    inner = os.path.join(stage, '魔芋-%s' % version)
+    os.makedirs(inner, exist_ok=True)
+    shutil.copytree(DEPLOY, inner, dirs_exist_ok=True)
+    for extra in ('LICENSE', 'README.md'):
+        src = os.path.join(ROOT, extra)
+        if os.path.exists(src):
+            name = 'LICENSE.txt' if extra == 'LICENSE' else extra
+            shutil.copy2(src, os.path.join(inner, name))
+    ps1 = os.path.join(ROOT, 'installer', 'install.ps1')
+    if os.path.exists(ps1):
+        shutil.copy2(ps1, os.path.join(inner, 'install.ps1'))
+        # 安装.cmd 用 OEM 编码，双击即可跑
+        cmd = ('@echo off\r\n'
+               'cd /d "%~dp0"\r\n'
+               'powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0install.ps1"\r\n'
+               'pause\r\n')
+        with open(os.path.join(inner, '安装.cmd'), 'w', encoding='oem') as f:
+            f.write(cmd)
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for root, _dirs, files in os.walk(inner):
+            for name in files:
+                full = os.path.join(root, name)
+                z.write(full, os.path.relpath(full, stage))
+    shutil.rmtree(stage, ignore_errors=True)
+    print('便携版：%s（%.1f MB）' % (zip_path, os.path.getsize(zip_path) / 1e6))
+    return True
+
+
 def main():
     skip = '--skip-pyinstaller' in sys.argv
     version = read_version()
@@ -90,6 +134,7 @@ def main():
         return 1
     if not skip and not build_exe():
         return 1
+    build_portable(version)
     if not build_installer(version):
         return 1
     target = os.path.join(ROOT, 'dist-installer', '魔芋-Setup-%s.exe' % version)
