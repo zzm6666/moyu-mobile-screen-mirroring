@@ -33,7 +33,9 @@ ISCC_CANDIDATES = [
 def read_version():
     try:
         with open(os.path.join(TOOLS, 'version.txt'), 'r', encoding='utf-8') as f:
-            return f.read().strip()
+            # 有人（含 PowerShell 的 Set-Content）会用带 BOM 的 UTF-8 存版本号，
+            # BOM 混进文件名会变成 "Moyu-Setup-﻿1.0.2.exe"，所以先剔掉。
+            return f.read().strip().lstrip('\ufeff').strip()
     except OSError:
         return ''
 

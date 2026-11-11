@@ -140,7 +140,9 @@ def read_version():
                  os.path.join(app_dir(), 'version.txt')):
         try:
             with open(cand, 'r', encoding='utf-8') as f:
-                v = f.read().strip()
+                # 编辑器/PowerShell 存成带 BOM 的 UTF-8 时，BOM 会混进版本号，
+                # 导致「当前版本」显示成乱码、比较永远判成「有新版」，所以剔掉。
+                v = f.read().strip().lstrip('\ufeff').strip()
             if v:
                 return v
         except Exception:
