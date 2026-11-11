@@ -86,17 +86,6 @@ WS_EX_TOOLWINDOW = 0x00000080  # 不进任务栏、不进 Alt+Tab
 WS_EX_NOACTIVATE = 0x08000000  # 点了也不抢焦点（scrcpy 子窗口用）
 TRAY_CLICK_GUARD = 0.35  # 秒；双击托盘只算一次，避免「显示→立刻又隐藏」
 WH_MOUSE_LL = 14
-# --- 前台监听（WinEvent）---
-# 挡在魔芋前面的那个窗口被最小化/关闭后，我们该重新露面；但系统此刻正在切激活，
-# 立刻抢会被它自己的激活覆盖，所以投递一个延迟消息再置前。
-TIMER_RAISE = 5
-RAISE_HOLD_MS = 400
-EVENT_SYSTEM_FOREGROUND = 0x0003
-EVENT_SYSTEM_MINIMIZESTART = 0x0016
-EVENT_OBJECT_DESTROY = 0x8001
-WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS = 0x0000, 0x0002
-FG_MIN_AGE = 0.3  # 秒；前台得当了这么久才算「用户真的在用这个窗口」
-GW_OWNER = 4
 
 DEFAULT_CFG = {
     'serial': '',   # 留空 = 启动时自动查找在线设备（USB 或已配对的无线调试）
@@ -281,11 +270,6 @@ user32.SetProcessDPIAware()
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
 HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wt.WPARAM, wt.LPARAM)
-# SetWinEventHook 的回调：hwnd/idObject/idChild 是「谁变了」，tid/ms 是线程与时间戳
-WINEVENTPROC = ctypes.WINFUNCTYPE(None, wt.HANDLE, wt.DWORD, wt.HWND,
-                                  wt.LONG, wt.LONG, wt.DWORD, wt.DWORD)
-# EnumWindows 回调：用来给「谁在谁前面」拍快照
-ENUMWINDOWSPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -540,19 +524,6 @@ user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wt.WPARAM, wt.L
 user32.CallNextHookEx.restype = ctypes.c_ssize_t
 user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 user32.UnhookWindowsHookEx.restype = wt.BOOL
-user32.SetWinEventHook.argtypes = [wt.DWORD, wt.DWORD, wt.HMODULE, WINEVENTPROC,
-                                   wt.DWORD, wt.DWORD, wt.DWORD]
-user32.SetWinEventHook.restype = ctypes.c_void_p
-user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
-user32.UnhookWinEvent.restype = wt.BOOL
-user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
-user32.GetWindow.restype = ctypes.c_void_p
-user32.GetWindowTextLengthW.argtypes = [wt.HWND]
-user32.GetWindowTextLengthW.restype = ctypes.c_int
-user32.IsIconic.argtypes = [wt.HWND]
-user32.IsIconic.restype = wt.BOOL
-user32.EnumWindows.argtypes = [ENUMWINDOWSPROC, wt.LPARAM]
-user32.EnumWindows.restype = wt.BOOL
 
 _PROC_REFS = []
 _FONT_CACHE = {}
@@ -568,8 +539,6 @@ state = {
     'moving': False,
     'drawn_size': None,  # 上次真正绘制操作栏时的 (W, H)，纯拖位移时用来跳过重绘
     'hook': None,
-    'winevent': None,  # 前台/最小化事件钩子
-    'z_order': None,  # 别人开始最小化那一刻的 Z 序快照
     'hidden': False,  # 用户点了 × / 托盘「隐藏投屏」：收进托盘，只能靠托盘再唤出
     'serial': None,  # 实际使用的 adb 串号（配置的不在线时自动替换）
     'retries': 0,  # scrcpy 意外退出后的自动重连次数
@@ -1425,108 +1394,6 @@ def remove_mouse_hook():
         state['hook'] = None
 
 
-def top_level_order():
-    """按 Z 序（前 → 后）列出当前可见的顶层窗口。"""
-    order = []
-
-    def _cb(h, _l):
-        h = hwnd_value(h)
-        if h and user32.IsWindowVisible(h):
-            order.append(h)
-        return True
-
-    try:
-        fn = ENUMWINDOWSPROC(_cb)
-        _PROC_REFS.append(fn)
-        user32.EnumWindows(fn, 0)
-    except Exception:
-        return []
-    return order
-
-
-def release_target(order, me, now_fg):
-    """临时置顶到期后该怎么落脚（返回要插到谁下面，0 表示保持默认）。
-
-    别的窗口最小化时系统会把另一个窗口激活并提到最前，为了不让用户看到「闪一下」，
-    我们在这段时间临时 TOPMOST；到期后：
-    - 原本就压在 now_fg 之上 → 返回 0：撤销 TOPMOST 后落在普通窗带最前，仍在它上面；
-    - 原本垫在 now_fg 之下 → 返回 now_fg：插回它下面，绝不跳层；
-    - 判断不了（快照缺失/前台未知）→ 返回 0，保持默认。
-    """
-    me, now_fg = hwnd_value(me), hwnd_value(now_fg)
-    if not me or not now_fg or me == now_fg:
-        return 0
-    try:
-        return 0 if order.index(me) < order.index(now_fg) else now_fg
-    except (ValueError, AttributeError):
-        return 0
-
-
-
-def is_real_window(h):
-    """是不是「用户能当窗口用的」顶层窗口。
-
-    工具窗、有 owner 的对话框、没标题的、尺寸太小的（提示条、输入法候选、托盘
-    浮层）全部排除：它们频繁创建销毁，拿它们判断前台变化只会误触发置前。
-    """
-    h = hwnd_value(h)
-    if not h or not user32.IsWindow(h) or not user32.IsWindowVisible(h):
-        return False
-    ex = user32.GetWindowLongW(h, GWL_EXSTYLE) & 0xFFFFFFFF
-    if ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE):
-        return False
-    if user32.GetWindow(h, GW_OWNER):
-        return False
-    if user32.GetWindowTextLengthW(h) <= 0:
-        return False
-    if user32.IsIconic(h):
-        # 已最小化的窗口只剩任务栏大小的矩形（实测记事本 160x28），别拿尺寸否掉它
-        return True
-    r = RECT()
-    user32.GetWindowRect(h, ctypes.byref(r))
-    return (r.right - r.left) >= 160 and (r.bottom - r.top) >= 80
-
-
-def foreground_event_proc(hook, event, hwnd, id_object, id_child, tid, ms):
-    """WinEvent 回调（跑在消息循环里）：只盯「别的真实窗口开始最小化」。
-
-    系统会在这之后把另一个窗口激活并提到最前，魔芋会先被盖住、再由我们托回来，
-    用户看到的就是「闪一下」。所以在这一刻就抢先把自己临时置顶（TOPMOST）挡住
-    这段过渡，并记下原来的邻居当锚点；RAISE_HOLD_MS 之后由 TIMER_RAISE 复位。
-    """
-    try:
-        if event != EVENT_SYSTEM_MINIMIZESTART:
-            return
-        h = hwnd_value(hwnd)
-        if not is_real_window(h):
-            return
-        f = hwnd_value(state['frame'])
-        if not f or state['hidden'] or not user32.IsWindowVisible(f):
-            return
-        fg = hwnd_value(user32.GetForegroundWindow())
-        if fg == f:
-            return  # 前台本来就是魔芋，被最小化的是它后面那扇，跟我们无关
-        state['z_order'] = top_level_order()
-        user32.SetWindowPos(f, HWND_TOPMOST, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        log('raise: hold topmost to avoid flicker')
-        user32.SetTimer(f, TIMER_RAISE, RAISE_HOLD_MS, None)
-    except Exception:
-        pass
-
-
-def install_foreground_hook():
-    fn = WINEVENTPROC(foreground_event_proc)
-    _PROC_REFS.append(fn)
-    # 只订阅「最小化开始」这一个事件：范围开大一点就会收到海量无关事件，既费 CPU
-    # 又容易误判（实测曾在别的窗口销毁时不停抢前台，用户鼠标都点不动）。
-    state['winevent'] = user32.SetWinEventHook(
-        EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, None, fn, 0, 0,
-        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
-    log('foreground hook=%s' % state['winevent'])
-
-
-
 
 def update_frame(hwnd, force=False):
     r = RECT()
@@ -1761,25 +1628,6 @@ def frame_proc(hwnd, msg, wparam, lparam):
     if msg == 0x0113:  # WM_TIMER
         if wparam == TIMER_RESIZE and state['resizing']:
             do_resize(hwnd)
-            return 0
-        if wparam == TIMER_RAISE:
-            # 临时置顶到期：撤销 TOPMOST 并按「最小化之前的相对位次」落脚。
-            # 原本在对方之上 -> 落在普通窗带最前（仍在它上面）；
-            # 原本在对方之下 -> 插回它下面。层级和最小化之前一致，也不闪。
-            user32.KillTimer(hwnd, TIMER_RAISE)
-            order_before = state['z_order'] or []
-            state['z_order'] = None
-            now_fg = hwnd_value(user32.GetForegroundWindow())
-            below = release_target(order_before, hwnd, now_fg)
-            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-            if (below and below != hwnd_value(hwnd)
-                    and user32.IsWindow(below) and user32.IsWindowVisible(below)):
-                # hWndInsertAfter = below → 插到它之后，也就是它底下
-                user32.SetWindowPos(hwnd, below, 0, 0, 0, 0,
-                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-            sync_child_zorder()
-            log('raise: released topmost below=%s fg=%s' % (below, now_fg))
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     if msg == 0x0200:  # WM_MOUSEMOVE
@@ -2221,7 +2069,6 @@ def main():
     log('main: frame hwnd=%s size=%dx%d (content %dx%d, shadow pad=%d)'
         % (state['frame'], fw, fh, fw - 2 * SHADOW_PAD, fh - 2 * SHADOW_PAD, SHADOW_PAD))
     install_mouse_hook()
-    install_foreground_hook()
 
     threading.Thread(target=start_scrcpy, daemon=True).start()
     threading.Thread(target=maybe_check_update, daemon=True).start()

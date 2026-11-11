@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     魔芋 免安装包安装脚本（PowerShell 版安装器）
 
@@ -65,6 +65,13 @@ if ($running) {
     Say "正在关闭已运行的魔芋…"
     $running | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 600
+}
+# 升级覆盖时旧版自带的 adb 服务会占着 adb.exe，不关掉就会复制失败
+Get-Process -Name 'scrcpy', 'adb' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$oldAdb = Join-Path $Destination '_internal\scrcpy\adb.exe'
+if (Test-Path $oldAdb) {
+    try { & $oldAdb kill-server 2>$null | Out-Null } catch { }
+    Start-Sleep -Milliseconds 400
 }
 
 # ---- 3. 复制文件 ----
