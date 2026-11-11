@@ -7,5 +7,7 @@
   "h": 572,
   "fps": 60,
   "bitrate": "4M",
-  "max_size": 720
+  "max_size": 720,
+  "update_repo": "zzm6666/moyu-mobile-screen-mirroring",
+  "last_update_check": 0
 }
