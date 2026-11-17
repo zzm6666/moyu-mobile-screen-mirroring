@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-"""一键出安装包：PyInstaller 打包 → 铺到 tools\\魔芋 → Inno Setup 编译 installer\\moyu.iss。
+"""一键出安装包：PyInstaller 打包 → 铺到 deploy → Inno Setup 编译 installer\\moyu.iss。
 
 用法（仓库根目录）：
     python tools\\build_installer.py            # 全流程
     python tools\\build_installer.py --skip-pyinstaller   # 只编安装器
 
 产物：
-    tools\\魔芋\\魔芋.exe                 （onedir 绿色包，可直接 zip 分发）
+    deploy\\魔芋.exe                     （onedir 绿色包，可直接 zip 分发）
     dist-installer\\Moyu-Setup-<版本>.exe （安装包）
     dist-installer\\Moyu-<版本>-portable.zip （便携版）
+
+中间目录 dist-build / build-work / deploy 都放仓库根目录：
+tools\\ 下的旧 build 目录删不掉（WinError 5），别挪回去。
 """
 
 import os
@@ -18,9 +21,9 @@ import sys
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
-DIST = os.path.join(TOOLS, 'dist')
-BUILD = os.path.join(TOOLS, 'build')
-DEPLOY = os.path.join(TOOLS, '魔芋')
+DIST = os.path.join(ROOT, 'dist-build')
+BUILD = os.path.join(ROOT, 'build-work')
+DEPLOY = os.path.join(ROOT, 'deploy')
 ISS = os.path.join(ROOT, 'installer', 'moyu.iss')
 ISCC_CANDIDATES = [
     os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
