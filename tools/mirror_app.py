@@ -1886,6 +1886,11 @@ def toggle_mirror():
     f = state['frame']
     if not f:
         return
+    if not (state['child'] and user32.IsWindow(state['child'])):
+        # 还没连上手机：没有视频窗口，把空壳显示出来没意义，直接弹连接向导
+        log('toggle: no video window -> connect wizard')
+        open_connect_wizard()
+        return
     visible = user32.IsWindowVisible(f)
     fg = user32.GetForegroundWindow()
     on_top = (bool(visible)
@@ -2107,6 +2112,11 @@ def watchdog(hwnd):
             ensure_frame_orientation()
             update_frame(state['frame'])
             log('child ready hwnd=%s' % t)
+            # 连上了才露面：没连手机时不显示投屏窗口（收进托盘期间除外）
+            if not state['hidden']:
+                user32.ShowWindow(state['frame'], 5)
+                user32.ShowWindow(t, 5)
+                log('window: shown after connect')
             return
     else:
         if user32.IsWindow(state['child']):
@@ -2125,6 +2135,10 @@ def watchdog(hwnd):
                     log('aspect updated %.4f' % a)
             return
         state['child'] = None
+        # 视频窗口没了（掉线/退出）：别把最后一帧画面继续晾在桌面上
+        if user32.IsWindowVisible(state['frame']):
+            user32.ShowWindow(state['frame'], 0)
+            log('window: hidden because the video window is gone')
     p = state['proc']
     if p is None:
         return
@@ -2255,7 +2269,7 @@ def main():
     no_system_chrome(state['frame'])
     move_to_bottom_right()
     update_frame(state['frame'])
-    user32.ShowWindow(state['frame'], 5)
+    # 先不显示：没连上手机时只弹连接向导，等视频窗口就绪（watchdog 的 child ready）再露面
     log('main: frame hwnd=%s size=%dx%d (content %dx%d, shadow pad=%d)'
         % (state['frame'], fw, fh, fw - 2 * SHADOW_PAD, fh - 2 * SHADOW_PAD, SHADOW_PAD))
     install_mouse_hook()
