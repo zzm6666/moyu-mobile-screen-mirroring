@@ -113,6 +113,7 @@ DEFAULT_CFG = {
     'max_size': 720,
     'update_repo': 'zzm6666/moyu-mobile-screen-mirroring',  # 自动更新来源（GitHub 仓库）
     'last_update_check': 0,  # 上次成功检查更新的时间戳（秒），用于 24 小时节流
+    'known_devices': [],  # 连接向导记住的设备：{'serial','name','addr','last_seen'}，新在前
 }
 
 
@@ -615,25 +616,6 @@ def is_ip_port(serial):
     return bool(serial) and re.match(r'^[\d.]+:\d+$', str(serial)) is not None
 
 
-def valid_pair_code(code):
-    """无线调试的配对码固定 6 位数字。"""
-    return bool(code) and re.match(r'^\d{6}$', str(code).strip()) is not None
-
-
-def parse_pair_output(text):
-    """`adb pair` 的输出 → (是否成功, 给人看的提示)。"""
-    t = (text or '').strip()
-    if 'Successfully paired' in t:
-        return True, ''
-    if not t:
-        return False, '配对失败：adb 没有任何输出（检查 IP 与配对端口）'
-    for line in t.splitlines():
-        low = line.lower()
-        if 'failed' in low or 'error' in low or 'cannot' in low:
-            return False, line.strip()
-    return False, t.splitlines()[-1].strip()
-
-
 def list_devices():
     """adb devices 里当前在线的设备序列号（offline / unauthorized 不算）。"""
     try:
@@ -720,14 +702,15 @@ def open_connect_wizard():
     state['wizard_open'] = True
     log('wizard: open (adb=%s cfg=%s)' % (ADB, CONFIG_PATH))
 
-    def on_done(serial):
+    def on_done(serial, name=''):
         state['wizard_open'] = False
         CFG['serial'] = serial
+        connect_ui.remember_device(CFG, serial, name)
         ok = save_cfg(CONFIG_PATH, CFG)
         state['serial'] = serial
         state['retries'] = 0
         state['error_shown'] = False
-        log('wizard: serial=%s saved=%s -> %s' % (serial, ok, CONFIG_PATH))
+        log('wizard: serial=%s name=%s saved=%s -> %s' % (serial, name, ok, CONFIG_PATH))
         threading.Thread(target=start_scrcpy, daemon=True).start()
 
     def on_close():
@@ -735,12 +718,19 @@ def open_connect_wizard():
         state['wizard_open'] = False
         log('wizard: closed without connect')
 
-    connect_ui.show_wizard(ADB, on_done, on_log=log, on_close=on_close)
+    connect_ui.show_wizard(ADB, on_done, on_log=log, on_close=on_close,
+                           known=CFG.get('known_devices'), icon_path=ICO)
 
 
 def start_scrcpy():
     # 先自己找手机：在线设备 → 上次的 IP:端口 → mDNS 发现；都没有才弹向导
-    auto = connect_ui.try_auto_connect(ADB, CFG.get('serial'))
+    serial = CFG.get('serial') or ''
+    online = bool(serial) and serial in list_devices()
+    if online:
+        # 已连接（比如向导里点了「已连接」的设备）：不重复 connect，直接投屏
+        auto = serial
+    else:
+        auto = connect_ui.try_auto_connect(ADB, CFG.get('serial'))
     if not auto:
         log('scrcpy: 自动查找设备失败，改走连接向导')
         open_connect_wizard()
@@ -752,7 +742,7 @@ def start_scrcpy():
     state['serial'] = auto
     serial = auto
     state['aspect'] = get_phone_aspect()
-    if re.match(r'^[\d.]+:\d+$', serial or ''):
+    if not online and re.match(r'^[\d.]+:\d+$', serial or ''):
         try:
             subprocess.run([ADB, 'connect', serial], stdin=subprocess.DEVNULL,
                            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=8)
@@ -774,6 +764,10 @@ def start_scrcpy():
             '-m', str(CFG['max_size'])]
     if not has_audio_device():
         args.append('--no-audio')
+    # 「60 秒没出窗口」从本次拉起 scrcpy 起算，不能用程序启动时间：
+    # 用户可能在连接向导里配对好几分钟，配对成功那一刻距启动早已超过 60 秒，
+    # 用旧起点会在 scrcpy 窗口出现前的一两秒里弹出误报（投屏其实是好的）。
+    state['started_at'] = time.time()
     state['proc'] = subprocess.Popen(args, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
