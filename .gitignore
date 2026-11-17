@@ -4,6 +4,14 @@ tools/dist/
 tools/__pycache__/
 __pycache__/
 *.pyc
+build-work/
+dist-build/
+deploy/
+.venv/
+pip-unpack-*/
+
+# ---- 本地验证截图（调试用，不入库）----
+wizard_*.png
 
 # ---- 部署目录（本地运行用的成品，不是源码）----
 tools/魔芋/
