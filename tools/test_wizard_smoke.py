@@ -182,8 +182,12 @@ class WizardSmokeTest(unittest.TestCase):
         t.join(5)
         self.assertFalse(t.is_alive(), '向导线程没退出')
 
-    def test_success_toast_then_auto_close(self):
-        """连接成功 → 窗口内「连接成功」toast → 1 秒后窗口自动消失并回调 on_done。"""
+    def test_connected_row_not_clickable_and_button_connects(self):
+        """已连接的设备行点了不能有任何反应；连接要走未连接设备右侧的「连接」按钮。
+
+        用户 m02243 反馈：点设备项（还是已连接的设备）又触发了一次连接，
+        结果开出第二个「裸」投屏窗口。所以行本身不再是热点，只有「连接」按钮是。
+        """
         done = threading.Event()
         closed = threading.Event()
         result = {}
@@ -196,33 +200,49 @@ class WizardSmokeTest(unittest.TestCase):
                              kwargs=dict(adb='fake-adb',
                                          on_done=done_cb,
                                          on_close=closed.set,
-                                         runner=fake_runner))
+                                         runner=fake_runner_mixed))
         t.start()
         hwnd = _own_window(done_cb)
         self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
         ctx = connect_ui._WINDOWS[hwnd]
-        # 等首次刷新完成，拿到在线设备行
+        # 等首次刷新完成，拿到设备行
         for _ in range(80):
             if ctx['rows']:
                 break
             time.sleep(0.1)
+        self.assertTrue(ctx['rows'], '假 runner 没刷出设备')
         rows = ctx['rows']
-        self.assertTrue(rows, '假 runner 没刷出设备')
-        i = next(i for i, r in enumerate(rows) if r['state'] == 'online')
-        # 已连接（在线）的设备不显示「连接」按钮：没有行按钮热点，整行可点
-        self.assertNotIn(connect_ui.ID_ROW_BASE + i, ctx['hotspots'],
-                         '在线设备不应有连接按钮')
-        off = [j for j, r in enumerate(ctx['visible_rows']) if r['state'] != 'online']
-        for j in off:
+        vis = ctx['visible_rows']
+        online = [i for i, r in enumerate(vis) if r['state'] == 'online']
+        self.assertTrue(online, '假数据里应该有已连接的设备')
+        # 已连接（在线）的设备不显示「连接」按钮，整行也不再是热点
+        for i in online:
+            self.assertNotIn(connect_ui.ID_ROW_BASE + i, ctx['hotspots'],
+                             '在线设备不应有连接按钮')
+        found = [j for j, r in enumerate(vis) if r['state'] == 'found']
+        self.assertTrue(found, '假数据里应该有一台「新发现」的设备')
+        for j in found:
             self.assertIn(connect_ui.ID_ROW_BASE + j, ctx['hotspots'],
                           '未连接设备应保留连接按钮')
+        # 1) 点已连接的设备行：不能触发连接（没有 toast、没有 on_done）
+        i = online[0]
         y = connect_ui.LIST_Y + i * connect_ui.ROW_H
-        lp = (connect_ui.PAD + 100) | ((y + 20) << 16)   # 点设备行本身
+        lp = (connect_ui.PAD + 100) | ((y + 20) << 16)
         connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)  # WM_LBUTTONDOWN
-        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)  # WM_LBUTTONUP → 连接
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)  # WM_LBUTTONUP
+        time.sleep(0.5)
+        self.assertEqual(ctx.get('toast'), '', '点已连接的设备行不该发起连接')
+        self.assertFalse(done.is_set(), '点已连接的设备行不该回调 on_done')
+        self.assertTrue(connect_ui.user32.IsWindow(hwnd), '窗口不该关闭')
+        # 2) 点「新发现」设备右侧的连接按钮：连上 → toast → 1 秒后自动关窗
+        j = found[0]
+        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE + j]
+        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
         # toast 出现后窗口必须还活着（不能立刻销毁）
         saw_toast = False
-        for _ in range(40):
+        for _ in range(60):
             if ctx.get('toast'):
                 saw_toast = True
                 break
@@ -233,8 +253,8 @@ class WizardSmokeTest(unittest.TestCase):
         self.assertFalse(done.is_set(), 'toast 还没满 1 秒就回调了 on_done')
         # 1 秒后窗口自动关闭、on_done 带上串号和名字
         self.assertTrue(done.wait(5), 'toast 后窗口没有自动关闭')
-        self.assertEqual(result['serial'], rows[i]['serial'])
-        self.assertEqual(result['name'], rows[i]['name'])
+        self.assertEqual(result['serial'], vis[j]['serial'])
+        self.assertEqual(result['name'], vis[j]['name'])
         for _ in range(50):   # WM_DESTROY 是同步销毁，但消息循环收尾略滞后
             if not connect_ui.user32.IsWindow(hwnd):
                 break
@@ -378,6 +398,69 @@ class WizardSmokeTest(unittest.TestCase):
         t.join(5)
         self.assertFalse(t.is_alive(), '向导线程没退出')
         self.assertFalse(done.is_set(), '没点连接却触发了 on_done')
+
+    def test_only_code_uses_discovered_pairing_port(self):
+        """只填 6 位配对码、IP 端口留空：电脑自己发现配对端口并填回输入框。"""
+        closed = threading.Event()
+        done = threading.Event()
+        discovered = []
+
+        def fake_discover(peers=(), timeout=None, browser=None):
+            discovered.append(list(peers))
+            return '192.168.137.144:43485'
+
+        orig_discover = connect_ui.discover_pair_target
+        connect_ui.discover_pair_target = fake_discover
+        pair_cmds = []
+        orig_runner = connect_ui.run_cmd
+
+        def runner(cmd, timeout=25):
+            j = ' '.join(cmd)
+            pair_cmds.append(j)
+            if ' pair ' in j:
+                return 0, 'Successfully paired to 192.168.137.144:43485'
+            if 'connect' in j:
+                return 0, 'connected to 192.168.137.144:37999'
+            return 0, 'List of devices attached\n'
+
+        try:
+            done_cb = done.set
+            t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                                 kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                             on_close=closed.set, runner=runner))
+            t.start()
+            hwnd = _own_window(done_cb)
+            self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+            ctx = connect_ui._WINDOWS[hwnd]
+            edits = ctx['edits']
+            WM_SETTEXT, WM_COMMAND = 0x000C, 0x0111
+            connect_ui.user32.SendMessageW(edits[connect_ui.ID_CODE], WM_SETTEXT, 0,
+                                           ctypes.c_wchar_p('123456'))
+            connect_ui.user32.PostMessageW(hwnd, WM_COMMAND, connect_ui.ID_GO, 0)
+            for _ in range(80):
+                if any(' pair ' in c for c in pair_cmds):
+                    break
+                time.sleep(0.1)
+            pair_cmd = next((c for c in pair_cmds if ' pair ' in c), None)
+            self.assertIsNotNone(pair_cmd, '没发起 adb pair：%r' % pair_cmds)
+            self.assertIn('192.168.137.144:43485', pair_cmd,
+                          '没用自动发现的配对端口：%r' % pair_cmd)
+            self.assertIn('123456', pair_cmd)
+            self.assertTrue(discovered, '没有调用自动发现')
+            # 发现的地址要填回输入框，让用户看到电脑找到了什么
+            # （pair 之后还要等 10 秒的「连接端口」发现窗口，所以这里要等足够久）
+            for _ in range(300):
+                if connect_ui._text(edits[connect_ui.ID_IP]):
+                    break
+                time.sleep(0.1)
+            self.assertEqual(connect_ui._text(edits[connect_ui.ID_IP]), '192.168.137.144')
+            self.assertEqual(connect_ui._text(edits[connect_ui.ID_PORT]), '43485')
+            connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
+            self.assertTrue(closed.wait(5), 'WM_CLOSE 后 on_close 没被调用')
+            t.join(5)
+        finally:
+            connect_ui.discover_pair_target = orig_discover
+            connect_ui.run_cmd = orig_runner
 
 
 if __name__ == '__main__':

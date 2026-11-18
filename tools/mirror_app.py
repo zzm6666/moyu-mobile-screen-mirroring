@@ -722,10 +722,52 @@ def open_connect_wizard():
                            known=CFG.get('known_devices'), icon_path=ICO)
 
 
+def _kill_scrcpy():
+    """结束当前 scrcpy 进程（连同子进程）；没有在跑就什么都不做。
+
+    再拉起一个新的 scrcpy 之前必须先结束旧的：旧窗口已经被收养进 frame，
+    第二个窗口不会被收养，会变成一个单独的「裸」投屏窗口。
+    """
+    p = state['proc']
+    if p is None or p.poll() is not None:
+        return
+    try:
+        subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'],
+                       stdin=subprocess.DEVNULL, capture_output=True,
+                       creationflags=CREATE_NO_WINDOW, timeout=10)
+    except Exception:
+        pass
+
+
+AUTO_CONNECT_GRACE = 6.0    # 启动时等 adb 自己把「已配对的无线设备」连上多久
+
+
+def _wait_online(serial, seconds):
+    """等 adb 把这个串号变成在线设备。
+
+    adb server 刚启动（例如刚装完/刚重启过）时，它要靠 mDNS 广播才发现手机，
+    这中间有 2~5 秒的空档。这段时间里 `adb devices` 是空的，但手机其实就在，
+    立刻判定「没设备」会把用户直接丢进连接向导。
+    """
+    end = time.time() + seconds
+    while time.time() < end:
+        if serial in list_devices():
+            return True
+        time.sleep(0.5)
+    return serial in list_devices()
+
+
 def start_scrcpy():
+    _kill_scrcpy()
+    state['child'] = None      # 旧画面已经没了，等新窗口出现再收养
     # 先自己找手机：在线设备 → 上次的 IP:端口 → mDNS 发现；都没有才弹向导
     serial = CFG.get('serial') or ''
     online = bool(serial) and serial in list_devices()
+    if not online and '_adb-tls-connect._tcp' in serial:
+        # 上次配对过的无线设备：先等 adb 自己连上来，别急着弹向导
+        online = _wait_online(serial, AUTO_CONNECT_GRACE)
+        if online:
+            log('scrcpy: 等到了 adb 自动连上 %s' % serial)
     if online:
         # 已连接（比如向导里点了「已连接」的设备）：不重复 connect，直接投屏
         auto = serial
@@ -1943,12 +1985,7 @@ def quit_app():
     shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
     p = state['proc']
     if p is not None and p.poll() is None:
-        try:
-            subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'],
-                           stdin=subprocess.DEVNULL, capture_output=True,
-                           creationflags=CREATE_NO_WINDOW, timeout=10)
-        except Exception:
-            pass
+        _kill_scrcpy()
     if state['tray']:
         user32.DestroyWindow(state['tray'])
     else:

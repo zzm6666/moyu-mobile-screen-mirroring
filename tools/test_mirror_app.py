@@ -46,7 +46,16 @@ class WatchdogTimeoutTest(unittest.TestCase):
             'get_phone_aspect': app.get_phone_aspect,
             'has_audio_device': app.has_audio_device,
             'Popen': app.subprocess.Popen,
+            'run': app.subprocess.run,
         }
+        # adb/taskkill 一律记录不真跑：测试不该真去结束 pid=4242 的进程
+        self._run_calls = []
+
+        def fake_run(cmd, **kw):
+            self._run_calls.append(list(cmd))
+            return types.SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+
+        app.subprocess.run = fake_run
         app.fail = lambda msg: self._fail_calls.append(msg)
         app.target_hwnd = lambda: None      # scrcpy 窗口尚未出现
         app.list_devices = lambda: ['192.168.1.2:5555']
@@ -63,6 +72,8 @@ class WatchdogTimeoutTest(unittest.TestCase):
                 app.connect_ui.try_auto_connect = v
             elif k == 'Popen':
                 app.subprocess.Popen = v
+            elif k == 'run':
+                app.subprocess.run = v
             else:
                 setattr(app, k, v)
         app.state.clear()
@@ -110,21 +121,35 @@ class WatchdogTimeoutTest(unittest.TestCase):
         app.CFG['serial'] = serial
         app.state['serial'] = serial
         app.list_devices = lambda: [serial]
-        calls = []
-        orig_run = app.subprocess.run
-        app.subprocess.run = lambda cmd, **kw: calls.append(cmd) or orig_run(cmd, **kw)
         app.connect_ui.try_auto_connect = lambda *a, **kw: self.fail(
             '已连接的设备不应再走 try_auto_connect 重新找设备/连接')
         app.get_phone_aspect = lambda: 0.4545
         app.has_audio_device = lambda: True
         app.subprocess.Popen = lambda *a, **kw: FakeProc()
-        try:
-            app.start_scrcpy()
-        finally:
-            app.subprocess.run = orig_run
-        self.assertFalse([c for c in calls if 'connect' in c],
-                         '设备已在线却又执行了 adb connect：%r' % calls)
+        app.start_scrcpy()
+        self.assertFalse([c for c in self._run_calls if 'connect' in c],
+                         '设备已在线却又执行了 adb connect：%r' % self._run_calls)
         self.assertIsInstance(app.state['proc'], FakeProc)
+
+    def test_start_scrcpy_kills_previous_before_launch(self):
+        """已在投屏时又点连接：先结束旧的 scrcpy，否则新窗口不会被收养，会留在外面成「裸」投屏窗口。"""
+        app.connect_ui.try_auto_connect = lambda adb, serial, runner=None: '192.168.1.2:5555'
+        app.get_phone_aspect = lambda: 0.4545
+        app.has_audio_device = lambda: True
+        order = []
+
+        def fake_run(cmd, **kw):
+            order.append(list(cmd))
+            return types.SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+
+        app.subprocess.run = fake_run
+        app.subprocess.Popen = lambda *a, **kw: order.append(['popen']) or FakeProc()
+        app.state['child'] = 12345          # 上一个 scrcpy 窗口已经被收养
+        app.start_scrcpy()
+        self.assertEqual(order[0][:2], ['taskkill', '/PID'],
+                         '旧的 scrcpy 没被结束，会开出第二个「裸」投屏窗口：%r' % (order,))
+        self.assertIn(['popen'], order)
+        self.assertIsNone(app.state['child'], '没有清掉 child，新窗口不会被收养')
 
 
 class WizardWiringTest(unittest.TestCase):
@@ -198,6 +223,65 @@ class WizardWiringTest(unittest.TestCase):
         self.assertTrue(app.state['wizard_open'])
         self._wiz_kwargs['on_close']()
         self.assertFalse(app.state['wizard_open'])
+
+
+class StartupWaitTest(unittest.TestCase):
+    """启动时 adb 刚起来、mDNS 还没发现手机：先等一会儿，别急着弹连接向导。"""
+
+    def setUp(self):
+        self._saved_state = dict(app.state)
+        self._saved_cfg = app.CFG
+        self._orig = {'list_devices': app.list_devices, 'sleep': time.sleep,
+                      'Popen': app.subprocess.Popen,
+                      'wizard': app.open_connect_wizard,
+                      'try_auto': app.connect_ui.try_auto_connect,
+                      'aspect': app.get_phone_aspect,
+                      'audio': app.has_audio_device}
+        self.wizard_calls = []
+        app.open_connect_wizard = lambda: self.wizard_calls.append(1)
+        time.sleep = lambda s: None          # 不真的等
+        app.get_phone_aspect = lambda: 0.4545
+        app.has_audio_device = lambda: True
+        app.subprocess.Popen = lambda *a, **kw: FakeProc()
+        app.CFG = dict(app.DEFAULT_CFG)
+        app.state.update({'proc': None, 'child': None, 'quitting': False})
+
+    def tearDown(self):
+        time.sleep = self._orig['sleep']
+        app.list_devices = self._orig['list_devices']
+        app.subprocess.Popen = self._orig['Popen']
+        app.open_connect_wizard = self._orig['wizard']
+        app.connect_ui.try_auto_connect = self._orig['try_auto']
+        app.get_phone_aspect = self._orig['aspect']
+        app.has_audio_device = self._orig['audio']
+        app.CFG = self._saved_cfg
+        app.state.clear()
+        app.state.update(self._saved_state)
+
+    def test_waits_for_mdns_autoconnect(self):
+        """上次配对过的无线设备：等 adb 自己连上就该直接投屏，不该弹向导。"""
+        serial = 'adb-bfd7e543-MoDo9u._adb-tls-connect._tcp'
+        app.CFG['serial'] = serial
+        seen = []
+
+        def fake_list():
+            seen.append(1)
+            return [serial] if len(seen) >= 3 else []   # 第三次才出现
+
+        app.list_devices = fake_list
+        app.connect_ui.try_auto_connect = lambda *a, **kw: self.fail(
+            '已经在等 adb 自动连接，不该再走 try_auto_connect 重新找设备')
+        app.start_scrcpy()
+        self.assertEqual(self.wizard_calls, [], '应该等 adb 自己连上，而不是弹连接向导')
+        self.assertIsInstance(app.state['proc'], FakeProc)
+
+    def test_no_device_still_opens_wizard(self):
+        """手机确实不在（等也等不到）时，仍然要弹向导。"""
+        app.CFG['serial'] = 'adb-x._adb-tls-connect._tcp'
+        app.list_devices = lambda: []
+        app.connect_ui.try_auto_connect = lambda *a, **kw: ''
+        app.start_scrcpy()
+        self.assertEqual(len(self.wizard_calls), 1, '手机不在时要弹连接向导')
 
 
 if __name__ == '__main__':

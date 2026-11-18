@@ -440,6 +440,20 @@ class ReconnectKnownTest(ChineseMsgMixin, unittest.TestCase):
         self.assert_plain_chinese(msg, 'failed to connect', '10061')
         self.assertIn('无线调试', msg)
 
+    def test_wifi_mdns_same_name_new_ip(self):
+        """手机换了 IP（DHCP 变了）→ 按 mDNS 服务名认回来，连新地址。"""
+        r = FakeRunner(
+            mdns=mdns_text(('adb-bfd7e543-MoDo9u', '_adb-tls-connect._tcp.',
+                            '192.168.137.72:45861')),
+            connect_map={
+                '192.168.137.198:41001': (1, 'failed to connect: 10061'),
+                '192.168.137.72:45861': (0, 'connected to 192.168.137.72:45861')})
+        ok, msg, serial = cu.reconnect_known(
+            ADB, {'serial': MDNS_SERIAL, 'addr': '192.168.137.198:41001',
+                  'name': '一加 13'}, r)
+        self.assertTrue(ok)
+        self.assertEqual(serial, '192.168.137.72:45861')
+
 
 class PairThenConnectTest(ChineseMsgMixin, unittest.TestCase):
     def test_pair_fail_returns_chinese_error(self):
@@ -483,17 +497,38 @@ class PairThenConnectTest(ChineseMsgMixin, unittest.TestCase):
                          [['pair', '192.168.1.5:43847', '123456']])
 
     def test_pair_ok_all_fail_sleep_patched(self):
-        """配对成功但 6 轮都找不到连接端口 → 中文提示；sleep 必须被打桩。"""
+        """配对成功但一直等不到连接广播 → 中文提示（含手动填端口的办法）。"""
         r = FakeRunner(mdns='List of discovered mdns services\n')
+        logs = []
         with mock.patch('connect_ui.time.sleep') as sl:
             ok, msg, serial = cu.pair_then_connect(ADB, '192.168.1.5:43847',
-                                                   '123456', r)
+                                                   '123456', r, logs.append)
         self.assertFalse(ok)
         self.assertEqual(serial, '')
         self.assert_plain_chinese(msg)
         self.assertIn('配对成功', msg)
-        self.assertEqual(sl.call_count, 6)          # 最多 6 轮重试
-        self.assertEqual(len(r.cmds('devices')), 6)
+        self.assertIn('端口', msg)
+        self.assertIn('无线调试', msg)
+        self.assertEqual(sl.call_count, cu.PAIR_DISCOVER_SECS)   # 按常量等这么多秒
+        self.assertEqual(len(r.cmds('devices')), cu.PAIR_DISCOVER_SECS)
+        # 放弃时把原始 mdns 输出写进日志，便于定位「广播到底有没有来」
+        self.assertTrue(any('mdns=' in m for m in logs))
+
+    def test_pair_ok_port_found_but_connect_failed(self):
+        """端口找到了但 connect 失败 → 报真实的连接错误，不能说「没找到端口」。"""
+        r = FakeRunner(
+            mdns=mdns_text(('adb-bfd7e543-MoDo9u', '_adb-tls-connect._tcp.',
+                            '192.168.1.5:41001')),
+            connect_default=(1, 'failed to connect to 192.168.1.5:41001: 10060'))
+        with mock.patch('connect_ui.time.sleep'):
+            ok, msg, serial = cu.pair_then_connect(ADB, '192.168.1.5:43847',
+                                                   '123456', r)
+        self.assertFalse(ok)
+        self.assertEqual(serial, '')
+        self.assertIn('端口也找到了', msg)
+        self.assertIn('192.168.1.5:41001', msg)
+        self.assertNotIn('没收到', msg)
+        self.assert_plain_chinese(msg, '10060')
 
     def test_invalid_input_short_circuits(self):
         """IP:端口 / 配对码不合法 → 中文提示，且一个 adb 命令都不跑。"""
@@ -516,6 +551,84 @@ class PairThenConnectTest(ChineseMsgMixin, unittest.TestCase):
                                                    '123456', r)
         self.assertFalse(ok)
         self.assertEqual(r.cmds('connect'), [])
+
+
+class DecideActionTest(ChineseMsgMixin, unittest.TestCase):
+    """「连接手机」按钮的分派：有配对码→配对+连接；配对码留空→直接连接。"""
+
+    def test_with_code_pairs(self):
+        kind, payload, err = cu.decide_action('192.168.1.5', '43847', '123456')
+        self.assertEqual(kind, 'pair')
+        self.assertEqual(payload, ('192.168.1.5:43847', '123456'))
+        self.assertEqual(err, '')
+
+    def test_empty_code_connects_directly(self):
+        """已配对过：配对码留空，填好 IP 和连接端口就直接连（不重新配对）。"""
+        kind, payload, err = cu.decide_action('192.168.1.5', '41001', '')
+        self.assertEqual(kind, 'connect')
+        self.assertEqual(payload, '192.168.1.5:41001')
+        self.assertEqual(err, '')
+
+    def test_short_code_is_error(self):
+        kind, payload, err = cu.decide_action('192.168.1.5', '43847', '123')
+        self.assertEqual(kind, '')
+        self.assertIsNone(payload)
+        self.assert_plain_chinese(err)
+        self.assertIn('留空', err)
+
+    def test_only_code_pairs_by_discovery(self):
+        """只填配对码、IP 端口留空：交给电脑自己去手机广播里找端口。"""
+        kind, payload, err = cu.decide_action('', '', '123456')
+        self.assertEqual(kind, 'pair')
+        self.assertEqual(payload, ('', '123456'))
+        self.assertEqual(err, '')
+
+    def test_missing_everything_is_error(self):
+        kind, payload, err = cu.decide_action('', '', '')
+        self.assertEqual(kind, '')
+        self.assertIsNone(payload)
+        self.assert_plain_chinese(err)
+        self.assertIn('配对码', err)
+
+
+class DiscoverPairTargetTest(unittest.TestCase):
+    """自动找手机的配对端口：连接广播给 IP，配对广播给端口。"""
+
+    def browser(self, srv_connect=(), srv_pairing=()):
+        calls = []
+
+        def browse(service_type, timeout=None, targets=None):
+            calls.append((service_type, list(targets or [])))
+            return list(srv_connect if 'connect' in service_type else srv_pairing)
+
+        browse.calls = calls
+        return browse
+
+    def test_uses_ip_from_connect_broadcast(self):
+        browse = self.browser(
+            srv_connect=[{'name': 'x', 'port': 36305, 'addr': '192.168.1.5'}],
+            srv_pairing=[{'name': 'y', 'port': 43485, 'addr': '192.168.1.5'}])
+        got = cu.discover_pair_target(browser=browse)
+        self.assertEqual(got, '192.168.1.5:43485')
+        self.assertEqual(browse.calls[0][0], '_adb-tls-connect._tcp')
+        self.assertEqual(browse.calls[1][0], '_adb-tls-pairing._tcp')
+        # 配对广播必须单播问手机（组播问不到）
+        self.assertIn('192.168.1.5', browse.calls[1][1])
+
+    def test_peers_from_known_devices_are_asked(self):
+        browse = self.browser(srv_pairing=[{'addr': '192.168.1.9', 'port': 40000}])
+        got = cu.discover_pair_target(['192.168.1.9', ''], browser=browse)
+        self.assertEqual(got, '192.168.1.9:40000')
+        # 已知手机 IP 时省掉连接广播那一轮，直接单播问配对广播
+        self.assertEqual(browse.calls[0][0], '_adb-tls-pairing._tcp')
+        self.assertEqual(browse.calls[0][1], ['192.168.1.9'])
+
+    def test_nothing_found_returns_empty(self):
+        self.assertEqual(cu.discover_pair_target(browser=self.browser()), '')
+
+    def test_item_without_port_ignored(self):
+        browse = self.browser(srv_pairing=[{'addr': '192.168.1.5', 'port': 0}])
+        self.assertEqual(cu.discover_pair_target(browser=browse), '')
 
 
 class ConnectOnlyTest(ChineseMsgMixin, unittest.TestCase):

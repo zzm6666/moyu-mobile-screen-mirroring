@@ -26,6 +26,11 @@ import subprocess
 import threading
 import time
 
+try:                      # 自动发现手机配对端口（纯标准库 mDNS 浏览器）
+    import mdns_browse
+except Exception:         # 环境里没有这个模块时，退化为「只能手填 IP:端口」
+    mdns_browse = None
+
 CREATE_NO_WINDOW = 0x08000000
 IP_PORT_RE = re.compile(r'^[\d.]+:\d+$')
 
@@ -40,6 +45,7 @@ WM_SETFOCUS = 0x0007
 WM_KILLFOCUS = 0x0008
 WM_PRINTCLIENT = 0x0318
 WM_SETICON = 0x0080
+WM_SETTEXT = 0x000C
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
 WM_CTLCOLORSTATIC = 0x0138
@@ -508,9 +514,14 @@ def reconnect_known(adb, entry, runner=run_cmd):
         ok, msg, s = connect_only(adb, addr, runner)
         if ok:
             return True, msg, s
-    # 3) mDNS 找新端口（优先同 IP）
-    ip = _ip_of(addr)
-    found = parse_mdns_services(runner([adb, 'mdns', 'services'])[1], ip)
+    # 3) mDNS 找新端口（优先同 IP；手机换了 IP 时按 mDNS 服务名认回来）
+    out = runner([adb, 'mdns', 'services'])[1]
+    found = parse_mdns_services(out, _ip_of(addr))
+    if not found and serial:
+        for d in parse_mdns_all(out):
+            if d['serial'] == serial:
+                found = d['addr']
+                break
     if found:
         ok, msg, s = connect_only(adb, found, runner)
         if ok:
@@ -547,33 +558,112 @@ def try_auto_connect(adb, cfg_serial, runner=run_cmd):
     return ''
 
 
-def pair_then_connect(adb, ip_port, code, runner=run_cmd):
+PAIR_DISCOVER_SECS = 10      # 配对成功后等手机广播「连接端口」的秒数
+
+
+PAIR_SETUP_SECS = 6          # 在手机「使用配对码配对设备」页面等配对端口的秒数
+
+
+def _ip_only(text):
+    """把用户填的东西取成纯 IP：'192.168.1.5:43847' 和 '192.168.1.5' 都行。"""
+    text = (text or '').strip()
+    if IP_PORT_RE.match(text):
+        return _ip_of(text)
+    return text if re.match(r'^[\d.]+$', text) else ''
+
+
+def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None):
+    """自动找手机的**配对端口**，返回 'ip:port'；找不到返回 ''。
+
+    手机停在「使用配对码配对设备」页面时会广播 `_adb-tls-pairing._tcp`，
+    但安卓的 NsdManager 广播**不回组播查询**，必须单播问手机 ip:5353 ——
+    所以先用手头的手机 IP（设备行/历史设备/用户填的 IP + 连接广播里的 IP）当单播目标。
+    browser: 可注入（默认 mdns_browse.browse），返回 [{'name','host','port','addr'}]。
+    """
+    if mdns_browse is None and browser is None:
+        return ''
+    browse = browser or mdns_browse.browse
+    ips = []
+    for ip in peers:
+        if ip and ip not in ips:
+            ips.append(ip)
+    # 手头还没有手机 IP 时，才去问连接广播（组播就能问到）把 IP 补齐（省 3 秒）
+    if not ips:
+        for it in browse('_adb-tls-connect._tcp', timeout=min(3.0, timeout),
+                         targets=[]):
+            ip = it.get('addr') or ''
+            if ip and ip not in ips:
+                ips.append(ip)
+    for it in browse('_adb-tls-pairing._tcp', timeout=timeout, targets=ips):
+        ip, port = it.get('addr') or '', it.get('port') or 0
+        if ip and port:
+            return '%s:%s' % (ip, port)
+    return ''
+
+
+def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
+                      wait=PAIR_DISCOVER_SECS):
     """一键「连接手机」：配对 + 自动找到真正的「连接端口」再连，用户无感。
 
     手机无线调试有两个端口：配对弹窗里的**配对端口**和主页面上「IP 地址和端口」的
     **连接端口**，两者通常不同——配对成功后不能拿配对端口去 connect。
-    这里按三步找连接方式：
+    连接端口只能靠手机的 mDNS 广播（`_adb-tls-connect._tcp`）发现：广播可能迟到，
+    路由器开了客户端隔离时甚至永远收不到。所以这里：
       1. 配对成功后先看 `adb devices`（mDNS 常常直接出现可用设备）；
       2. 不行再查 `adb mdns services` 拿该 IP 的连接端口，然后 connect；
-      3. 都不行就给出通俗提示（不再让用户手填连接端口——自动重试 mDNS 几轮）。
+      3. 重试 wait 秒；仍不行就把「端口框手动填一次」的办法说清楚。
+    log: 可选日志回调；放弃时写原始 mdns 输出，便于以后定位。
     """
     ok, msg = pair_only(adb, ip_port, code, runner)
     if not ok:
         return False, msg, ''
     ip = _ip_of(ip_port)
+    seen_addr, last_err, out = '', '', ''
     # mDNS 广播有延迟：多等几轮，尽量不让用户做任何额外操作
-    for attempt in range(6):
+    for _ in range(max(1, wait)):
         devs = list_online(adb, runner)
         if devs:
             return True, '配对并连接成功', devs[0]
-        serial = parse_mdns_services(runner([adb, 'mdns', 'services'])[1], ip)
+        out = runner([adb, 'mdns', 'services'])[1]
+        serial = parse_mdns_services(out, ip)
         if serial:
             ok2, msg2, s2 = connect_only(adb, serial, runner)
             if ok2:
                 return True, '配对并连接成功', s2
+            seen_addr, last_err = serial, msg2   # 端口找到了但连不上，不能报「找不到端口」
         time.sleep(1.0)
-    return False, ('配对成功了，但电脑暂时没找到手机的连接端口。请保持手机「无线调试」'
-                   '页面亮着，稍等几秒后再点一次「连接手机」。'), ''
+    if log:
+        log('wizard: 配对成功但没连上，最后 mdns=%r' % ((out or '')[:600],))
+    if seen_addr:
+        return False, ('配对成功了，端口也找到了（%s），但连接没成功：%s'
+                       % (seen_addr, last_err or '手机没有响应。')), ''
+    return False, ('配对成功了，但没收到手机的连接广播。请回到手机「无线调试」主页'
+                   '（能看到「IP 地址和端口」那一页）停留几秒让电脑自动连；'
+                   '若还是连不上，把那一页上的「端口」填到上面的端口框、配对码留空，'
+                   '再点一次「连接手机」。'), ''
+
+
+def decide_action(ip, port, code):
+    """「连接手机」按钮该干什么：有配对码 → 配对+连接；只填 IP:端口 → 直接连接。
+
+    返回 (kind, payload, 提示)：kind 是 'pair' / 'connect' / ''，
+    为空串表示输入不合格，此时提示是中文错误文案。
+    配对码留空＝已配对过，用户手填连接端口即可（mDNS 收不到时的兜底）。
+    **只填了配对码**时 payload 的 ip_port 是空串：电脑自己去手机广播里找配对端口。
+    """
+    ip_port = join_ip_port(ip, port)
+    code = (code or '').strip()
+    if code:
+        if not valid_code(code):
+            return '', None, ('配对码是手机「使用配对码配对设备」页面上显示的 6 位数字；'
+                              '已经配对过可以留空，直接点「连接手机」。')
+        if not ip_port:
+            return 'pair', ('', code), ''    # 端口交给电脑自动发现
+        return 'pair', (ip_port, code), ''
+    if not ip_port:
+        return '', None, ('先在手机上打开「使用配对码配对设备」页面并把 6 位配对码填进'
+                          '「配对码」框；或者按那一页显示的 IP 和端口填进前两个框。')
+    return 'connect', ip_port, ''
 
 
 def remember_device(cfg, serial, name, addr='', now=None):
@@ -753,16 +843,14 @@ def _xy(lparam):
 
 
 def _hit(ctx, x, y):
-    """客户区坐标 → 可点元素 id；没有则 0。"""
+    """客户区坐标 → 可点元素 id；没有则 0。
+
+    设备行本身不可点：只有行右侧的「连接」按钮有热点。
+    已连接的设备连按钮都没有，点它什么也不会发生（避免误触发起连接）。
+    """
     for hid, (rx, ry, rw, rh) in ctx['hotspots'].items():
         if rx <= x < rx + rw and ry <= y < ry + rh:
             return hid
-    # 在线设备没有按钮：整行可点，点一下直接开始投屏
-    if PAD <= x < WIN_W - PAD:
-        for i, r in enumerate(ctx['visible_rows']):
-            ry = LIST_Y + i * ROW_H
-            if r['state'] == 'online' and ry <= y < ry + ROW_H:
-                return ID_ROW_BASE + i
     return 0
 
 
@@ -903,7 +991,7 @@ def _paint(ctx, hdc):
         # 首次配对区
         _draw_text(hdc, f_body, PAD, SEC_Y, '首次配对', C_INK)
         _draw_text(hdc, f_small, PAD + 76, SEC_Y + 3,
-                   '手机：设置 → 开发者选项 → 无线调试 → 使用配对码配对', C_FAINT)
+                   '手机：无线调试 → 使用配对码配对设备（只填配对码也行）', C_FAINT)
         _draw_text(hdc, f_small, PAD, IP_Y + 2, 'IP 端口', C_SUB)
         _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
         # IP 与端口之间的冒号（两个输入框同一行，用户不用输「:」）
@@ -998,6 +1086,29 @@ def _start_job(ctx, kind, payload, row=None, busy_text='正在连接'):
     threading.Thread(target=_worker_job, args=(ctx, kind, payload), daemon=True).start()
 
 
+def _peer_ips(ctx):
+    """手头所有可能的手机 IP：设备行地址、历史设备、用户已填的 IP。"""
+    ips = []
+
+    def add(ip):
+        if ip and ip not in ips:
+            ips.append(ip)
+
+    for r in ctx.get('rows') or []:
+        add(_ip_only(r.get('addr') or ''))
+    for k in ctx.get('known') or []:
+        add(_ip_only(k.get('addr') or ''))
+    add(_ip_only(_text(ctx['edits'][ID_IP])))
+    return ips
+
+
+def _set_edit_text(ctx, cid, text):
+    eh = ctx['edits'].get(cid)
+    if eh and text:
+        user32.SendMessageW(eh, WM_SETTEXT, 0,
+                            ctypes.cast(ctypes.c_wchar_p(text), ctypes.c_void_p))
+
+
 def _worker_job(ctx, kind, payload):
     """在工作线程里跑 adb，结果放到 ctx 里再 PostMessage 回窗口。"""
     try:
@@ -1021,9 +1132,22 @@ def _worker_job(ctx, kind, payload):
                         r['name'] = m.group(1)
             ctx['job'] = ('refresh', rows, '')
         elif kind == 'pair':
-            ok, msg, serial = pair_then_connect(ctx['adb'], payload[0], payload[1],
-                                                ctx['runner'])
-            ctx['job'] = ('pair', (ok, msg, serial), '')
+            ip_port, code = payload
+            found = ''
+            if not ip_port:            # 只填了配对码：电脑自己去手机广播里找配对端口
+                found = discover_pair_target(_peer_ips(ctx))
+                ip_port = found
+                if ctx['log']:
+                    ctx['log']('wizard: 自动发现配对端口 %r' % (found,))
+            if not ip_port:
+                ctx['job'] = ('pair', (False,
+                                       '没找到手机。请让手机停在「使用配对码配对设备」'
+                                       '那一页（上面有 6 位码和 IP:端口），再点一次'
+                                       '「连接手机」。', ''), '')
+            else:
+                ok, msg, serial = pair_then_connect(ctx['adb'], ip_port, code,
+                                                    ctx['runner'], ctx['log'])
+                ctx['job'] = ('pair', (ok, msg, serial, found), '')
         elif kind == 'connect':
             ok, msg, serial = connect_only(ctx['adb'], payload, ctx['runner'])
             ctx['job'] = ('connect', (ok, msg, serial), '')
@@ -1057,7 +1181,7 @@ def _on_job_done(ctx):
         n_on = sum(1 for r in rows if r['state'] == 'online')
         if rows:
             if n_on:
-                _status(ctx, '找到 %d 台设备（%d 台已连接），点已连接的设备即可投屏。'
+                _status(ctx, '找到 %d 台设备（%d 台已连接）。点未连接设备右侧的「连接」即可投屏。'
                         % (len(rows), n_on), 'info')
             else:
                 _status(ctx, '找到 %d 台设备，点设备右侧「连接」即可投屏。'
@@ -1068,7 +1192,12 @@ def _on_job_done(ctx):
             ctx['log']('wizard: devices=%s' % ([r['serial'] for r in rows],))
         _invalidate(ctx)
         return
-    ok, msg, serial = job[1] if isinstance(job[1], tuple) else (False, str(job[1]), '')
+    val = job[1] if isinstance(job[1], tuple) else (False, str(job[1]), '')
+    ok, msg, serial = val[0], val[1], val[2]
+    found = val[3] if len(val) > 3 else ''
+    if found:   # 电脑自己找到的配对端口：填回输入框，让用户看到它找到了什么
+        _set_edit_text(ctx, ID_IP, _ip_of(found))
+        _set_edit_text(ctx, ID_PORT, found.rsplit(':', 1)[-1])
     if ctx['log']:
         ctx['log']('wizard: %s -> ok=%s msg=%s' % (kind, ok, msg))
     if ok:
@@ -1144,17 +1273,16 @@ def _click(ctx, hid):
         _start_job(ctx, 'refresh', None, busy_text='正在查找设备')
         return
     if hid == ID_GO:
-        ip_port = join_ip_port(_text(ctx['edits'][ID_IP]),
-                               _text(ctx['edits'][ID_PORT]))
-        if not ip_port:
-            _status(ctx, '请在两个框里分别填手机配对弹窗里的 IP 和端口，'
-                         '例如 192.168.1.5 和 43847（冒号不用输）。', 'err')
+        kind, payload, err = decide_action(_text(ctx['edits'][ID_IP]),
+                                           _text(ctx['edits'][ID_PORT]),
+                                           _text(ctx['edits'][ID_CODE]))
+        if not kind:
+            _status(ctx, err, 'err')
             return
-        code = _text(ctx['edits'][ID_CODE]).strip()
-        if not valid_code(code):
-            _status(ctx, '配对码是手机配对弹窗里的 6 位数字。', 'err')
-            return
-        _start_job(ctx, 'pair', (ip_port, code), busy_text='正在配对并连接')
+        if kind == 'pair':
+            _start_job(ctx, 'pair', payload, busy_text='正在配对并连接')
+        else:
+            _start_job(ctx, 'connect', payload, busy_text='正在连接')
         return
     if hid >= ID_ROW_BASE:
         i = hid - ID_ROW_BASE
@@ -1163,7 +1291,9 @@ def _click(ctx, hid):
             return
         r = rows[i]
         if r['state'] == 'online':
-            _finish(ctx, r['serial'])
+            # 已连接的设备：点了也不做任何事（不重复连接，也就不会开出第二个投屏窗口）
+            _status(ctx, '「%s」已经连上了，不用再点。' % r['name'], 'info')
+            return
         elif r['state'] == 'found':
             _start_job(ctx, 'connect', r['addr'], row=i)
         else:
