@@ -538,6 +538,8 @@ def _set_pair_open(ctx, mode='', addr=''):
         eh = ctx['edits'].get(eid)
         if eh:
             user32.ShowWindow(eh, 5 if visible else 0)   # SW_SHOW / SW_HIDE
+    # 收起时窗口跟着矮下去（用户嫌底部空了一大片）
+    _fit_client(ctx['hwnd'], WIN_W, _win_h(ctx))
     _rebuild_hotspots(ctx)
     _invalidate(ctx)
 
@@ -953,6 +955,7 @@ def _rgb(c):
 
 # 布局常量（客户区坐标，DPI 未缩放时按 96dpi 设计；窗口固定尺寸）
 WIN_W, WIN_H = 520, 560
+WIN_H_CLOSED = 508                   # 配对面板收起时窗口矮一点，底部不留大片空白
 PAD = 20
 TAB_Y, TAB_H = 56, 34
 LIST_Y = TAB_Y + TAB_H + 14
@@ -970,7 +973,6 @@ SUCCESS_CLOSE_MS = 1000         # 「连接成功」toast 停留时长，之后�
 AUTO_REFRESH_MS = 3000          # 向导开着时每 3 秒悄悄刷新一次设备列表
 AUTO_REFRESH_TIMER = 3          # 该刷新用的 WM_TIMER id
 GO_H = 40
-STATUS_Y = GO_Y + GO_H + 12
 USB_HINT_Y = LIST_Y + LIST_H_FULL + 16
 EDIT_X = PAD + 64                     # 输入框左缘（标签右侧）
 IP_W = 176                            # IP 框宽（适量，不拉满）
@@ -1104,6 +1106,23 @@ def _max_rows(ctx):
     return MAX_ROWS if ctx.get('pair_open') else MAX_ROWS_FULL
 
 
+def _win_h(ctx):
+    """窗口高度：面板收起时矮一点（没有大按钮和输入框），展开时回到全高。"""
+    return WIN_H if ctx.get('pair_open') else WIN_H_CLOSED
+
+
+def _fit_client(hwnd, w, h):
+    """把窗口调成「客户区正好 w x h」（SetWindowPos 给的是含边框的窗口尺寸）。"""
+    rc = wt.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(rc))
+    wr = wt.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(wr))
+    dw = (wr.right - wr.left) - rc.right
+    dh = (wr.bottom - wr.top) - rc.bottom
+    user32.SetWindowPos(hwnd, None, 0, 0, w + dw, h + dh,
+                        0x0002 | 0x0004 | 0x0010)   # NOMOVE|NOZORDER|NOACTIVATE
+
+
 def _list_h(ctx):
     """设备列表卡片高度固定（不随行数变化），行数多了用滚轮翻。"""
     return ROW_H * _max_rows(ctx)
@@ -1157,7 +1176,7 @@ def _rebuild_hotspots(ctx):
 
 
 def _paint(ctx, hdc):
-    W, H = WIN_W, WIN_H
+    W, H = WIN_W, _win_h(ctx)
     _fill_rect(hdc, 0, 0, W, H, C_BG)
     f_title = ctx['f_title']
     f_body = ctx['f_body']
@@ -1347,7 +1366,8 @@ def _paint(ctx, hdc):
         _draw_text(hdc, f_small, PAD, USB_HINT_Y,
                    '提示：手机上弹出「允许 USB 调试」时勾选「一律允许」，以后即插即用。', C_FAINT)
 
-    # 内联状态区（错误红 / 成功绿 / 进行中主色 / 普通灰）
+    # 内联状态区（错误红 / 成功绿 / 进行中主色 / 普通灰）——贴着窗口底部，
+    # 这样收起面板时不用为它留一大片固定空隙
     st = ctx['status_text']
     if st:
         kind = ctx['status_kind']
@@ -1355,9 +1375,11 @@ def _paint(ctx, hdc):
         bg = {'err': C_ERR_LT, 'ok': C_OK_LT, 'busy': C_PRIMARY_LT}.get(kind, C_BG)
         lines = _wrap_text(hdc, f_small, st, W - 2 * PAD - 24)
         bh = 12 + len(lines) * 18
-        _round_rect(hdc, PAD, STATUS_Y, W - 2 * PAD, bh, 8, bg)
+        floor = (GO_Y + GO_H + 8) if ctx['pair_open'] else (_pair_link_y(ctx) + 22)
+        sy = max(floor, H - 12 - bh)
+        _round_rect(hdc, PAD, sy, W - 2 * PAD, bh, 8, bg)
         for i, ln in enumerate(lines):
-            _draw_text(hdc, f_small, PAD + 12, STATUS_Y + 7 + i * 18, ln, fg)
+            _draw_text(hdc, f_small, PAD + 12, sy + 7 + i * 18, ln, fg)
 
     # 「连接成功」toast：列表中央的浅绿圆角条、绿色小字，1 秒后窗口自动关闭
     if ctx.get('toast'):
@@ -1570,8 +1592,9 @@ def _apply_job(ctx):
             ctx['auto_opened'] = True
             _set_pair_open(ctx, 'manual')
         # 列表本身就是答案，不用再报「找到 N 台设备」（用户嫌啰嗦）。
-        # 但自动刷新别把用户刚看到的错误提示/成功提示顶掉。
-        if not (auto and ctx['status_kind'] in ('err', 'ok', 'busy')):
+        # 只有用户自己点刷新才清空状态行：自动刷新（每 3 秒）绝不能把
+        # 用户刚看到的提示清掉——之前「点手动配对后提示一闪就没」就是这么来的。
+        if not auto:
             _status(ctx, '', 'info')
         if ctx['log'] and not auto:
             ctx['log']('wizard: devices=%s' % ([r['serial'] for r in rows],))
@@ -1968,10 +1991,10 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
         wa = wt.RECT()
         user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(wa), 0)  # SPI_GETWORKAREA
         wx = wa.left + max(0, ((wa.right - wa.left) - WIN_W) // 2)
-        wy = wa.top + max(0, ((wa.bottom - wa.top) - WIN_H) // 2)
+        wy = wa.top + max(0, ((wa.bottom - wa.top) - WIN_H_CLOSED) // 2)
         style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN
         hwnd = user32.CreateWindowExW(0, 'MoyuConnectWizard', '魔芋 · 连接手机',
-                                      style, wx, wy, WIN_W, WIN_H, None, None, hinst, None)
+                                      style, wx, wy, WIN_W, WIN_H_CLOSED, None, None, hinst, None)
         if not hwnd:
             if on_log:
                 on_log('wizard: 创建窗口失败 err=%s' % ctypes.get_last_error())
@@ -1980,24 +2003,15 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
             # 类图标只对新建窗口生效；显式再发一次，确保标题栏与任务栏都换掉
             user32.SendMessageW(hwnd, WM_SETICON, 1, hicon)   # ICON_SMALL
             user32.SendMessageW(hwnd, WM_SETICON, 0, hicon)   # ICON_BIG
-        # 客户区精确到 WIN_W x WIN_H（CreateWindow 的尺寸含边框）
-        rc = wt.RECT()
-        user32.GetClientRect(hwnd, ctypes.byref(rc))
-        if rc.right != WIN_W or rc.bottom != WIN_H:
-            wr = wt.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(wr))
-            dw = WIN_W - rc.right
-            dh = WIN_H - rc.bottom
-            user32.SetWindowPos(hwnd, None, 0, 0, (wr.right - wr.left) + dw,
-                                (wr.bottom - wr.top) + dh, 0x0002 | 0x0004)  # NOMOVE|NOZORDER
+        # 客户区精确到 WIN_W x WIN_H_CLOSED（CreateWindow 的尺寸含边框）
+        _fit_client(hwnd, WIN_W, WIN_H_CLOSED)
         ctx = {'hwnd': hwnd, 'adb': adb, 'on_done': on_done, 'log': on_log,
                'on_close': on_close, 'closed': False, 'job': None, 'busy': False,
                'busy_row': None, 'busy_text': '', 'tick': 0, 'hicon': hicon,
                'known': known or [], 'runner': runner,
                'tab': 'wifi', 'rows': [], 'visible_rows': [],
                'hotspots': {}, 'hover': 0, 'pressed': 0, 'tracking': False,
-               'status_text': '点右上角「刷新」查找设备；第一次用无线请点下方「手动配对」。',
-               'status_kind': 'info', 'edits': {}, 'cues': {},
+               'status_text': '', 'status_kind': 'info', 'edits': {}, 'cues': {},
                'toast': '', 'closing': False, 'dead': False, 'typed_ip': '',
                'queued': None, 'auto_refresh': False,
                'pair_open': False, 'pair_mode': '', 'pair_label': '',

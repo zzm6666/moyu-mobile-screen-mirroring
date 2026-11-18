@@ -481,6 +481,11 @@ class WizardSmokeTest(_Isolated):
         time.sleep(0.4)
         self.assertTrue(ctx['pair_open'], '点「手动配对」应展开面板')
         self.assertEqual(ctx['pair_mode'], 'manual')
+        # 面板展开后窗口回到全高，收起时矮一截（底部别留大片空白）
+        rc = wt.RECT()
+        connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
+        self.assertEqual(rc.bottom, connect_ui.WIN_H, '展开面板时窗口该是全高')
+        self.assertLess(connect_ui.WIN_H_CLOSED, connect_ui.WIN_H)
         for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
             self.assertTrue(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
                             '手动模式下三个框都要可见')
@@ -500,6 +505,9 @@ class WizardSmokeTest(_Isolated):
         time.sleep(0.4)
         self.assertFalse(ctx['pair_open'], '点「收起」应再收起来')
         self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'])
+        connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
+        self.assertEqual(rc.bottom, connect_ui.WIN_H_CLOSED,
+                         '收起面板后窗口要变矮（底部没有内容了）')
         # 再次展开：上一次手填的 IP/端口 必须被清掉（旧地址只会让人填错）
         bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_MANUAL]
         lp = (bx + bw // 2) | ((by + bh // 2) << 16)
@@ -511,6 +519,11 @@ class WizardSmokeTest(_Isolated):
                          '手动配对时要清空 IP 框')
         self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]), '',
                          '手动配对时要清空端口框')
+        # 用户 m04090：展开后底部提示不能被 3 秒自动刷新悄悄清掉
+        self.assertIn('配对码', ctx['status_text'])
+        time.sleep(4.0)          # 跨过至少一次自动刷新
+        self.assertIn('配对码', ctx['status_text'],
+                      '自动刷新不该把「手动配对」的提示清掉')
         connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         self.assertTrue(closed.wait(5))
         t.join(5)
