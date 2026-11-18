@@ -45,6 +45,7 @@ WM_SETFOCUS = 0x0007
 WM_KILLFOCUS = 0x0008
 WM_PRINTCLIENT = 0x0318
 WM_SETICON = 0x0080
+WM_SETTEXT = 0x000C
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
 WM_CTLCOLORSTATIC = 0x0138
@@ -497,6 +498,41 @@ def _is_junk_name(name, serial=''):
     return name.startswith('adb-') or bool(IP_PORT_RE.match(name))
 
 
+def _seen_before(row, known=()):
+    """这台设备以前跟本机连过没有（按串号或 IP 匹配历史）。
+
+    「新发现」= 手机在广播无线调试服务、但电脑现在没有和它连上。它可能以前
+    配对过（拔了线/关过无线调试），也可能从来没跟本机配对过——后者点「连接」
+    只会得到「手机没有授权这台电脑」。所以按钮文案按这个判断分「连接」/「配对」。
+    """
+    serial = row.get('serial') or ''
+    ip = _ip_of(row.get('addr') or '')
+    for k in known or []:
+        if serial and k.get('serial') == serial:
+            return True
+        if ip and _ip_of(k.get('addr') or '') == ip:
+            return True
+    return False
+
+
+def _prefill_pair(ctx, row):
+    """点「配对」：把这一行的 IP:端口 填好，焦点交给配对码框（只差 6 位码）。"""
+    addr = row.get('addr') or ''
+    ip, port = ('', '')
+    if IP_PORT_RE.match(addr):
+        ip, port = addr.rsplit(':', 1)
+    if ip:
+        user32.SendMessageW(ctx['edits'][ID_IP], WM_SETTEXT, 0,
+                            ctypes.c_wchar_p(ip))
+        user32.SendMessageW(ctx['edits'][ID_PORT], WM_SETTEXT, 0,
+                            ctypes.c_wchar_p(port))
+    user32.SetFocus(ctx['edits'][ID_CODE])
+    _status(ctx, '「%s」需要先配对：请在手机上打开「使用配对码配对设备」，'
+                 '把手机上的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
+            % (row.get('name') or ip or '这台设备'), 'info')
+    _invalidate(ctx)
+
+
 def _remembered_name(row, known=()):
     """没连上的设备用「记住的名字」或 IP 兜底，绝不把 mDNS 机器串号当名字。
 
@@ -890,6 +926,8 @@ IP_Y = SEC_Y + 30
 CODE_Y = IP_Y + 40
 GO_Y = CODE_Y + 44
 SUCCESS_CLOSE_MS = 1000         # 「连接成功」toast 停留时长，之后窗口自动关闭
+AUTO_REFRESH_MS = 3000          # 向导开着时每 3 秒悄悄刷新一次设备列表
+AUTO_REFRESH_TIMER = 3          # 该刷新用的 WM_TIMER id
 GO_H = 40
 STATUS_Y = GO_Y + GO_H + 12
 USB_HINT_Y = LIST_Y + LIST_H + 16
@@ -1020,7 +1058,7 @@ def _rebuild_hotspots(ctx):
     ctx['visible_rows'] = rows[:MAX_ROWS]
     for i, r in enumerate(ctx['visible_rows']):
         y = LIST_Y + i * ROW_H
-        if r['state'] != 'online':   # 已连接的设备不再显示「连接」按钮
+        if r['state'] == 'found':   # 只有「新发现」设备才有按钮：已连接不用点，离线点了也连不上
             hs[ID_ROW_BASE + i] = (WIN_W - PAD - 76, y + 10, 64, 32)
     hs[ID_REFRESH] = (WIN_W - PAD - 64, TAB_Y + 4, 64, 26)
     if ctx['tab'] == 'wifi':
@@ -1119,26 +1157,24 @@ def _paint(ctx, hdc):
         _badge(hdc, f_small, nx + nw + 8, name_y + (20 - bh) // 2, label, fg, bg)
         if sub:
             _draw_text(hdc, f_small, nx, sub_y, sub, C_FAINT)
-        # 行尾「连接」按钮：已连接（在线）的设备不显示，整行不可点
-        if r['state'] == 'online':
+        # 行尾按钮：只有「新发现」设备有。已连接的点了没意义，离线（连广播都没有）
+        # 点了必然失败，所以这两类都不再摆一个注定失败的按钮。
+        if r['state'] != 'found':
             continue
         bx, by, bw, bh = ctx['hotspots'][ID_ROW_BASE + i]
         hover = ctx['hover'] == ID_ROW_BASE + i
         busy = ctx['busy'] and ctx['busy_row'] == i
         if busy:
             _round_rect(hdc, bx, by, bw, bh, 8, C_PRIMARY_LT)
-            _draw_text(hdc, f_small, bx + 10, by + 8, '连接中', C_PRIMARY)
-        elif r['state'] == 'offline':
-            # 离线行的「连接」沿用右上角「刷新」的样式：白底灰框灰字，hover 浅绿底绿字
-            _round_rect(hdc, bx, by, bw, bh, 8,
-                        C_PRIMARY_LT if hover else C_SURFACE, C_LINE)
-            _draw_text(hdc, f_btn, bx + 16, by + 7, '连接',
-                       C_PRIMARY if hover else C_SUB)
+            _draw_text(hdc, f_small, bx + 8, by + 8, '连接中', C_PRIMARY)
         else:
+            # 本机连过的「连接」；没连过的只能先配对，按钮就叫「配对」
+            label = '连接' if _seen_before(r, ctx['known']) else '配对'
+            off = 12 if label == '配对' else 16
             # hover 与下方「连接手机」大按钮完全一致：主色填深一档 + 白字
             _round_rect(hdc, bx, by, bw, bh, 8,
                         C_PRIMARY_HOVER if hover else C_PRIMARY)
-            _draw_text(hdc, f_btn, bx + 16, by + 7, '连接', (255, 255, 255))
+            _draw_text(hdc, f_btn, bx + off, by + 7, label, (255, 255, 255))
 
     if ctx['tab'] == 'wifi':
         # 首次配对区
@@ -1243,8 +1279,13 @@ def _start_job(ctx, kind, payload, row=None, busy_text='正在连接'):
     ctx['busy_row'] = row
     ctx['busy_text'] = busy_text
     ctx['tick'] = 0
-    user32.SetTimer(ctx['hwnd'], 1, 400, None)
-    _status(ctx, busy_text + '…', 'busy')
+    auto = kind == 'refresh' and payload == 'auto'
+    if auto:
+        # 自动刷新只悄悄更新列表：不转圈、不改状态行，避免每 3 秒闪一下
+        ctx['auto_refresh'] = True
+    else:
+        user32.SetTimer(ctx['hwnd'], 1, 400, None)
+        _status(ctx, busy_text + '…', 'busy')
     threading.Thread(target=_worker_job, args=(ctx, kind, payload), daemon=True).start()
 
 
@@ -1394,17 +1435,20 @@ def _apply_job(ctx):
         rows = job[1] or []
         ctx['rows'] = rows
         _rebuild_hotspots(ctx)
+        auto = ctx.pop('auto_refresh', False)
         n_on = sum(1 for r in rows if r['state'] == 'online')
-        if rows:
-            if n_on:
-                _status(ctx, '找到 %d 台设备（%d 台已连接）。点未连接设备右侧的「连接」即可投屏。'
-                        % (len(rows), n_on), 'info')
-            else:
-                _status(ctx, '找到 %d 台设备，点设备右侧「连接」即可投屏。'
-                        % len(rows), 'info')
-        else:
-            _status(ctx, '', 'info')
-        if ctx['log']:
+        # 自动刷新只为让列表跟上手机状态，别把用户刚看到的错误提示/成功提示顶掉
+        if not (auto and ctx['status_kind'] in ('err', 'ok', 'busy')):
+            if rows:
+                if n_on:
+                    _status(ctx, '找到 %d 台设备（%d 台已连接）。点未连接设备右侧的按钮即可投屏。'
+                            % (len(rows), n_on), 'info')
+                else:
+                    _status(ctx, '找到 %d 台设备，点设备右侧的按钮即可投屏。'
+                            % len(rows), 'info')
+            elif not auto:
+                _status(ctx, '', 'info')
+        if ctx['log'] and not auto:
             ctx['log']('wizard: devices=%s' % ([r['serial'] for r in rows],))
         _invalidate(ctx)
         return
@@ -1511,12 +1555,12 @@ def _click(ctx, hid):
             # 已连接的设备：点了也不做任何事（不重复连接，也就不会开出第二个投屏窗口）
             _status(ctx, '「%s」已经连上了，不用再点。' % r['name'], 'info')
             return
-        elif r['state'] == 'found':
+        if r['state'] != 'found':
+            return      # 离线设备没有按钮（热点），这里只是兜底
+        if _seen_before(r, ctx['known']):
             _start_job(ctx, 'connect', r['addr'], row=i)
         else:
-            _start_job(ctx, 'reconnect',
-                       {'serial': r['serial'], 'addr': r['addr'], 'name': r['name']},
-                       row=i)
+            _prefill_pair(ctx, r)    # 没配对过：先让用户填 6 位配对码
         return
 
 
@@ -1632,6 +1676,11 @@ def _wndproc(hwnd, msg, wparam, lparam):
         if wparam == 2:   # 「连接成功」toast 满 1 秒：关窗、通知开始投屏
             user32.KillTimer(hwnd, 2)
             _complete(ctx, ctx.get('pending_serial', ''))
+            return 0
+        if wparam == AUTO_REFRESH_TIMER:
+            # 每 3 秒悄悄刷新列表：手机重开无线调试后，几秒内自己变回「新发现/已连接」
+            if not ctx['busy'] and not ctx['closing'] and not ctx.get('dead'):
+                _start_job(ctx, 'refresh', 'auto')
             return 0
         ctx['tick'] += 1
         if ctx['busy']:
@@ -1804,7 +1853,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'status_text': '点右上角「刷新」查找设备；第一次用无线请在下方配对。',
                'status_kind': 'info', 'edits': {}, 'cues': {},
                'toast': '', 'closing': False, 'dead': False, 'typed_ip': '',
-               'queued': None}
+               'queued': None, 'auto_refresh': False}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)
         ctx['f_small'] = _font_create(12, 400)
@@ -1824,6 +1873,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
         user32.ShowWindow(hwnd, SW_SHOW)
         user32.UpdateWindow(hwnd)
         user32.SetForegroundWindow(hwnd)
+        user32.SetTimer(hwnd, AUTO_REFRESH_TIMER, AUTO_REFRESH_MS, None)
         _start_job(ctx, 'refresh', None, busy_text='正在查找设备')
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:

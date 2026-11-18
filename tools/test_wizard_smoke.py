@@ -141,14 +141,12 @@ class WizardSmokeTest(unittest.TestCase):
         row_px = (connect_ui.PAD + 100, row_y + connect_ui.ROW_H - 8)  # 行内空白，非按钮
         btn_px = (bx + bw // 2, by + bh - 4)                           # 按钮内靠下，避开文字
         k = next((i for i, r in enumerate(rows) if r['state'] == 'offline'), None)
-        off_px = None
-        if k is not None:
-            obx, oby, obw, obh = ctx['hotspots'][connect_ui.ID_ROW_BASE + k]
-            off_px = (obx + obw // 2, oby + obh - 4)
+        self.assertIsNotNone(k, '假 runner + known 应刷出离线（历史）设备')
+        # 离线设备点了必然连不上（手机无线调试多半已经关了），因此不给按钮
+        self.assertNotIn(connect_ui.ID_ROW_BASE + k, ctx['hotspots'],
+                         '离线设备行不该有「连接」按钮')
         base_btn, base_row = pixel(*btn_px), pixel(*row_px)
         self.assertEqual(base_btn, connect_ui.C_PRIMARY, '按钮常态应为主色')
-        if off_px:
-            self.assertEqual(pixel(*off_px), connect_ui.C_SURFACE, '离线按钮常态应为白底描边')
         self.assertEqual(base_row, connect_ui.C_SURFACE, '设备行常态应为卡片白')
         # 无头环境真实光标不在窗口上，TrackMouseEvent 会立刻补发 WM_MOUSELEAVE
         # 清掉 hover；这里只测悬停绘制逻辑，屏蔽系统鼠标跟踪。
@@ -173,13 +171,6 @@ class WizardSmokeTest(unittest.TestCase):
                                 'hover 色必须和常态肉眼可分辨')
             self.assertEqual(pixel(*row_px), connect_ui.C_SURFACE,
                              '悬停按钮时设备行不应变色（只有按钮 hover）')
-            if off_px:
-                lp = off_px[0] | (off_px[1] << 16)
-                u.PostMessageW(hwnd, 0x0200, 0, lp)
-                time.sleep(0.4)
-                self.assertEqual(ctx['hover'], connect_ui.ID_ROW_BASE + k)
-                self.assertEqual(pixel(*off_px), connect_ui.C_PRIMARY_LT,
-                                 '离线按钮悬停应和「刷新」按钮一样变浅绿底')
         finally:
             connect_ui.user32.TrackMouseEvent = orig_tme
         u.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
@@ -205,7 +196,12 @@ class WizardSmokeTest(unittest.TestCase):
                              kwargs=dict(adb='fake-adb',
                                          on_done=done_cb,
                                          on_close=closed.set,
-                                         runner=fake_runner_mixed))
+                                         runner=fake_runner_mixed,
+                                         # NewPhone 以前跟本机连过 → 按钮显示「连接」
+                                         known=[{'serial': 'adb-aaaa1111-NewPhone'
+                                                          '._adb-tls-connect._tcp',
+                                                 'name': 'NewPhone',
+                                                 'addr': '192.168.137.88:41234'}]))
         t.start()
         hwnd = _own_window(done_cb)
         self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
@@ -267,6 +263,93 @@ class WizardSmokeTest(unittest.TestCase):
         self.assertFalse(connect_ui.user32.IsWindow(hwnd), '窗口应已销毁')
         t.join(5)
         self.assertFalse(t.is_alive(), '向导线程没退出')
+
+    def test_unpaired_found_row_asks_for_pairing_code(self):
+        """没跟本机配对过的「新发现」设备：点按钮不发起连接，只把 IP:端口填好等配对码。
+
+        用户 m03416：新发现 = 广播可见但没连上，可能从没配对过，点「连接」注定失败，
+        所以这种行按钮叫「配对」，点了把 IP:端口 填好、焦点交给配对码框。
+        """
+        done = threading.Event()
+        closed = threading.Event()
+        cmds = []
+
+        def runner(cmd, timeout=25):
+            joined = ' '.join(cmd)
+            cmds.append(joined)
+            if 'devices' in joined:
+                return 0, 'List of devices attached\n'   # 一台都没连上
+            if 'mdns' in joined:
+                return 0, ('List of discovered mdns services\n'
+                           'adb-aaaa1111-NewPhone\t_adb-tls-connect._tcp\t'
+                           '192.168.137.88:41234\n')
+            return 0, ''
+
+        done_cb = done.set
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         on_close=closed.set, runner=runner))
+        t.start()
+        hwnd = _own_window(done_cb)
+        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+        ctx = connect_ui._WINDOWS[hwnd]
+        for _ in range(80):
+            if ctx['visible_rows']:
+                break
+            time.sleep(0.1)
+        row = ctx['visible_rows'][0]
+        self.assertEqual(row['state'], 'found')
+        self.assertFalse(connect_ui._seen_before(row, ctx['known']),
+                         '这台设备不该被认为配对过')
+        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
+        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+        for _ in range(40):
+            if connect_ui._text(ctx['edits'][connect_ui.ID_IP]):
+                break
+            time.sleep(0.1)
+        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
+                         '192.168.137.88', '该把这一行的 IP 自动填好')
+        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]),
+                         '41234', '该把这一行的端口自动填好')
+        self.assertIn('配对码', ctx['status_text'], '状态行要提示去填配对码')
+        self.assertFalse(any('connect' in c and ' pair' not in c for c in cmds),
+                         '没配对过就不该直接发起连接：%r' % cmds)
+        self.assertFalse(done.is_set(), '不该连接成功')
+        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+        self.assertTrue(closed.wait(5))
+        t.join(5)
+        self.assertFalse(t.is_alive())
+
+    def test_auto_refresh_timer_started(self):
+        """向导开着时每 3 秒自动刷新列表（手机重开无线调试后自己变回「新发现」）。"""
+        timers = []
+        orig = connect_ui.user32.SetTimer
+
+        def spy(hwnd, tid, ms, cb):
+            timers.append((tid, ms))
+            return orig(hwnd, tid, ms, cb)
+
+        connect_ui.user32.SetTimer = spy
+        closed = threading.Event()
+        done_cb = closed.set
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         on_close=closed.set,
+                                         runner=fake_runner_mixed))
+        try:
+            t.start()
+            hwnd = _own_window(done_cb)
+            self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+            time.sleep(0.5)
+            connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            closed.wait(5)
+            t.join(5)
+        finally:
+            connect_ui.user32.SetTimer = orig
+        self.assertIn((connect_ui.AUTO_REFRESH_TIMER, connect_ui.AUTO_REFRESH_MS),
+                      timers, '没设置自动刷新定时器：%r' % timers)
 
     def test_window_opens_paints_and_closes(self):
         done = threading.Event()
