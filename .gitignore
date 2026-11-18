@@ -30,3 +30,4 @@ tools/scrcpy-win64-*/
 
 # ---- 安装包产物（构建生成，分发用 Release）----
 dist-installer/
+.git-commit-msg.txt
