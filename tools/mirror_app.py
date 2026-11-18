@@ -35,7 +35,7 @@ RESIZE_EDGE = 4  # 窗口边缘的缩放热区宽度（独立于 FRAME，用于�
 EDGE_GRAB = 6  # 全局钩子判定「抓边缩放」的带宽：比 RESIZE_EDGE 宽一点更好抓
 CLOSE_W = 44
 MIN_VIDEO = 180  # 视频区短边下限（缩放时保比例的下限）
-NIM_ADD, NIM_DELETE = 0, 2
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 WM_TRAY = 0x8001
 WM_APP_RAISE = 0x8002  # 点击视频区时请求整体置前
@@ -1972,6 +1972,35 @@ def fail(msg):
     user32.MessageBoxW(None, msg, APP_NAME, 0x10)
 
 
+def set_tray_tip(text):
+    """更新托盘图标提示文字（不弹任何窗口）。"""
+    nid = state.get('nid')
+    if nid is None:
+        return
+    nid.uFlags = NIF_TIP
+    nid.szTip = text
+    shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+
+def quiet_stop(reason=''):
+    """投屏结束但**不打扰用户**：藏外框、清状态、改托盘提示，不弹窗也不退出程序。
+
+    断开连接或重新配对时 scrcpy 必然会退出，这时弹「投屏进程已退出」的模态框
+    除了打断用户没有任何用处——结束就结束，想再看就从托盘重新连接。
+    """
+    if state['proc'] is not None and state['proc'].poll() is None and not state['quitting']:
+        _kill_scrcpy()
+    state['proc'] = None
+    state['child'] = None
+    state['serial'] = None
+    state['retries'] = 0
+    state['started_at'] = time.time()      # 别让「窗口 60 秒没出现」的看门狗拿旧计时报警
+    if state.get('frame') and user32.IsWindowVisible(state['frame']):
+        user32.ShowWindow(state['frame'], 0)
+    set_tray_tip('%s · 已断开（点托盘「连接手机…」重新连接）' % APP_NAME)
+    log('mirror: stopped quietly (%s)' % reason)
+
+
 def quit_app():
     if state['quitting']:
         return
@@ -2143,6 +2172,7 @@ def watchdog(hwnd):
             ensure_frame_orientation()
             update_frame(state['frame'])
             log('child ready hwnd=%s' % t)
+            set_tray_tip('%s · 投屏中' % APP_NAME)
             # 连上了才露面：没连手机时不显示投屏窗口（收进托盘期间除外）
             if not state['hidden']:
                 user32.ShowWindow(state['frame'], 5)
@@ -2184,9 +2214,8 @@ def watchdog(hwnd):
             log('scrcpy retry %d' % state['retries'])
             threading.Thread(target=start_scrcpy, daemon=True).start()
             return
-        fail('投屏进程已退出。\n请从托盘菜单「连接手机…」重新连接（或确认手机无线调试已开启）。'
-             '\n配置位置：%s' % CONFIG_PATH)
-        quit_app()
+        # 手机断开/重新配对了：投屏就安静地结束，不弹「投屏进程已退出」的框
+        quiet_stop('scrcpy exit rc=%s' % p.returncode)
         return
     if time.time() - state['started_at'] > 60:
         fail('投屏窗口 60 秒仍未出现。\n请确认手机端无线调试正常，或重启本程序。')
@@ -2280,6 +2309,7 @@ def main():
     nid.hIcon = hicon
     nid.szTip = APP_NAME
     shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+    state['nid'] = nid            # 之后断开时改提示文字用
     log('main: notifyicon=%s hicon=%s' % (hicon, bool(hicon)))
     trc = tray_icon_rect(state['tray'])
     if trc is not None:

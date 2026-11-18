@@ -31,6 +31,14 @@ class FakeProc:
         return None
 
 
+class ExitedProc(FakeProc):
+    """模拟已经退出的 scrcpy 进程（poll() 返回退出码）。"""
+    returncode = 1
+
+    def poll(self):
+        return 1
+
+
 class WatchdogTimeoutTest(unittest.TestCase):
     def setUp(self):
         # 快照并隔离全局状态，避免测试互相污染
@@ -59,7 +67,8 @@ class WatchdogTimeoutTest(unittest.TestCase):
         app.fail = lambda msg: self._fail_calls.append(msg)
         app.target_hwnd = lambda: None      # scrcpy 窗口尚未出现
         app.list_devices = lambda: ['192.168.1.2:5555']
-        app.quit_app = lambda: None
+        self._quit_calls = []
+        app.quit_app = lambda: self._quit_calls.append(True)
         app.state.update({
             'frame': None, 'child': None, 'hidden': False,
             'proc': FakeProc(), 'quitting': False, 'error_shown': False,
@@ -101,8 +110,27 @@ class WatchdogTimeoutTest(unittest.TestCase):
         self.assertEqual(len(self._fail_calls), 1)
         self.assertIn('60 秒', self._fail_calls[0])
 
+    def test_scrcpy_exit_offline_stops_quietly(self):
+        """手机断开后 scrcpy 退出：安静收尾，不弹「投屏进程已退出」的框，也不退出程序。"""
+        app.state.update({'proc': ExitedProc(), 'retries': 2, 'child': None,
+                          'nid': None, 'frame': None})
+        app.list_devices = lambda: []          # 手机已经不在线
+        app.watchdog(None)
+        self.assertEqual(self._fail_calls, [],
+                         '断开后不该弹任何弹窗：%r' % self._fail_calls)
+        self.assertEqual(self._quit_calls, [], '断开后不该退出程序')
+        self.assertIsNone(app.state['proc'])
+        self.assertIsNone(app.state['serial'])
+        self.assertEqual(app.state['retries'], 0)
+
+    def test_scrcpy_exit_after_retries_stops_quietly(self):
+        """设备还在线但自动重连次数用完了：同样安静收尾，不弹框。"""
+        app.state.update({'proc': ExitedProc(), 'retries': 3, 'nid': None})
+        app.watchdog(None)
+        self.assertEqual(self._fail_calls, [])
+        self.assertIsNone(app.state['proc'])
+
     def test_start_scrcpy_resets_timer(self):
-        """每次拉起 scrcpy（含向导成功、掉线重试路径）都应重置等待计时。"""
         app.state['started_at'] = time.time() - 466
         app.connect_ui.try_auto_connect = lambda adb, serial, runner=None: '192.168.1.2:5555'
         app.get_phone_aspect = lambda: 0.4545
