@@ -15,7 +15,9 @@
 | **历史设备（known device）** | 本机成功连接过、记在 `config.json → known_devices` 的设备：`{serial, name, addr, last_seen}`，新在前、最多 8 台、按 serial+同 IP 去重。 | 不等于「已配对设备」——adb 没有列出配对记录的 API，历史表只是本机经验 |
 | **设备名（display name）** | 给用户看的名字，取值优先级：营销名（`ro.product.marketname` / `ro.vendor.oplus.market.name` 等，如「一加 13」）→ `adb devices -l` 的 model → `无线设备 <ip>` 兜底。代码：`connect_ui.device_display_name`。 | 不是 serial、不是 mDNS 名 |
 | **重连（reconnect）** | 对历史/发现设备：mDNS 串号已在线→直接用；否则先试旧 `addr` connect，再按 mDNS 找同 IP/同服务名的新端口 connect。代码：`connect_ui.reconnect_known`。 | 不需要重新配对；当前 UI 不再直接调用它（离线行没有按钮，手机重新开无线调试后会以「新发现」自己回来） |
-| **行内按钮（row action）** | 设备行右侧只在「新发现」时给按钮：本机连过（`connect_ui._seen_before`，按串号或 IP 命中 `known_devices`）显示「连接」；从没连过显示「配对」——点了把该行 IP:端口 填进「首次配对」区、焦点交给配对码框，用户只需填 6 位码。已连接行、离线行都不给按钮（点了必然失败或没意义）。 | 按钮文案不是装饰：它是「这台设备还需不需要配对」的唯一提示 |
+| **行内按钮（row action）** | 设备行右侧只在「新发现」时给按钮：本机连过（`connect_ui._seen_before`，按串号或 IP 命中 `known_devices`）显示「连接」；从没连过显示「配对」——点了展开配对面板并把该行 IP:端口 填好、焦点交给配对码框，用户只需填 6 位码。已连接行、离线行都不给按钮（点了必然失败或没意义）。 | 按钮文案不是装饰：它是「这台设备还需不需要配对」的唯一提示 |
+| **配对面板（pair panel）** | 窗口下方那块填配对码的区域，平时收起（`ctx['pair_open']=False`），只在列表下方留一行「手机不在列表里？手动配对」；一台设备都没发现时**自动展开**一次（`ctx['auto_opened']`）。展开方式三种：`_set_pair_open(ctx, '')` 收起 / `'prefill'` 只显示配对码框（IP:端口 已自动填好并隐藏）/ `'manual'` 三个框都显示。代码：`connect_ui._set_pair_open`、`_prefill_pair`。 | prefill 不是「不让用户改地址」，是「地址已经问过手机了」 |
+| **列表滚动（list scroll）** | 列表卡片**高度固定**：收起配对面板时 6 行（`MAX_ROWS_FULL`），展开时 4 行（`MAX_ROWS`）；设备更多时用滚轮翻（`ctx['scroll']`，每次 1 行，右侧画细滚动条）。`_visible_rows` 给绘制和热点同一段窗口。 | 高度固定是为了窗口不长高、按钮位置不跳 |
 | **自动连接（auto connect）** | 启动时 `try_auto_connect`：在线设备 → 配置串号 ip:端口 → mDNS 发现，三步兜底；全失败才弹向导。 | — |
 | **自动刷新（auto refresh）** | 向导开着时每 3 秒（`connect_ui.AUTO_REFRESH_MS`，WM_TIMER id 3）悄悄刷一次设备列表：不转圈、不改状态行、不写日志，但不会顶掉用户刚看到的错误/成功提示。手机重开无线调试后几秒内自己变回「新发现/已连接」。 | 不是「刷新按钮的自动化替代」——手动刷新仍会显示进度与结果 |
 | **连接端口广播** | 连接端口是随机端口，电脑只能靠手机的 mDNS 广播（`_adb-tls-connect._tcp`）发现它。广播可能迟到；路由器开了客户端隔离/跨网段时**永远收不到**——此时只能让用户把「无线调试」主页上的端口手动填进「端口」框。代码：`connect_ui.parse_mdns_services`。 | 不是配对端口的别名；也不是能扫描出来的固定端口 |

@@ -54,6 +54,7 @@ WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_MOUSEMOVE = 0x0200
 WM_MOUSELEAVE = 0x02A3
+WM_MOUSEWHEEL = 0x020A
 WM_SETCURSOR = 0x0020
 WM_KEYDOWN = 0x0100
 WM_APP_JOB = 0x8000 + 7          # 工作线程做完通知窗口
@@ -84,6 +85,8 @@ ID_IP, ID_CODE, ID_GO, ID_STATUS, ID_PORT = range(1001, 1006)
 IDOK = 1                       # IsDialogMessage 回车→默认按钮的 WM_COMMAND id
 ID_TAB_WIFI, ID_TAB_USB = 1101, 1102
 ID_REFRESH = 1103
+ID_MANUAL = 1104                 # 配对面板收起时的「手动配对」链接
+ID_PAIR_CLOSE = 1105             # 配对面板右上角「收起」
 ID_ROW_BASE = 1200               # 设备行「连接」按钮：ID_ROW_BASE + 行号
 
 _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
@@ -515,6 +518,25 @@ def _seen_before(row, known=()):
     return False
 
 
+def _set_pair_open(ctx, mode='', addr=''):
+    """开/关配对面板。mode: '' 收起 / 'prefill' 已填好 IP:端口 / 'manual' 手动填。
+
+    prefill 时 IP、端口 两个框直接藏起来（已经填好，用户不用看也不用改），
+    面板标题只说「填写配对码」；manual 时三个框都摆出来。
+    """
+    ctx['pair_open'] = bool(mode)
+    ctx['pair_mode'] = mode
+    ctx['pair_label'] = addr
+    ctx['scroll'] = 0                # 面板高度变了，列表回到顶部，免得停在半截
+    show_ip = mode == 'manual'
+    for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, bool(mode))):
+        eh = ctx['edits'].get(eid)
+        if eh:
+            user32.ShowWindow(eh, 5 if visible else 0)   # SW_SHOW / SW_HIDE
+    _rebuild_hotspots(ctx)
+    _invalidate(ctx)
+
+
 def _prefill_pair(ctx, row):
     """点「配对」：把这一行的 IP:端口 填好，焦点交给配对码框（只差 6 位码）。"""
     addr = row.get('addr') or ''
@@ -526,11 +548,11 @@ def _prefill_pair(ctx, row):
                             ctypes.c_wchar_p(ip))
         user32.SendMessageW(ctx['edits'][ID_PORT], WM_SETTEXT, 0,
                             ctypes.c_wchar_p(port))
+    _set_pair_open(ctx, 'prefill' if ip else 'manual', addr)
     user32.SetFocus(ctx['edits'][ID_CODE])
     _status(ctx, '「%s」需要先配对：请在手机上打开「使用配对码配对设备」，'
                  '把手机上的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
             % (row.get('name') or ip or '这台设备'), 'info')
-    _invalidate(ctx)
 
 
 def _remembered_name(row, known=()):
@@ -921,16 +943,19 @@ LIST_Y = TAB_Y + TAB_H + 14
 ROW_H = 52
 MAX_ROWS = 4
 LIST_H = ROW_H * MAX_ROWS
-SEC_Y = LIST_Y + LIST_H + 16          # 「首次配对」区标题
+MAX_ROWS_FULL = 6                      # 配对面板收起时列表占满下方空白，能多看两台
+LIST_H_FULL = ROW_H * MAX_ROWS_FULL
+SEC_Y = LIST_Y + LIST_H + 16          # 配对面板标题（收起时是「手动配对」链接）
 IP_Y = SEC_Y + 30
 CODE_Y = IP_Y + 40
 GO_Y = CODE_Y + 44
+MANUAL_TEXT = '手机不在列表里？手动配对'
 SUCCESS_CLOSE_MS = 1000         # 「连接成功」toast 停留时长，之后窗口自动关闭
 AUTO_REFRESH_MS = 3000          # 向导开着时每 3 秒悄悄刷新一次设备列表
 AUTO_REFRESH_TIMER = 3          # 该刷新用的 WM_TIMER id
 GO_H = 40
 STATUS_Y = GO_Y + GO_H + 12
-USB_HINT_Y = LIST_Y + LIST_H + 16
+USB_HINT_Y = LIST_Y + LIST_H_FULL + 16
 EDIT_X = PAD + 64                     # 输入框左缘（标签右侧）
 IP_W = 176                            # IP 框宽（适量，不拉满）
 COLON_GAP = 12                        # 冒号与左右输入框的间距（两侧一致）
@@ -1037,8 +1062,8 @@ def _xy(lparam):
 def _hit(ctx, x, y):
     """客户区坐标 → 可点元素 id；没有则 0。
 
-    设备行本身不可点：只有行右侧的「连接」按钮有热点。
-    已连接的设备连按钮都没有，点它什么也不会发生（避免误触发起连接）。
+    设备行本身不可点：只有行右侧的「连接」/「配对」按钮有热点。
+    已连接与离线的设备连按钮都没有，点它什么也不会发生。
     """
     for hid, (rx, ry, rw, rh) in ctx['hotspots'].items():
         if rx <= x < rx + rw and ry <= y < ry + rh:
@@ -1046,23 +1071,65 @@ def _hit(ctx, x, y):
     return 0
 
 
+def _list_rows(ctx):
+    """当前标签页的设备行（全部，滚动只看其中一段）。"""
+    kind = 'usb' if ctx.get('tab') == 'usb' else 'wifi'
+    return [r for r in ctx['rows'] if r['kind'] == kind]
+
+
+def _max_rows(ctx):
+    """列表一次能显示几行：面板展开时 4 行，收起时 6 行。"""
+    return MAX_ROWS if ctx.get('pair_open') else MAX_ROWS_FULL
+
+
+def _list_h(ctx):
+    """设备列表卡片高度固定（不随行数变化），行数多了用滚轮翻。"""
+    return ROW_H * _max_rows(ctx)
+
+
+def _max_scroll(ctx):
+    return max(0, len(_list_rows(ctx)) - _max_rows(ctx))
+
+
+def _visible_rows(ctx):
+    """当前滚到哪一段。"""
+    rows = _list_rows(ctx)
+    top = min(max(0, ctx.get('scroll') or 0), max(0, len(rows) - 1))
+    return rows[top:top + _max_rows(ctx)], top
+
+
+def _scroll_by(ctx, delta):
+    """滚动列表；返回是否真的动了（没动就不必重画）。"""
+    before = ctx.get('scroll') or 0
+    ctx['scroll'] = min(max(0, before + delta), _max_scroll(ctx))
+    if ctx['scroll'] == before:
+        return False
+    _rebuild_hotspots(ctx)
+    _invalidate(ctx)
+    return True
+
+
+def _pair_link_y(ctx):
+    """「手动配对」链接紧跟在列表卡片下沿。"""
+    return LIST_Y + _list_h(ctx) + 16
+
+
 def _rebuild_hotspots(ctx):
     hs = {}
     hs[ID_TAB_WIFI] = (PAD, TAB_Y, 108, TAB_H)
     hs[ID_TAB_USB] = (PAD + 116, TAB_Y, 108, TAB_H)
-    rows = ctx['rows']
-    if ctx['tab'] == 'usb':
-        rows = [r for r in rows if r['kind'] == 'usb']
-    else:
-        rows = [r for r in rows if r['kind'] == 'wifi']
-    ctx['visible_rows'] = rows[:MAX_ROWS]
+    ctx['visible_rows'], _top = _visible_rows(ctx)
     for i, r in enumerate(ctx['visible_rows']):
         y = LIST_Y + i * ROW_H
         if r['state'] == 'found':   # 只有「新发现」设备才有按钮：已连接不用点，离线点了也连不上
             hs[ID_ROW_BASE + i] = (WIN_W - PAD - 76, y + 10, 64, 32)
     hs[ID_REFRESH] = (WIN_W - PAD - 64, TAB_Y + 4, 64, 26)
     if ctx['tab'] == 'wifi':
-        hs[ID_GO] = (PAD, GO_Y, WIN_W - 2 * PAD, GO_H)
+        if ctx.get('pair_open'):
+            hs[ID_GO] = (PAD, GO_Y, WIN_W - 2 * PAD, GO_H)
+            hs[ID_PAIR_CLOSE] = (WIN_W - PAD - 40, SEC_Y - 4, 40, 24)
+        else:
+            hs[ID_MANUAL] = (PAD, _pair_link_y(ctx) - 4, 196, 26)
     ctx['hotspots'] = hs
 
 
@@ -1104,12 +1171,13 @@ def _paint(ctx, hdc):
 
     # 设备列表卡片
     rows = ctx['visible_rows']
-    _round_rect(hdc, PAD, LIST_Y - 6, W - 2 * PAD, LIST_H + 12, 12, C_SURFACE, C_LINE)
+    list_h = _list_h(ctx)
+    _round_rect(hdc, PAD, LIST_Y - 6, W - 2 * PAD, list_h + 12, 12, C_SURFACE, C_LINE)
     if not rows:
         if ctx['tab'] == 'wifi':
             msg1 = '还没有无线设备'
             msg2 = '手机开启「无线调试」后会自动出现在这里；'
-            msg3 = '第一次使用请在下方完成配对。'
+            msg3 = '第一次使用请点下方「手动配对」。'
         else:
             msg1 = '没有检测到 USB 设备'
             msg2 = '用数据线连接手机，并在手机上'
@@ -1118,7 +1186,7 @@ def _paint(ctx, hdc):
         for i, (m, f, c) in enumerate(((msg1, f_body, C_SUB), (msg2, f_small, C_FAINT),
                                        (msg3, f_small, C_FAINT))):
             tw = _text_size(hdc, f, m)[0]
-            _draw_text(hdc, f, cx - tw // 2, LIST_Y + 52 + i * 24, m, c)
+            _draw_text(hdc, f, cx - tw // 2, LIST_Y + (list_h - 3 * 24) // 2 + i * 24, m, c)
     for i, r in enumerate(rows):
         y = LIST_Y + i * ROW_H
         # hover 只作用于「连接」按钮本身，设备行不做整行高亮
@@ -1176,45 +1244,75 @@ def _paint(ctx, hdc):
                         C_PRIMARY_HOVER if hover else C_PRIMARY)
             _draw_text(hdc, f_btn, bx + off, by + 7, label, (255, 255, 255))
 
+    # 设备多于能显示的行数时，右侧画一条细滚动条（滚轮滚动）
+    total = len(_list_rows(ctx))
+    if total > len(rows):
+        track_x = W - PAD - 8
+        track_y, track_h = LIST_Y + 4, list_h - 8
+        _round_rect(hdc, track_x, track_y, 4, track_h, 2, C_LINE)
+        thumb_h = max(24, track_h * len(rows) // total)
+        top = ctx.get('scroll') or 0
+        span = max(1, total - len(rows))
+        thumb_y = track_y + (track_h - thumb_h) * top // span
+        _round_rect(hdc, track_x, thumb_y, 4, thumb_h, 2, C_FAINT)
+
     if ctx['tab'] == 'wifi':
-        # 首次配对区
-        _draw_text(hdc, f_body, PAD, SEC_Y, '首次配对', C_INK)
-        _draw_text(hdc, f_small, PAD + 76, SEC_Y + 3,
-                   '手机：无线调试 → 使用配对码配对设备（只填配对码也行）', C_FAINT)
-        _draw_text(hdc, f_small, PAD, IP_Y + 2, 'IP 端口', C_SUB)
-        _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
-        # IP 与端口之间的冒号（两个输入框同一行，用户不用输「:」）
-        # 冒号在间隙里水平居中、与框内文字同一垂直中线
-        cw, ch = _text_size(hdc, f_body, ':')
-        colon_x = EDIT_X + IP_W + (2 * COLON_GAP - cw) // 2
-        _draw_text(hdc, f_body, colon_x, IP_Y + (EDIT_H - ch) // 2, ':', C_SUB)
-        # EDIT 边框（焦点时主色）
-        focus = user32.GetFocus()
-        for eid, ey in ((ID_IP, IP_Y), (ID_PORT, IP_Y), (ID_CODE, CODE_Y)):
-            eh = ctx['edits'][eid]
-            rc = wt.RECT()
-            user32.GetWindowRect(eh, ctypes.byref(rc))
-            pt = wt.POINT(rc.left, rc.top)
-            user32.ScreenToClient(ctx['hwnd'], ctypes.byref(pt))
-            ew = rc.right - rc.left
-            line = C_EDIT_FOCUS if focus == eh else C_EDIT_LINE
-            _round_rect(hdc, pt.x - 2, pt.y - 2, ew + 4, EDIT_H + 4, 6, C_EDIT_BG, line)
-        # 唯一的大按钮
-        gx, gy, gw, gh = ctx['hotspots'][ID_GO]
-        hover = ctx['hover'] == ID_GO
-        if ctx['busy'] and ctx['busy_row'] is None:
-            dots = '.' * (1 + ctx['tick'] % 3)
-            label = ctx['busy_text'] + dots
-            _round_rect(hdc, gx, gy, gw, gh, 10, C_PRIMARY_LT)
-            tw = _text_size(hdc, f_btn, label)[0]
-            _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, C_PRIMARY)
+        if not ctx['pair_open']:
+            # 平时收起配对面板：手机不在列表里（mDNS 收不到）时才需要手动填 IP:端口
+            hx, hy, hw, hh = ctx['hotspots'][ID_MANUAL]
+            _draw_text(hdc, f_body, PAD, hy + 2, MANUAL_TEXT,
+                       C_PRIMARY_HOVER if ctx['hover'] == ID_MANUAL else C_PRIMARY)
+            _draw_text(hdc, f_small, PAD + 210, hy + 5,
+                       '手机不在附近、或者找不到时，手动填 IP 和配对码', C_FAINT)
         else:
-            _round_rect(hdc, gx, gy, gw, gh, 10,
-                        C_PRIMARY_DK if ctx['pressed'] == ID_GO
-                        else (C_PRIMARY_HOVER if hover else C_PRIMARY))
-            label = '连接手机'
-            tw = _text_size(hdc, f_btn, label)[0]
-            _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
+            prefill = ctx['pair_mode'] == 'prefill'
+            _draw_text(hdc, f_body, PAD, SEC_Y,
+                       '填写配对码' if prefill else '配对手机', C_INK)
+            hint = ('手机：%s（IP 和端口已自动填好）' % ctx['pair_label']
+                    if prefill else '手机：无线调试 → 使用配对码配对设备')
+            _draw_text(hdc, f_small, PAD + 76, SEC_Y + 3, hint, C_FAINT)
+            # 右上角「收起」
+            hx, hy, hw, hh = ctx['hotspots'][ID_PAIR_CLOSE]
+            _draw_text(hdc, f_small, hx, hy + 2, '收起',
+                       C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
+            _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
+            focus = user32.GetFocus()
+            targets = ((ID_CODE, CODE_Y),)
+            if not prefill:
+                _draw_text(hdc, f_small, PAD, IP_Y + 2, 'IP 端口', C_SUB)
+                # IP 与端口之间的冒号（两个输入框同一行，用户不用输「:」）
+                cw, ch = _text_size(hdc, f_body, ':')
+                colon_x = EDIT_X + IP_W + (2 * COLON_GAP - cw) // 2
+                _draw_text(hdc, f_body, colon_x, IP_Y + (EDIT_H - ch) // 2, ':', C_SUB)
+                targets = ((ID_IP, IP_Y), (ID_PORT, IP_Y), (ID_CODE, CODE_Y))
+            # EDIT 边框（焦点时主色）
+            for eid, ey in targets:
+                eh = ctx['edits'][eid]
+                rc = wt.RECT()
+                user32.GetWindowRect(eh, ctypes.byref(rc))
+                pt = wt.POINT(rc.left, rc.top)
+                user32.ScreenToClient(ctx['hwnd'], ctypes.byref(pt))
+                ew = rc.right - rc.left
+                line = C_EDIT_FOCUS if focus == eh else C_EDIT_LINE
+                _round_rect(hdc, pt.x - 2, pt.y - 2, ew + 4, EDIT_H + 4, 6,
+                            C_EDIT_BG, line)
+            # 唯一的大按钮（后台自动刷新不算「正在连接」，别让按钮自己闪）
+            gx, gy, gw, gh = ctx['hotspots'][ID_GO]
+            hover = ctx['hover'] == ID_GO
+            busy = ctx['busy'] and ctx['busy_row'] is None and not ctx.get('auto_refresh')
+            if busy:
+                dots = '.' * (1 + ctx['tick'] % 3)
+                label = ctx['busy_text'] + dots
+                _round_rect(hdc, gx, gy, gw, gh, 10, C_PRIMARY_LT)
+                tw = _text_size(hdc, f_btn, label)[0]
+                _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, C_PRIMARY)
+            else:
+                _round_rect(hdc, gx, gy, gw, gh, 10,
+                            C_PRIMARY_DK if ctx['pressed'] == ID_GO
+                            else (C_PRIMARY_HOVER if hover else C_PRIMARY))
+                label = '连接手机'
+                tw = _text_size(hdc, f_btn, label)[0]
+                _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
     else:
         _draw_text(hdc, f_small, PAD, USB_HINT_Y,
                    '提示：手机上弹出「允许 USB 调试」时勾选「一律允许」，以后即插即用。', C_FAINT)
@@ -1258,9 +1356,8 @@ def _wrap_text(hdc, font, text, max_w):
 
 def _set_tab(ctx, tab):
     ctx['tab'] = tab
-    wifi = tab == 'wifi'
-    for eid in (ID_IP, ID_PORT, ID_CODE):
-        user32.ShowWindow(ctx['edits'][eid], SW_SHOW if wifi else SW_HIDE)
+    if tab != 'wifi' and ctx.get('pair_open'):
+        _set_pair_open(ctx, '')     # 配对面板只属于无线页，切走就收起
     _rebuild_hotspots(ctx)
     _invalidate(ctx)
 
@@ -1434,9 +1531,15 @@ def _apply_job(ctx):
     if kind == 'refresh':
         rows = job[1] or []
         ctx['rows'] = rows
+        ctx['scroll'] = min(ctx.get('scroll') or 0, _max_scroll(ctx))
         _rebuild_hotspots(ctx)
         auto = ctx.pop('auto_refresh', False)
         n_on = sum(1 for r in rows if r['state'] == 'online')
+        # 一台都没发现（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对面板摊开，
+        # 省得用户自己去找入口。只自动展开一次，别每次刷新都抢用户的操作。
+        if not rows and not ctx.get('auto_opened') and not ctx['pair_open']:
+            ctx['auto_opened'] = True
+            _set_pair_open(ctx, 'manual')
         # 自动刷新只为让列表跟上手机状态，别把用户刚看到的错误提示/成功提示顶掉
         if not (auto and ctx['status_kind'] in ('err', 'ok', 'busy')):
             if rows:
@@ -1532,7 +1635,20 @@ def _click(ctx, hid):
     if hid == ID_REFRESH:
         _start_job(ctx, 'refresh', None, busy_text='正在查找设备')
         return
+    if hid == ID_MANUAL:
+        _set_pair_open(ctx, 'manual')
+        user32.SetFocus(ctx['edits'][ID_IP])
+        _status(ctx, '把手机「无线调试」页上的 IP 和端口填进上面两个框，'
+                     '再填手机「使用配对码配对设备」页上的 6 位配对码，然后点「连接手机」。',
+                'info')
+        return
+    if hid == ID_PAIR_CLOSE:
+        _set_pair_open(ctx, '')
+        _status(ctx, '', 'info')
+        return
     if hid == ID_GO:
+        if not ctx['pair_open']:   # 面板收着时这个按钮不存在
+            return
         ctx['typed_ip'] = _text(ctx['edits'][ID_IP])   # 抄给 worker，别让它跨线程读 EDIT
         kind, payload, err = decide_action(ctx['typed_ip'],
                                            _text(ctx['edits'][ID_PORT]),
@@ -1624,6 +1740,15 @@ def _wndproc(hwnd, msg, wparam, lparam):
         if ctx['hover']:
             ctx['hover'] = 0
             _invalidate(ctx)
+        return 0
+    if msg == WM_MOUSEWHEEL:
+        # 列表能显示的行放不下时，滚轮上下翻（lParam 是屏幕坐标，先换算成客户区）
+        pt = wt.POINT(*_xy(lparam))
+        user32.ScreenToClient(hwnd, ctypes.byref(pt))
+        if PAD <= pt.x <= WIN_W - PAD and LIST_Y <= pt.y <= LIST_Y + _list_h(ctx):
+            notches = ctypes.c_short((wparam >> 16) & 0xFFFF).value
+            step = int(round(notches / 120.0)) or (1 if notches > 0 else -1)
+            _scroll_by(ctx, -step)
         return 0
     if msg == WM_LBUTTONDOWN:
         x, y = _xy(lparam)
@@ -1850,10 +1975,12 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'known': known or [], 'runner': runner,
                'tab': 'wifi', 'rows': [], 'visible_rows': [],
                'hotspots': {}, 'hover': 0, 'pressed': 0, 'tracking': False,
-               'status_text': '点右上角「刷新」查找设备；第一次用无线请在下方配对。',
+               'status_text': '点右上角「刷新」查找设备；第一次用无线请点下方「手动配对」。',
                'status_kind': 'info', 'edits': {}, 'cues': {},
                'toast': '', 'closing': False, 'dead': False, 'typed_ip': '',
-               'queued': None, 'auto_refresh': False}
+               'queued': None, 'auto_refresh': False,
+               'pair_open': False, 'pair_mode': '', 'pair_label': '',
+               'scroll': 0, 'auto_opened': False}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)
         ctx['f_small'] = _font_create(12, 400)
@@ -1869,6 +1996,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                                            number=True, cue='4-5 位端口号')
         ctx['edits'][ID_CODE] = _make_edit(ctx, '', EDIT_X, CODE_Y, 120, EDIT_H, ID_CODE,
                                            number=True, cue='6 位配对码')
+        _set_pair_open(ctx, '')     # 平时收起：配对面板只在点「配对」/「手动配对」时出来
         _rebuild_hotspots(ctx)
         user32.ShowWindow(hwnd, SW_SHOW)
         user32.UpdateWindow(hwnd)

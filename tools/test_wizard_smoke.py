@@ -72,7 +72,41 @@ def _own_window(on_done_cb, timeout=10):
     return None
 
 
-class WizardSmokeTest(unittest.TestCase):
+def _click_at(hwnd, rect):
+    """在客户区 rect 中心发一次真实的按下+抬起。"""
+    bx, by, bw, bh = rect
+    lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+    connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+    connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+
+
+def _open_pair_panel(hwnd, timeout=5):
+    """配对面板平时收着：点「手动配对」把它展开（展开后才有「连接手机」按钮）。"""
+    ctx = connect_ui._WINDOWS[hwnd]
+    if ctx.get('pair_open'):
+        return
+    _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MANUAL])
+    for _ in range(int(timeout / 0.1)):
+        if ctx.get('pair_open'):
+            return
+        time.sleep(0.1)
+    raise AssertionError('点了「手动配对」也没展开配对面板')
+
+
+class _Isolated(unittest.TestCase):
+    """测试不许碰真实局域网：手机真的在线时，向导的 _enrich_mdns 会用真 socket 组播一次，
+    把真机混进假数据里（行数、名字都跟着变），那样测的就不是罐头数据了。
+    只在本测试期间替掉 connect_ui 里的引用，不动 mdns_browse 模块本身。"""
+
+    def setUp(self):
+        self._orig_enrich = connect_ui._enrich_mdns
+        connect_ui._enrich_mdns = lambda discovered, **kw: discovered
+
+    def tearDown(self):
+        connect_ui._enrich_mdns = self._orig_enrich
+
+
+class WizardSmokeTest(_Isolated):
     def test_hover_only_on_connect_button_not_row(self):
         """悬停「连接」按钮 → 按钮变色、设备行不变色；悬停设备行其余位置 → 无任何 hover。"""
         closed = threading.Event()
@@ -309,10 +343,17 @@ class WizardSmokeTest(unittest.TestCase):
             if connect_ui._text(ctx['edits'][connect_ui.ID_IP]):
                 break
             time.sleep(0.1)
+        self.assertTrue(ctx['pair_open'], '点「配对」应把配对面板展开')
+        self.assertEqual(ctx['pair_mode'], 'prefill', 'IP:端口 已自动填好 → prefill 模式')
         self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
                          '192.168.137.88', '该把这一行的 IP 自动填好')
         self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]),
                          '41234', '该把这一行的端口自动填好')
+        self.assertFalse(connect_ui.user32.IsWindowVisible(
+            ctx['edits'][connect_ui.ID_IP]),
+            'prefill 模式下 IP 框应藏起来（已经填好，用户不用看）')
+        self.assertTrue(connect_ui.user32.IsWindowVisible(
+            ctx['edits'][connect_ui.ID_CODE]), '配对码框要可见')
         self.assertIn('配对码', ctx['status_text'], '状态行要提示去填配对码')
         self.assertFalse(any('connect' in c and ' pair' not in c for c in cmds),
                          '没配对过就不该直接发起连接：%r' % cmds)
@@ -350,6 +391,54 @@ class WizardSmokeTest(unittest.TestCase):
             connect_ui.user32.SetTimer = orig
         self.assertIn((connect_ui.AUTO_REFRESH_TIMER, connect_ui.AUTO_REFRESH_MS),
                       timers, '没设置自动刷新定时器：%r' % timers)
+
+    def test_pair_panel_hidden_by_default_and_manual_link_opens_it(self):
+        """配对面板平时收着：列表更高、页面更清爽；点「手动配对」才展开三个框。"""
+        closed = threading.Event()
+        done_cb = closed.set
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         on_close=closed.set,
+                                         runner=fake_runner_mixed))
+        t.start()
+        hwnd = _own_window(done_cb)
+        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+        ctx = connect_ui._WINDOWS[hwnd]
+        for _ in range(80):
+            if ctx['rows']:
+                break
+            time.sleep(0.1)
+        self.assertFalse(ctx['pair_open'], '默认应收起配对面板')
+        self.assertIn(connect_ui.ID_MANUAL, ctx['hotspots'], '收起时应显示「手动配对」链接')
+        self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'], '收起时不该有「连接手机」大按钮')
+        for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+            self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
+                             '收起时输入框都要藏起来')
+        self.assertGreater(connect_ui._list_h(ctx), connect_ui.LIST_H,
+                           '收起时列表要变高，多显示几台设备')
+        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_MANUAL]
+        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+        time.sleep(0.4)
+        self.assertTrue(ctx['pair_open'], '点「手动配对」应展开面板')
+        self.assertEqual(ctx['pair_mode'], 'manual')
+        for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+            self.assertTrue(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
+                            '手动模式下三个框都要可见')
+        self.assertIn(connect_ui.ID_GO, ctx['hotspots'], '展开后才有「连接手机」大按钮')
+        # 收起
+        cx, cy, cw, ch = ctx['hotspots'][connect_ui.ID_PAIR_CLOSE]
+        lp = (cx + cw // 2) | ((cy + ch // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+        time.sleep(0.4)
+        self.assertFalse(ctx['pair_open'], '点「收起」应再收起来')
+        self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'])
+        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+        self.assertTrue(closed.wait(5))
+        t.join(5)
+        self.assertFalse(t.is_alive())
 
     def test_window_opens_paints_and_closes(self):
         done = threading.Event()
@@ -439,6 +528,7 @@ class WizardSmokeTest(unittest.TestCase):
 
         connect_ui._WINDOWS[hwnd]['runner'] = spy_runner
         WM_SETTEXT = 0x000C
+        _open_pair_panel(hwnd)                     # 配对面板平时收着，先点「手动配对」展开
         connect_ui.user32.SendMessageW(edits[connect_ui.ID_IP], WM_SETTEXT, 0,
                                        ctypes.c_wchar_p('192.168.1.5'))
         connect_ui.user32.SendMessageW(edits[connect_ui.ID_PORT], WM_SETTEXT, 0,
@@ -522,6 +612,7 @@ class WizardSmokeTest(unittest.TestCase):
             ctx = connect_ui._WINDOWS[hwnd]
             edits = ctx['edits']
             WM_SETTEXT, WM_COMMAND = 0x000C, 0x0111
+            _open_pair_panel(hwnd)   # 面板收着时没有「连接手机」按钮，先展开
             connect_ui.user32.SendMessageW(edits[connect_ui.ID_CODE], WM_SETTEXT, 0,
                                            ctypes.c_wchar_p('123456'))
             connect_ui.user32.PostMessageW(hwnd, WM_COMMAND, connect_ui.ID_GO, 0)
@@ -552,6 +643,120 @@ class WizardSmokeTest(unittest.TestCase):
         finally:
             connect_ui.discover_pair_target = orig_discover
             connect_ui.run_cmd = orig_runner
+
+
+MANY_MDNS = 'List of discovered mdns services\n' + ''.join(
+    'adb-phone%d\t_adb-tls-connect._tcp.\t192.168.137.%d:41234\n' % (i, 30 + i)
+    for i in range(8))
+
+
+def fake_runner_many(cmd, timeout=25):
+    """8 台「新发现」设备：超过收起状态能显示的 6 行，逼出滚动。"""
+    joined = ' '.join(cmd)
+    if 'devices' in joined:
+        return 0, 'List of devices attached\n\n'
+    if 'mdns' in joined:
+        return 0, MANY_MDNS
+    if 'getprop' in joined:
+        return 0, 'PJZ110\n'
+    return 0, ''
+
+
+def fake_runner_none(cmd, timeout=25):
+    """一台设备都没有（手机没开无线调试 / mDNS 被挡）。"""
+    joined = ' '.join(cmd)
+    if 'devices' in joined:
+        return 0, 'List of devices attached\n\n'
+    if 'mdns' in joined:
+        return 0, 'List of discovered mdns services\n'
+    return 0, ''
+
+
+def _wheel(hwnd, client_x, client_y, notches):
+    """在客户区某点滚一格滚轮（notches>0 往上，<0 往下）。"""
+    u = connect_ui.user32
+    pt = wt.POINT(client_x, client_y)
+    u.ClientToScreen(hwnd, ctypes.byref(pt))
+    lparam = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
+    wparam = ((notches * 120) & 0xFFFF) << 16
+    u.PostMessageW(hwnd, connect_ui.WM_MOUSEWHEEL, wparam, lparam)
+
+
+def _wait_refresh(ctx, timeout=10):
+    """等第一次自动刷新落盘（rows 有内容或确认是空列表）。"""
+    for _ in range(int(timeout / 0.1)):
+        if not ctx['busy'] and ctx['rows']:
+            return
+        if ctx.get('auto_opened'):
+            return
+        time.sleep(0.1)
+
+
+class ListScrollTest(_Isolated):
+    """列表卡片固定高度；设备多了滚轮翻；一台都没有时自动摊开配对面板。"""
+
+    def _open(self, runner, done_cb):
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         runner=runner))
+        t.start()
+        hwnd = _own_window(done_cb)
+        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+        return t, hwnd, connect_ui._WINDOWS[hwnd]
+
+    def _close(self, hwnd, t):
+        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
+        t.join(5)
+
+    def test_card_height_is_fixed_and_extra_rows_scroll(self):
+        done = threading.Event()
+        t, hwnd, ctx = self._open(fake_runner_many, done.set)
+        try:
+            _wait_refresh(ctx)
+            self.assertGreater(len(ctx['rows']), connect_ui.MAX_ROWS_FULL,
+                               '构造的 8 台设备没进来：%r' % ctx['rows'])
+            # 收起时固定 6 行高，不随行数长高
+            self.assertEqual(connect_ui._list_h(ctx),
+                             connect_ui.ROW_H * connect_ui.MAX_ROWS_FULL)
+            self.assertEqual(len(ctx['visible_rows']), connect_ui.MAX_ROWS_FULL)
+            first = ctx['visible_rows'][0]['serial']
+            # 往下滚一格：看到第 2 台起的 6 行，卡片高度不变
+            _wheel(hwnd, connect_ui.PAD + 200, connect_ui.LIST_Y + 40, -1)
+            for _ in range(30):
+                if ctx['scroll']:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(ctx['scroll'], 1, '滚轮没把列表滚动起来')
+            self.assertEqual(ctx['visible_rows'][0]['serial'],
+                             ctx['rows'][1]['serial'])
+            self.assertNotEqual(ctx['visible_rows'][0]['serial'], first)
+            self.assertEqual(connect_ui._list_h(ctx),
+                             connect_ui.ROW_H * connect_ui.MAX_ROWS_FULL)
+            # 往上滚回顶部
+            _wheel(hwnd, connect_ui.PAD + 200, connect_ui.LIST_Y + 40, 1)
+            for _ in range(30):
+                if not ctx['scroll']:
+                    break
+                time.sleep(0.1)
+            self.assertEqual(ctx['scroll'], 0)
+            self.assertEqual(ctx['visible_rows'][0]['serial'], first)
+        finally:
+            self._close(hwnd, t)
+
+    def test_empty_list_opens_pairing_panel_by_itself(self):
+        done = threading.Event()
+        t, hwnd, ctx = self._open(fake_runner_none, done.set)
+        try:
+            for _ in range(100):
+                if ctx.get('pair_open'):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(ctx['pair_open'], '一台设备都没发现却没自动摊开配对面板')
+            self.assertEqual(ctx['pair_mode'], 'manual')
+            self.assertTrue(ctx['auto_opened'])
+            self.assertIn(connect_ui.ID_GO, ctx['hotspots'])
+        finally:
+            self._close(hwnd, t)
 
 
 if __name__ == '__main__':
