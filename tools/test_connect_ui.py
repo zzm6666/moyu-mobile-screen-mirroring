@@ -289,7 +289,103 @@ class ParseMdnsTest(unittest.TestCase):
         self.assertEqual(cu.parse_mdns_services(None, '1.2.3.4'), '')
 
 
+class EnrichMdnsTest(unittest.TestCase):
+    """_enrich_mdns：用自带 mDNS 浏览器给发现行补地址（去重才有据可依）。"""
+
+    class _Browser:
+        def __init__(self, items):
+            self.items = items
+            self.calls = []
+
+        def browse(self, service_type, timeout=4.0, **kw):
+            self.calls.append((service_type, timeout))
+            return list(self.items)
+
+    def test_fills_addr_for_known_serial(self):
+        discovered = [{'name': 'adb-bfd7e543-MoDo9u', 'serial': MDNS_SERIAL, 'addr': ''}]
+        browser = self._Browser([{'name': MDNS_SERIAL + '.local', 'port': 45197,
+                                  'addr': '192.168.137.144'}])
+        items = cu._enrich_mdns(discovered, browser=browser)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['addr'], '192.168.137.144:45197')
+        self.assertEqual(browser.calls[0][0], '_adb-tls-connect._tcp')
+
+    def test_adds_instance_adb_did_not_list(self):
+        items = cu._enrich_mdns([], browser=self._Browser(
+            [{'name': 'adb-009b17d0._adb-tls-connect._tcp.local', 'port': 41234,
+              'addr': '192.168.137.88'}]))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['serial'], 'adb-009b17d0._adb-tls-connect._tcp')
+        self.assertEqual(items[0]['addr'], '192.168.137.88:41234')
+
+    def test_ignores_records_without_usable_addr(self):
+        items = cu._enrich_mdns([], browser=self._Browser(
+            [{'name': 'adb-x._adb-tls-connect._tcp.local', 'port': 0, 'addr': ''}]))
+        self.assertEqual(items, [])
+
+    def test_no_browser_returns_copy(self):
+        discovered = [{'name': 'a', 'serial': 'a', 'addr': '192.168.1.9:5555'}]
+        items = cu._enrich_mdns(discovered, browser=False)
+        self.assertEqual(items, discovered)
+        self.assertIsNot(items[0], discovered[0], '应返回副本，别改调用方数据')
+
+    def test_browser_failure_is_silent(self):
+        class Boom:
+            def browse(self, *a, **kw):
+                raise OSError('no socket')
+
+        self.assertEqual(cu._enrich_mdns([{'serial': 'a', 'name': 'a', 'addr': ''}],
+                                         browser=Boom())[0]['serial'], 'a')
+
+
 class MergeDevicesTest(unittest.TestCase):
+    def test_mdns_online_row_and_same_phone_found_row_merge_into_one(self):
+        """用户实测的重复：一台手机同时在线的 mDNS 串号 + 新发现的 ip:port 显示成两行。"""
+        online = [{'serial': MDNS_SERIAL, 'model': 'PJZ110'}]
+        discovered = [{'name': 'adb-bfd7e543-MoDo9u',
+                       'serial': MDNS_SERIAL,
+                       'addr': '192.168.137.144:36183'}]
+        rows = cu.merge_devices(online, discovered, [])
+        self.assertEqual(len(rows), 1, '同一台手机不该显示两行：%r' % rows)
+        self.assertEqual(rows[0]['state'], 'online')
+        # 在线行也要带上 IP:端口，否则用户看不出是哪台
+        self.assertEqual(rows[0]['addr'], '192.168.137.144:36183')
+
+    def test_two_online_serials_same_ip_merge_into_one(self):
+        """adb 同时报了 ip:port 和 mDNS 串号（同一台机）：只显示一行。"""
+        online = [{'serial': MDNS_SERIAL, 'model': 'PJZ110'},
+                  {'serial': '192.168.137.144:36183', 'model': 'PJZ110'}]
+        discovered = [{'name': 'adb-bfd7e543-MoDo9u', 'serial': MDNS_SERIAL,
+                       'addr': '192.168.137.144:36183'}]
+        rows = cu.merge_devices(online, discovered, [])
+        self.assertEqual(len(rows), 1, '同一台手机不该显示两行：%r' % rows)
+        self.assertEqual(rows[0]['state'], 'online')
+
+    def test_two_online_serials_without_mdns_addr_merge_into_one(self):
+        """拿不到 mDNS 地址时（缓存为空）也要并成一行，并补上地址给用户看。"""
+        online = [{'serial': MDNS_SERIAL, 'model': 'PJZ110'},
+                  {'serial': '192.168.137.144:45197', 'model': 'PJZ110'}]
+        rows = cu.merge_devices(online, [], [])
+        self.assertEqual(len(rows), 1, '同一台手机不该显示两行：%r' % rows)
+        self.assertEqual(rows[0]['serial'], MDNS_SERIAL)
+        self.assertEqual(rows[0]['addr'], '192.168.137.144:45197')
+
+    def test_usb_and_wifi_rows_stay_separate(self):
+        """USB 一台 + wifi 一台：两行都要留（不能把不同手机并掉）。"""
+        online = [{'serial': 'ABC123', 'model': 'Pixel_7'},
+                  {'serial': MDNS_SERIAL, 'model': 'PJZ110'}]
+        rows = cu.merge_devices(online, [], [])
+        self.assertEqual(len(rows), 2, '不该并成一行：%r' % rows)
+
+    def test_remembered_name_prefers_known_then_ip(self):
+        """没连上的设备用记住的名字，其次「无线设备 IP」，绝不显示 MoDo9u。"""
+        known = [{'serial': MDNS_SERIAL, 'name': '一加 13', 'addr': ''}]
+        row = {'serial': MDNS_SERIAL, 'addr': '', 'name': 'adb-bfd7e543-MoDo9u'}
+        self.assertEqual(cu._remembered_name(row, known), '一加 13')
+        row2 = {'serial': '192.168.137.144:36183',
+                'addr': '192.168.137.144:36183', 'name': 'adb-xx'}
+        self.assertEqual(cu._remembered_name(row2, []), '无线设备 192.168.137.144')
+
     def test_order_and_fields(self):
         """三源排序 online > found > offline；kind/state/name/addr 字段正确。"""
         online = [{'serial': 'ABC123', 'model': 'Pixel_7', 'product': '',
@@ -307,6 +403,29 @@ class MergeDevicesTest(unittest.TestCase):
         self.assertEqual(rows[1]['addr'], '192.168.1.9:41001')
         self.assertEqual(rows[2]['kind'], 'usb')
         self.assertEqual(rows[2]['name'], '旧手机')
+
+    def test_legacy_known_ipport_and_mdns_row_merge_into_one(self):
+        """旧配置里同时留着 ip:port 和 mDNS 串号两条历史记录：列表只显示一行。"""
+        known = [
+            {'serial': '192.168.137.144:45197', 'name': '192.168.137.144:45197',
+             'addr': '192.168.137.144:45197', 'last_seen': 2},
+            {'serial': MDNS_SERIAL, 'name': MDNS_SERIAL, 'addr': '', 'last_seen': 1},
+        ]
+        rows = cu.merge_devices([], [], known)
+        self.assertEqual(len(rows), 1, '同一台手机不该显示两行：%r' % rows)
+        self.assertEqual(rows[0]['serial'], MDNS_SERIAL)
+        # 名字不能是串号
+        self.assertNotIn('adb-', rows[0]['name'])
+        self.assertNotIn('192.168.137.144:45197', rows[0]['name'])
+
+    def test_two_different_phones_in_known_stay_two_rows(self):
+        """历史里两台不同的 wifi 手机：不能并成一行。"""
+        known = [
+            {'serial': '192.168.1.5:41001', 'name': '手机A', 'addr': '192.168.1.5:41001'},
+            {'serial': MDNS_SERIAL, 'name': '手机B', 'addr': '192.168.1.9:41001'},
+        ]
+        rows = cu.merge_devices([], [], known)
+        self.assertEqual(len(rows), 2, '两台不同手机不该合并：%r' % rows)
 
     def test_online_ipport_dedups_discovered_same_addr(self):
         """在线串号就是 ip:port 时，discovered 里同地址的 mDNS 行不重复。"""
@@ -400,7 +519,9 @@ class ReconnectKnownTest(ChineseMsgMixin, unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(serial, '192.168.1.5:5555')
         self.assertEqual(r.cmds('connect'), [['connect', '192.168.1.5:5555']])
-        self.assertEqual(r.cmds('mdns'), [])   # 旧端口成功就不必查 mDNS
+        # 成功后要问一次 adb 到底认哪个串号（ip:port 可能已被升级成 mDNS 串号）
+        self.assertTrue(all(c[:2] == ['mdns', 'services'] for c in r.cmds('mdns')),
+                        '成功后只允许查 mDNS 确认串号：%r' % r.cmds('mdns'))
 
     def test_wifi_mdns_finds_new_port(self):
         """旧端口失败 → mDNS 找到新端口 → connect 新端口成功。"""
@@ -688,6 +809,25 @@ class ConnectOnlyTest(ChineseMsgMixin, unittest.TestCase):
         self.assert_plain_chinese(msg)
         self.assertEqual(r.calls, [])
 
+    def test_stale_port_retries_with_fresh_mdns_port(self):
+        """「新发现」行的端口往往已过期：connect 失败后自动用 mDNS 最新端口重试。"""
+        r = FakeRunner(
+            mdns=('List of discovered mdns services\n'
+                  'adb-bfd7e543-MoDo9u\t_adb-tls-connect._tcp\t'
+                  '192.168.137.144:45197\n'),
+            connect_map={'192.168.137.144:45197': (0, 'connected to 192.168.137.144:45197')})
+        ok, msg, serial = cu.connect_only(ADB, '192.168.137.144:36183', r)
+        self.assertTrue(ok, '过期端口应能自动用新端口连上：%s' % msg)
+        self.assertEqual(serial, '192.168.137.144:45197')
+
+    def test_resolve_serial_uses_what_adb_reports(self):
+        """连接成功后串号口径统一：adb 报 mDNS 串号就用它（否则 scrcpy 启动即退出）。"""
+        r = FakeRunner(devices=('List of devices attached\n'
+                                '%s\tdevice product:PJZ110 model:PJZ110\n' % MDNS_SERIAL),
+                       mdns=('adb-bfd7e543-MoDo9u\t_adb-tls-connect._tcp\t'
+                             '192.168.137.144:45197\n'))
+        self.assertEqual(cu.resolve_serial(ADB, '192.168.137.144:45197', r), MDNS_SERIAL)
+
 
 class DeviceDisplayNameTest(unittest.TestCase):
     def test_first_nonempty_prop_wins(self):
@@ -722,11 +862,12 @@ class DeviceDisplayNameTest(unittest.TestCase):
         name = cu.device_display_name(ADB, '192.168.1.5:41001', '', r)
         self.assertEqual(name, '无线设备 192.168.1.5')
 
-    def test_mdns_serial_extracts_middle(self):
-        """mDNS 串号绝不直接当名字：提取中间段 MoDo9u。"""
+    def test_mdns_serial_never_shows_raw_segment(self):
+        """mDNS 串号中间那截（MoDo9u）用户看不懂，绝不能当名字显示。"""
         r = FakeRunner(shell_out='')
         name = cu.device_display_name(ADB, MDNS_SERIAL, '', r)
-        self.assertEqual(name, 'MoDo9u')
+        self.assertEqual(name, '无线设备')
+        self.assertNotIn('MoDo9u', name)
         self.assertNotIn('_tcp', name)
 
     def test_mdns_serial_without_middle_never_raw(self):
@@ -777,6 +918,44 @@ class RememberDeviceTest(unittest.TestCase):
         cu.remember_device(cfg, '192.168.1.5:41001', '一加 13', '', now=2)
         serials = [k['serial'] for k in cfg['known_devices']]
         self.assertEqual(serials, ['192.168.1.5:41001', 'USB1'])
+
+    def test_ipport_folds_into_mdns_entry(self):
+        """已记过 mDNS 串号时，记住 ip:port 不该再新增一条历史（同一台手机）。"""
+        cfg = {'known_devices': [{'serial': MDNS_SERIAL, 'name': '',
+                                  'addr': '', 'last_seen': 1}]}
+        cu.remember_device(cfg, '192.168.137.144:45197', '', '', now=5)
+        known = cfg['known_devices']
+        self.assertEqual(len(known), 1, '不该多记一条：%r' % known)
+        self.assertEqual(known[0]['serial'], MDNS_SERIAL)
+        self.assertEqual(known[0]['addr'], '192.168.137.144:45197')
+        self.assertEqual(known[0]['last_seen'], 5)
+        self.assertNotIn('_tcp', known[0]['name'])
+
+    def test_serial_never_stored_as_name(self):
+        """名字传空/等于串号时，存「无线设备 IP」这类可读名字，不存串号。"""
+        cfg = {}
+        cu.remember_device(cfg, '192.168.137.144:45197', '', now=1)
+        self.assertEqual(cfg['known_devices'][0]['name'], '无线设备 192.168.137.144')
+
+    def test_remembered_name_ignores_junk_names(self):
+        """旧配置把串号当名字存过：显示时也要过滤掉，不能顶到界面上。"""
+        known = [{'serial': MDNS_SERIAL, 'name': MDNS_SERIAL, 'addr': ''}]
+        row = {'serial': MDNS_SERIAL, 'addr': '', 'name': ''}
+        self.assertEqual(cu._remembered_name(row, known), '无线设备')
+        known2 = [{'serial': '192.168.137.144:45197',
+                   'name': '192.168.137.144:45197',
+                   'addr': '192.168.137.144:45197'}]
+        row2 = {'serial': '192.168.137.144:45197',
+                'addr': '192.168.137.144:45197', 'name': ''}
+        self.assertEqual(cu._remembered_name(row2, known2), '无线设备 192.168.137.144')
+
+    def test_known_mdns_replace_drops_old_ipport(self):
+        """先记 ip:port，再记同一台的 mDNS 串号：旧 ip:port 记录作废。"""
+        cfg = {'known_devices': [
+            {'serial': '192.168.137.144:45197', 'name': '无线设备 192.168.137.144',
+             'addr': '192.168.137.144:45197', 'last_seen': 1}]}
+        cu.remember_device(cfg, MDNS_SERIAL, '一加 13', '', now=2)
+        self.assertEqual([k['serial'] for k in cfg['known_devices']], [MDNS_SERIAL])
 
     def test_cap_at_eight(self):
         """最多 8 台：第 9 台进来时最旧的被挤掉。"""

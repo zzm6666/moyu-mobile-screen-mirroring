@@ -361,14 +361,64 @@ def pair_only(adb, ip_port, code, runner=run_cmd):
 
 
 def connect_only(adb, ip_port, runner=run_cmd):
-    """只做 adb connect；返回 (是否成功, 通俗提示, 串号)。"""
+    """只做 adb connect；返回 (是否成功, 通俗提示, 串号)。
+
+    手头的 ip:port 可能已经过期（每次开关无线调试端口都会变），所以失败时
+    重新问一次 mDNS 拿最新端口再试；这台手机已经以别的串号在线时直接算成功。
+    """
     if not normalize_ip_port(ip_port):
         return False, '请填写「IP:端口」，例如 192.168.1.5:41001', ''
     rc, out = runner([adb, 'connect', ip_port])
     low = (out or '').lower()
     if 'connected to' in low or 'already connected' in low:
-        return True, '连接成功', ip_port
+        return True, '连接成功', resolve_serial(adb, ip_port, runner)
+    # 端口过期：按 IP 找 mDNS 最新端口再连一次
+    stale = connect_only_fresh(adb, ip_port, runner)
+    if stale:
+        return stale
     return False, friendly_error(out, '连接'), ''
+
+
+def connect_only_fresh(adb, ip_port, runner=run_cmd):
+    """用 mDNS 里的最新端口重试同一台手机；成功返回 (True, msg, serial)。"""
+    ip = _ip_of(ip_port or '')
+    if not ip:
+        return None
+    out = runner([adb, 'mdns', 'services'])[1]
+    for d in parse_mdns_all(out):
+        if _ip_of(d['addr']) != ip:
+            continue
+        if d['addr'] == ip_port:
+            continue
+        rc, res = runner([adb, 'connect', d['addr']])
+        low = (res or '').lower()
+        if 'connected to' in low or 'already connected' in low:
+            return True, '连接成功', resolve_serial(adb, d['addr'], runner)
+    return None
+
+
+def resolve_serial(adb, wanted, runner=run_cmd):
+    """连接成功后问 adb 到底用哪个串号认这台手机。
+
+    adb 常把 ip:port 自动升级成 mDNS 串号（`adb-xxx._adb-tls-connect._tcp`），
+    两边不一致时投屏会「启动即退出」（scrcpy 找不到设备），所以统一成在线的那个。
+    """
+    if not wanted:
+        return wanted
+    devs = list_online(adb, runner)
+    if wanted in devs:
+        return wanted
+    ip = _ip_of(wanted)
+    if not ip:
+        return wanted
+    for s in devs:
+        if _ip_of(s) == ip:
+            return s
+    out = runner([adb, 'mdns', 'services'])[1]
+    for d in parse_mdns_all(out):
+        if _ip_of(d['addr']) == ip and d['serial'] in devs:
+            return d['serial']
+    return wanted
 
 
 def list_online(adb, runner=run_cmd):
@@ -377,7 +427,8 @@ def list_online(adb, runner=run_cmd):
     devs = []
     for line in (out or '').splitlines()[1:]:
         parts = line.split()
-        if len(parts) == 2 and parts[1] == 'device':
+        # 容忍 `adb devices -l` 那种后面还带 product:/model: 的输出
+        if len(parts) >= 2 and parts[1] == 'device':
             devs.append(parts[0])
     return devs
 
@@ -432,11 +483,35 @@ def device_display_name(adb, serial, model='', runner=run_cmd, timeout=6):
     if IP_PORT_RE.match(serial or ''):
         return '无线设备 ' + _ip_of(serial)
     if '_tcp' in (serial or ''):
-        m = re.match(r'^adb-[0-9a-f]+(?:-(.+?))?\._adb', serial)
-        if m and m.group(1):
-            return m.group(1)
-        return '无线设备'   # 无中间段的 mDNS 串号也绝不原样显示
+        return '无线设备'   # mDNS 机器串号绝不原样显示（那截 MoDo9u 用户看不懂）
     return serial or '未知设备'
+
+
+def _is_junk_name(name, serial=''):
+    """旧版本会把串号/ip:port 当名字存下来，这种名字对用户毫无意义。"""
+    name = (name or '').strip()
+    if not name:
+        return True
+    if serial and name == serial:
+        return True
+    return name.startswith('adb-') or bool(IP_PORT_RE.match(name))
+
+
+def _remembered_name(row, known=()):
+    """没连上的设备用「记住的名字」或 IP 兜底，绝不把 mDNS 机器串号当名字。
+
+    用户看不懂 `adb-bfd7e543-MoDo9u` 里那截 MoDo9u；同一台机在历史里记过
+    「一加 13」就沿用它。
+    """
+    ip = _ip_of(row.get('addr') or '')
+    for k in known or []:
+        same = (row.get('serial') and k.get('serial') == row['serial']) or \
+               (ip and _ip_of(k.get('addr') or '') == ip)
+        if same and not _is_junk_name(k.get('name'), k.get('serial')):
+            return k['name']
+    if ip:
+        return '无线设备 ' + ip
+    return '无线设备'
 
 
 def merge_devices(online, discovered, known):
@@ -451,32 +526,57 @@ def merge_devices(online, discovered, known):
     rows = []
     seen_serial = set()
     seen_addr = set()
+    seen_ip = set()
 
     def _identity_key(addr, serial):
         # mDNS 串号与 ip:port 指向同一台手机时用 addr 去重
         return addr or serial
 
-    for d in online:
-        serial = d['serial']
-        addr = serial if IP_PORT_RE.match(serial) else ''
-        rows.append({'serial': serial, 'name': d.get('model') or serial,
-                     'addr': addr, 'kind': classify_device(serial), 'state': 'online'})
+    def _claim(row, serial, addr):
+        rows.append(row)
         seen_serial.add(serial)
         if addr:
             seen_addr.add(addr)
-    for d in discovered:
+            seen_ip.add(_ip_of(addr))
+
+    # mDNS 串号 → 它的 ip:port：adb 把在线设备报成 mDNS 串号时靠它认出 IP，
+    # 这样「在线（mDNS 串号）」和「新发现（同一台机的 ip:port）」不会再显示成两行
+    inst_addr = {}
+    for d in discovered or []:
+        if d.get('serial') and d.get('addr'):
+            inst_addr[d['serial']] = d['addr']
+
+    for d in online:
+        serial = d['serial']
+        addr = serial if IP_PORT_RE.match(serial) else inst_addr.get(serial, '')
+        ip = _ip_of(addr) if addr else ''
+        if ip and ip in seen_ip:      # 同一台机被 adb 报成两个串号（ip:port 与 mDNS 串号）
+            continue
+        _claim({'serial': serial, 'name': d.get('model') or serial,
+                'addr': addr, 'kind': classify_device(serial), 'state': 'online'},
+               serial, addr)
+    for d in discovered or []:
         if d['serial'] in seen_serial:
-            # 同一台手机已在线（mDNS 串号）：把它的 ip:port 记进 seen_addr，
-            # 否则 known 里的 ip:port 历史行会重复出现（在线+离线两行）
             if d['addr']:
                 seen_addr.add(d['addr'])
+                seen_ip.add(_ip_of(d['addr']))
             continue
-        if d['addr'] in seen_addr:
+        if d['addr'] in seen_addr or _ip_of(d['addr']) in seen_ip:
             continue
-        rows.append({'serial': d['addr'], 'name': d['name'], 'addr': d['addr'],
-                     'kind': 'wifi', 'state': 'found'})
-        seen_serial.add(d['serial'])
-        seen_addr.add(d['addr'])
+        _claim({'serial': d['addr'], 'name': d['name'], 'addr': d['addr'],
+                'kind': 'wifi', 'state': 'found'}, d['serial'], d['addr'])
+    # 兜底：adb 把**同一台**手机报成两个串号（mDNS 串号 + ip:port）而拿不到 mDNS 的 IP 时，
+    # 并成一行——投屏只连一台手机，用户不该看到两台「已连接」。
+    wifi = [r for r in rows if r['kind'] == 'wifi' and r['state'] == 'online']
+    if len(wifi) == 2:
+        inst = next((r for r in wifi if '_tcp' in r['serial']), None)
+        ipp = next((r for r in wifi if IP_PORT_RE.match(r['serial'] or '')), None)
+        if inst is not None and ipp is not None and inst is not ipp:
+            inst['addr'] = inst['addr'] or ipp['addr'] or ipp['serial']
+            rows.remove(ipp)
+            seen_serial.discard(ipp['serial'])
+            seen_addr.add(inst['addr'])
+            seen_ip.add(_ip_of(inst['addr']))
     for k in known or []:
         serial = k.get('serial') or ''
         addr = k.get('addr') or (serial if IP_PORT_RE.match(serial) else '')
@@ -484,13 +584,19 @@ def merge_devices(online, discovered, known):
             continue
         # 同一台手机换了端口：IP 相同就视为同一台，不再重复列历史行
         ip = _ip_of(addr)
-        if ip and any(_ip_of(r['addr']) == ip for r in rows if r['addr']):
+        if ip and ip in seen_ip:
             continue
-        rows.append({'serial': serial, 'name': k.get('name') or serial,
-                     'addr': addr, 'kind': classify_device(serial), 'state': 'offline'})
-        seen_serial.add(serial)
-        if addr:
-            seen_addr.add(addr)
+        if serial in inst_addr and _ip_of(inst_addr[serial]) in seen_ip:
+            continue
+        # 旧配置里可能同时留着 ip:port 和 mDNS 串号两条记录：只留 mDNS 那条
+        if IP_PORT_RE.match(serial) and _mdns_twin(known, ip) is not None:
+            continue
+        name = k.get('name') or ''
+        if _is_junk_name(name, serial):
+            name = _default_name(serial, addr)
+        _claim({'serial': serial, 'name': name,
+                'addr': addr, 'kind': classify_device(serial), 'state': 'offline'},
+               serial, addr)
     return rows
 
 
@@ -673,9 +779,32 @@ def decide_action(ip, port, code):
     return 'connect', ip_port, ''
 
 
+def _default_name(serial, addr=''):
+    """想不出名字时的兜底：绝不把串号/ip:port 当名字显示给用户。"""
+    if addr and IP_PORT_RE.match(addr):
+        return '无线设备 %s' % _ip_of(addr)
+    if '_tcp' in (serial or ''):
+        return '无线设备'
+    return serial or '设备'
+
+
+def _mdns_twin(known, ip):
+    """历史记录里那台 mDNS 串号的手机（只有一台 wifi 手机时才有意义）。"""
+    mdns = [k for k in known if '_tcp' in (k.get('serial') or '')]
+    if len(mdns) != 1:
+        return None
+    twin = mdns[0]
+    twin_ip = _ip_of(twin.get('addr') or '')
+    if ip and twin_ip and twin_ip != ip:
+        return None      # 明确是两台不同的手机
+    return twin
+
+
 def remember_device(cfg, serial, name, addr='', now=None):
     """把成功连过的设备写进 cfg['known_devices']（按身份去重，最多 8 台，新在前）。
 
+    身份优先用 mDNS 串号（稳定），ip:port 只是易变信息：
+    新记的是 ip:port 时并进同一台手机的 mDNS 记录，绝不单独再记一条。
     返回更新后的列表（原地改 cfg）。now 可注入便于测试。
     """
     known = cfg.get('known_devices')
@@ -683,14 +812,31 @@ def remember_device(cfg, serial, name, addr='', now=None):
         known = []
     addr = addr or (serial if IP_PORT_RE.match(serial or '') else '')
     ip = _ip_of(addr)
-    entry = {'serial': serial, 'name': name or serial, 'addr': addr,
-             'last_seen': int(now if now is not None else time.time())}
+    name = '' if _is_junk_name(name, serial) else name
+    stamp = int(now if now is not None else time.time())
+    if IP_PORT_RE.match(serial or ''):
+        twin = _mdns_twin(known, ip)
+        if twin is not None:
+            twin['addr'] = addr or twin.get('addr') or ''
+            if _is_junk_name(twin.get('name'), twin.get('serial')):
+                twin['name'] = name or _default_name(twin['serial'], twin['addr'])
+            twin['last_seen'] = stamp
+            known.sort(key=lambda k: -(k.get('last_seen') or 0))
+            cfg['known_devices'] = known
+            return known
+    entry = {'serial': serial, 'name': name or _default_name(serial, addr),
+             'addr': addr, 'last_seen': stamp}
     rest = []
     for k in known:
         if k.get('serial') == serial:
             continue
         if ip and _ip_of(k.get('addr') or '') == ip:
             continue   # 同一台手机换了端口：旧记录作废
+        kser = k.get('serial') or ''
+        if '_tcp' in (serial or '') and IP_PORT_RE.match(kser):
+            auto = not k.get('name') or k['name'] in (kser, _default_name(kser, kser))
+            if auto or (ip and _ip_of(kser) == ip):
+                continue   # 有了 mDNS 串号，同一台手机的 ip:port 记录就没用了
         rest.append(k)
     known = [entry] + rest[:7]
     cfg['known_devices'] = known
@@ -710,6 +856,7 @@ C_FAINT = (156, 163, 173)       # 弱化文字/占位
 C_LINE = (228, 226, 220)        # 分隔线
 C_PRIMARY = (23, 152, 140)      # 主色 浅青绿（连接/选中；再浅一档，白字对比仍 ≥3:1）
 C_PRIMARY_DK = (18, 124, 114)   # 主色 按下
+C_PRIMARY_HOVER = (12, 104, 96)  # 主色 hover：明显深一档（和大按钮共用）
 C_PRIMARY_LT = (230, 246, 243)  # 主色 浅底（选中 tab 底/徽标底）
 C_ACCENT = (217, 119, 6)        # 琥珀（新发现徽标/提示图标）
 C_ACCENT_LT = (253, 240, 222)
@@ -972,7 +1119,7 @@ def _paint(ctx, hdc):
         _badge(hdc, f_small, nx + nw + 8, name_y + (20 - bh) // 2, label, fg, bg)
         if sub:
             _draw_text(hdc, f_small, nx, sub_y, sub, C_FAINT)
-        # 行尾「连接」按钮：已连接（在线）的设备不显示，整行可点直接投屏
+        # 行尾「连接」按钮：已连接（在线）的设备不显示，整行不可点
         if r['state'] == 'online':
             continue
         bx, by, bw, bh = ctx['hotspots'][ID_ROW_BASE + i]
@@ -982,17 +1129,16 @@ def _paint(ctx, hdc):
             _round_rect(hdc, bx, by, bw, bh, 8, C_PRIMARY_LT)
             _draw_text(hdc, f_small, bx + 10, by + 8, '连接中', C_PRIMARY)
         elif r['state'] == 'offline':
-            # hover 参照刷新按钮：浅绿底 + 主色文字（原来 hover 无任何变化）
+            # 离线行的「连接」沿用右上角「刷新」的样式：白底灰框灰字，hover 浅绿底绿字
             _round_rect(hdc, bx, by, bw, bh, 8,
                         C_PRIMARY_LT if hover else C_SURFACE, C_LINE)
             _draw_text(hdc, f_btn, bx + 16, by + 7, '连接',
                        C_PRIMARY if hover else C_SUB)
         else:
-            # hover 参照刷新按钮：浅绿底 + 主色文字（深绿→更深绿肉眼几乎看不出）
+            # hover 与下方「连接手机」大按钮完全一致：主色填深一档 + 白字
             _round_rect(hdc, bx, by, bw, bh, 8,
-                        C_PRIMARY_LT if hover else C_PRIMARY)
-            _draw_text(hdc, f_btn, bx + 16, by + 7, '连接',
-                       C_PRIMARY if hover else (255, 255, 255))
+                        C_PRIMARY_HOVER if hover else C_PRIMARY)
+            _draw_text(hdc, f_btn, bx + 16, by + 7, '连接', (255, 255, 255))
 
     if ctx['tab'] == 'wifi':
         # 首次配对区
@@ -1027,7 +1173,9 @@ def _paint(ctx, hdc):
             tw = _text_size(hdc, f_btn, label)[0]
             _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, C_PRIMARY)
         else:
-            _round_rect(hdc, gx, gy, gw, gh, 10, C_PRIMARY_DK if hover else C_PRIMARY)
+            _round_rect(hdc, gx, gy, gw, gh, 10,
+                        C_PRIMARY_DK if ctx['pressed'] == ID_GO
+                        else (C_PRIMARY_HOVER if hover else C_PRIMARY))
             label = '连接手机'
             tw = _text_size(hdc, f_btn, label)[0]
             _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
@@ -1082,7 +1230,14 @@ def _set_tab(ctx, tab):
 
 
 def _start_job(ctx, kind, payload, row=None, busy_text='正在连接'):
-    if ctx['busy'] or ctx['closing']:
+    if ctx['closing'] or ctx.get('dead'):
+        return
+    if ctx['busy']:
+        if kind == 'refresh':
+            return
+        # 正在刷新设备列表时用户点了「连接手机」：别把这次点击丢掉，等刷新结束再跑
+        ctx['queued'] = (kind, payload, row, busy_text)
+        _status(ctx, busy_text + '…（正在刷新设备）', 'busy')
         return
     ctx['busy'] = True
     ctx['busy_row'] = row
@@ -1109,12 +1264,47 @@ def _peer_ips(ctx):
     return ips
 
 
+def _enrich_mdns(discovered, browser=None, timeout=1.5):
+    """用自带的 mDNS 浏览器给「发现」行补上地址。
+
+    `adb mdns services` 的缓存经常把同一台手机报成 mDNS 串号却没有地址，
+    列表里就会冒出两行同一台手机。自己组播问一次连接服务，就能拿到
+    每个串号对应的 ip:port，去重才有据可依。
+    """
+    items = [dict(d) for d in (discovered or [])]
+    browser = browser if browser is not None else mdns_browse
+    if browser is None:
+        return items
+    try:
+        found = browser.browse('_adb-tls-connect._tcp', timeout=timeout)
+    except Exception:
+        return items
+    known = {d['serial'] for d in items}
+    for it in found or []:
+        name = (it.get('name') or '').rstrip('.')
+        if name.endswith('.local'):
+            name = name[:-6]
+        addr = '%s:%s' % (it.get('addr') or '', it.get('port') or '')
+        if not name or not IP_PORT_RE.match(addr):
+            continue
+        if name in known:
+            for d in items:
+                if d['serial'] == name and not d['addr']:
+                    d['addr'] = addr
+            continue
+        items.append({'name': name.split('.')[0], 'serial': name, 'addr': addr})
+        known.add(name)
+    return items
+
+
 def _worker_job(ctx, kind, payload):
     """在工作线程里跑 adb，结果放到 ctx 里再 PostMessage 回窗口。"""
     try:
         if kind == 'refresh':
             online = list_devices_detailed(ctx['adb'], ctx['runner'])
             disc = parse_mdns_all(ctx['runner']([ctx['adb'], 'mdns', 'services'])[1])
+            # 自己再问一遍 mDNS：给没有地址的 mDNS 串号补上 ip:port，避免同一台手机列两行
+            disc = _enrich_mdns(disc)
             rows = merge_devices(online, disc, ctx['known'])
             # 在线设备补营销名（每台一次 shell，超时兜底型号）
             for r in rows:
@@ -1126,10 +1316,8 @@ def _worker_job(ctx, kind, payload):
                             break
                     r['name'] = device_display_name(ctx['adb'], r['serial'],
                                                     model, ctx['runner'])
-                elif r['state'] == 'found':
-                    m = re.match(r'^adb-[0-9a-f]+-(.+)$', r['name'])
-                    if m:
-                        r['name'] = m.group(1)
+                elif r['state'] != 'online':
+                    r['name'] = _remembered_name(r, ctx['known'])
             ctx['job'] = ('refresh', rows, '')
         elif kind == 'pair':
             ip_port, code = payload
@@ -1168,10 +1356,26 @@ def _worker_job(ctx, kind, payload):
             ctx['job'] = ('reconnect', (ok, msg, serial), '')
     except Exception as exc:
         ctx['job'] = (kind, '', str(exc) or exc.__class__.__name__)
+    # 连接成功后统一成 adb 此刻真正认的串号（ip:port ↔ mDNS 串号），否则投屏起不来
+    job = ctx.get('job')
+    if job and job[0] != 'refresh' and isinstance(job[1], tuple) and len(job[1]) > 2:
+        ok, msg, serial = job[1][0], job[1][1], job[1][2]
+        if ok and serial:
+            fixed = resolve_serial(ctx['adb'], serial, ctx['runner'])
+            if fixed != serial:
+                ctx['job'] = (job[0], (ok, msg, fixed), job[2])
     user32.PostMessageW(ctx['hwnd'], WM_APP_JOB, 0, 0)
 
 
 def _on_job_done(ctx):
+    _apply_job(ctx)
+    # 刷新期间被拦下的点击，等这次任务收尾后补跑
+    queued = ctx.pop('queued', None)
+    if queued and not ctx['closing'] and not ctx.get('dead'):
+        _start_job(ctx, *queued)
+
+
+def _apply_job(ctx):
     job = ctx.get('job')
     if not job:
         return
@@ -1244,9 +1448,11 @@ def _complete(ctx, serial):
     hwnd = ctx['hwnd']
     ctx['closed'] = True
     name = ''
+    addr = ''
     for r in ctx['rows']:
         if r['serial'] == serial or r['addr'] == serial:
             name = r['name']
+            addr = r['addr'] or ''
             break
     if ctx['log']:
         ctx['log']('wizard: done serial=%s name=%s' % (serial, name))
@@ -1259,7 +1465,9 @@ def _complete(ctx, serial):
         except (TypeError, ValueError):
             n = 2
         try:
-            if n >= 2:
+            if n >= 3:
+                ctx['on_done'](serial, name, addr)
+            elif n == 2:
                 ctx['on_done'](serial, name)
             else:
                 ctx['on_done'](serial)
@@ -1595,7 +1803,8 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'hotspots': {}, 'hover': 0, 'pressed': 0, 'tracking': False,
                'status_text': '点右上角「刷新」查找设备；第一次用无线请在下方配对。',
                'status_kind': 'info', 'edits': {}, 'cues': {},
-               'toast': '', 'closing': False, 'dead': False, 'typed_ip': ''}
+               'toast': '', 'closing': False, 'dead': False, 'typed_ip': '',
+               'queued': None}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)
         ctx['f_small'] = _font_create(12, 400)

@@ -80,7 +80,10 @@ class WizardSmokeTest(unittest.TestCase):
         done_cb = done.set   # 绑定方法每次取属性都是新对象，先存引用再传+认窗口
         t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
                              kwargs=dict(adb='fake-adb', on_done=done_cb,
-                                         on_close=closed.set, runner=fake_runner_mixed))
+                                         on_close=closed.set, runner=fake_runner_mixed,
+                                         known=[{'serial': '192.168.137.77:39001',
+                                                 'name': '旧手机',
+                                                 'addr': '192.168.137.77:39001'}]))
         t.start()
         hwnd = _own_window(done_cb)
         self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
@@ -159,13 +162,15 @@ class WizardSmokeTest(unittest.TestCase):
             self.assertEqual(ctx['hover'], 0, '设备行本身不应有 hover')
             self.assertEqual(pixel(*row_px), connect_ui.C_SURFACE, '悬停设备行不应变色')
             self.assertEqual(pixel(*btn_px), connect_ui.C_PRIMARY, '按钮未悬停应保持主色')
-            # 悬停按钮：参照刷新按钮的 hover——浅绿底+主色文字，行保持白
+            # 悬停按钮：与大按钮「连接手机」同款 hover——主色填深一档 + 白字，行保持白
             lp = btn_px[0] | (btn_px[1] << 16)
             u.PostMessageW(hwnd, 0x0200, 0, lp)
             time.sleep(0.4)
             self.assertEqual(ctx['hover'], connect_ui.ID_ROW_BASE + j, '按钮应响应悬停')
-            self.assertEqual(pixel(*btn_px), connect_ui.C_PRIMARY_LT,
-                             '悬停时按钮应像刷新按钮一样变浅绿底')
+            self.assertEqual(pixel(*btn_px), connect_ui.C_PRIMARY_HOVER,
+                             '悬停时按钮应像「连接手机」大按钮一样变深')
+            self.assertNotEqual(connect_ui.C_PRIMARY_HOVER, connect_ui.C_PRIMARY,
+                                'hover 色必须和常态肉眼可分辨')
             self.assertEqual(pixel(*row_px), connect_ui.C_SURFACE,
                              '悬停按钮时设备行不应变色（只有按钮 hover）')
             if off_px:
@@ -174,7 +179,7 @@ class WizardSmokeTest(unittest.TestCase):
                 time.sleep(0.4)
                 self.assertEqual(ctx['hover'], connect_ui.ID_ROW_BASE + k)
                 self.assertEqual(pixel(*off_px), connect_ui.C_PRIMARY_LT,
-                                 '离线按钮悬停也应变浅绿底')
+                                 '离线按钮悬停应和「刷新」按钮一样变浅绿底')
         finally:
             connect_ui.user32.TrackMouseEvent = orig_tme
         u.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE

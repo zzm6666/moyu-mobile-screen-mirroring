@@ -702,10 +702,10 @@ def open_connect_wizard():
     state['wizard_open'] = True
     log('wizard: open (adb=%s cfg=%s)' % (ADB, CONFIG_PATH))
 
-    def on_done(serial, name=''):
+    def on_done(serial, name='', addr=''):
         state['wizard_open'] = False
         CFG['serial'] = serial
-        connect_ui.remember_device(CFG, serial, name)
+        connect_ui.remember_device(CFG, serial, name, addr)
         ok = save_cfg(CONFIG_PATH, CFG)
         state['serial'] = serial
         state['retries'] = 0
@@ -777,6 +777,13 @@ def start_scrcpy():
         log('scrcpy: 自动查找设备失败，改走连接向导')
         open_connect_wizard()
         return
+    if auto not in list_devices():
+        # adb 会把同一台手机在 ip:port 与 mDNS 串号之间换来换去：用 adb 此刻真正
+        # 认的串号起 scrcpy，否则 scrcpy 会「启动即退出」（rc=2），画面不出现
+        fixed = connect_ui.resolve_serial(ADB, auto)
+        if fixed and fixed != auto:
+            log('serial: %s → %s（按 adb 当前认的串号）' % (auto, fixed))
+            auto = fixed
     if auto != CFG.get('serial'):
         CFG['serial'] = auto
         save_cfg(CONFIG_PATH, CFG)

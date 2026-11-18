@@ -179,6 +179,32 @@ class WatchdogTimeoutTest(unittest.TestCase):
         self.assertIn(['popen'], order)
         self.assertIsNone(app.state['child'], '没有清掉 child，新窗口不会被收养')
 
+    def test_start_scrcpy_uses_the_serial_adb_reports(self):
+        """配置里存的是 ip:port，但 adb 把它认成 mDNS 串号：要用 mDNS 串号起 scrcpy。
+
+        否则 scrcpy 找不到设备会「启动即退出」（rc=2），投屏窗口根本不出现。
+        """
+        mDNS = 'adb-bfd7e543-MoDo9u._adb-tls-connect._tcp'
+        app.CFG['serial'] = '192.168.137.144:36183'
+        app.list_devices = lambda: []            # 该 ip:port 不在 adb 的在线列表里
+        app.connect_ui.try_auto_connect = lambda adb, serial, runner=None: '192.168.137.144:36183'
+        app.connect_ui.resolve_serial = lambda adb, serial: mDNS
+        app.get_phone_aspect = lambda: 0.4545
+        app.has_audio_device = lambda: True
+        app.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=0, stdout=b'', stderr=b'')
+        launched = {}
+
+        def fake_popen(args, **kw):
+            launched['args'] = args
+            return FakeProc()
+
+        app.subprocess.Popen = fake_popen
+        app.start_scrcpy()
+        self.assertEqual(launched['args'][0:3], [app.SCRCPY, '-s', mDNS],
+                         '没用 adb 当前认的串号起 scrcpy：%r' % (launched.get('args'),))
+        self.assertEqual(app.CFG['serial'], mDNS, '配置里该写回统一后的串号')
+
 
 class WizardWiringTest(unittest.TestCase):
     """连接向导接线：known_devices 记忆 + on_done(serial, name) 新签名。"""
