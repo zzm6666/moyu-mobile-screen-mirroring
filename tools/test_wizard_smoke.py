@@ -176,9 +176,9 @@ class WizardSmokeTest(_Isolated):
         btn_px = (bx + bw // 2, by + bh - 4)                           # 按钮内靠下，避开文字
         k = next((i for i, r in enumerate(rows) if r['state'] == 'offline'), None)
         self.assertIsNotNone(k, '假 runner + known 应刷出离线（历史）设备')
-        # 离线设备点了必然连不上（手机无线调试多半已经关了），因此不给按钮
-        self.assertNotIn(connect_ui.ID_ROW_BASE + k, ctx['hotspots'],
-                         '离线设备行不该有「连接」按钮')
+        # 离线设备也有按钮——点了是去重新配对（自动问新端口），不是直接连接
+        self.assertIn(connect_ui.ID_ROW_BASE + k, ctx['hotspots'],
+                      '离线设备应有「配对」按钮')
         base_btn, base_row = pixel(*btn_px), pixel(*row_px)
         self.assertEqual(base_btn, connect_ui.C_PRIMARY, '按钮常态应为主色')
         self.assertEqual(base_row, connect_ui.C_SURFACE, '设备行常态应为卡片白')
@@ -358,6 +358,62 @@ class WizardSmokeTest(_Isolated):
         self.assertFalse(any('connect' in c and ' pair' not in c for c in cmds),
                          '没配对过就不该直接发起连接：%r' % cmds)
         self.assertFalse(done.is_set(), '不该连接成功')
+        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+        self.assertTrue(closed.wait(5))
+        t.join(5)
+        self.assertFalse(t.is_alive())
+
+    def test_offline_row_gets_pair_button_and_anonymous_row_is_hidden(self):
+        """离线设备：认得出的留一行「配对」按钮，认不出的（名字是串号、没地址）不显示。
+
+        用户 m03950：看不出是哪台设备、又没有按钮可点的离线行留着没意义。
+        """
+        done = threading.Event()
+        closed = threading.Event()
+
+        def runner(cmd, timeout=25):
+            joined = ' '.join(cmd)
+            if 'devices' in joined:
+                return 0, 'List of devices attached\n'   # 一台都没连上
+            if 'mdns' in joined:
+                return 0, 'List of discovered mdns services\n'   # 也没人广播
+            return 0, ''
+
+        known = [{'serial': 'adb-bfd7e543-MoDo9u._adb-tls-connect._tcp',
+                  'name': '一加 13', 'addr': '192.168.137.77:39001'},
+                 {'serial': 'adb-cccc3333-Lost._adb-tls-connect._tcp',
+                  'name': 'adb-cccc3333-Lost._adb-tls-connect._tcp', 'addr': ''}]
+        done_cb = done.set
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         on_close=closed.set, runner=runner,
+                                         known=known))
+        t.start()
+        hwnd = _own_window(done_cb)
+        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+        ctx = connect_ui._WINDOWS[hwnd]
+        for _ in range(80):
+            if ctx['visible_rows']:
+                break
+            time.sleep(0.1)
+        rows = ctx['visible_rows']
+        self.assertEqual([r['name'] for r in rows], ['一加 13'],
+                         '看不出是哪台设备的离线行应被藏掉：%r' % [r['name'] for r in rows])
+        self.assertEqual(rows[0]['state'], 'offline')
+        self.assertIn(connect_ui.ID_ROW_BASE, ctx['hotspots'],
+                      '离线设备要有「配对」按钮（点了是重新配对，不是硬连）')
+        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
+        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+        for _ in range(40):
+            if ctx['pair_open']:
+                break
+            time.sleep(0.1)
+        self.assertTrue(ctx['pair_open'], '点离线设备的「配对」应展开配对面板')
+        self.assertEqual(ctx['pair_mode'], 'prefill')
+        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
+                         '192.168.137.77')
         connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         self.assertTrue(closed.wait(5))
         t.join(5)

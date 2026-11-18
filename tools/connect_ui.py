@@ -577,6 +577,17 @@ def _remembered_name(row, known=()):
     return '无线设备'
 
 
+def _row_has_info(row, known=()):
+    """这一行有没有可辨认的信息（名字或地址）。
+
+    离线行既没有地址、名字也只是「无线设备」兜底时，用户看不出是哪台设备、
+    也没有按钮可点，留着就是噪音——直接不显示。
+    """
+    if (row.get('addr') or '').strip():
+        return True
+    return _remembered_name(row, known) != '无线设备'
+
+
 def merge_devices(online, discovered, known):
     """三源合并成向导设备列表，按 在线 > 新发现 > 历史 排序，按身份去重。
 
@@ -1079,7 +1090,13 @@ def _hit(ctx, x, y):
 def _list_rows(ctx):
     """当前标签页的设备行（全部，滚动只看其中一段）。"""
     kind = 'usb' if ctx.get('tab') == 'usb' else 'wifi'
-    return [r for r in ctx['rows'] if r['kind'] == kind]
+    rows = [r for r in ctx['rows'] if r['kind'] == kind]
+    if kind == 'wifi':
+        known = ctx.get('known') or ()
+        # 离线又完全看不出是哪台设备的行（没地址、名字也只是「无线设备」）不显示
+        rows = [r for r in rows
+                if r['state'] != 'offline' or _row_has_info(r, known)]
+    return rows
 
 
 def _max_rows(ctx):
@@ -1126,7 +1143,8 @@ def _rebuild_hotspots(ctx):
     ctx['visible_rows'], _top = _visible_rows(ctx)
     for i, r in enumerate(ctx['visible_rows']):
         y = LIST_Y + i * ROW_H
-        if r['state'] == 'found':   # 只有「新发现」设备才有按钮：已连接不用点，离线点了也连不上
+        # 已连接的不用点；「新发现」和「离线」都有按钮：离线那台点了是去配对
+        if r['state'] in ('found', 'offline'):
             hs[ID_ROW_BASE + i] = (WIN_W - PAD - 76, y + 10, 64, 32)
     hs[ID_REFRESH] = (WIN_W - PAD - 64, TAB_Y + 4, 64, 26)
     if ctx['tab'] == 'wifi':
@@ -1230,9 +1248,9 @@ def _paint(ctx, hdc):
         _badge(hdc, f_small, nx + nw + 8, name_y + (20 - bh) // 2, label, fg, bg)
         if sub:
             _draw_text(hdc, f_small, nx, sub_y, sub, C_FAINT)
-        # 行尾按钮：只有「新发现」设备有。已连接的点了没意义，离线（连广播都没有）
-        # 点了必然失败，所以这两类都不再摆一个注定失败的按钮。
-        if r['state'] != 'found':
+        # 行尾按钮：已连接的设备不摆按钮（点了也是重复连接）。
+        # 「新发现」连过的显示「连接」、没连过的显示「配对」；离线设备只能重新配对。
+        if r['state'] not in ('found', 'offline'):
             continue
         bx, by, bw, bh = ctx['hotspots'][ID_ROW_BASE + i]
         hover = ctx['hover'] == ID_ROW_BASE + i
@@ -1243,8 +1261,9 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_small, bx + (bw - tw) // 2, by + (bh - th) // 2,
                        '连接中', C_PRIMARY)
         else:
-            # 本机连过的「连接」；没连过的只能先配对，按钮就叫「配对」
-            label = '连接' if _seen_before(r, ctx['known']) else '配对'
+            # 本机连过的「连接」；没连过的（以及离线的）只能先配对，按钮就叫「配对」
+            label = '连接' if (r['state'] == 'found' and
+                               _seen_before(r, ctx['known'])) else '配对'
             # hover 与下方「连接手机」大按钮完全一致：主色填深一档 + 白字
             _round_rect(hdc, bx, by, bw, bh, 8,
                         C_PRIMARY_HOVER if hover else C_PRIMARY)
@@ -1281,7 +1300,9 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_small, hx, hy + 2, '收起',
                        C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
             if prefill:
-                # 自动问到的 IP:端口 就摆在配对码框正上方，和输入框左缘对齐
+                # 自动问到的 IP:端口 摆在配对码框正上方：标签与「配对码」左对齐，地址与输入框对齐
+                _draw_text(hdc, f_small, PAD, CODE_Y - 24,
+                           'IP和端口：', C_SUB)
                 _draw_text(hdc, f_small, EDIT_X, CODE_Y - 24,
                            ctx['pair_label'] or '', C_SUB)
             _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
@@ -1680,12 +1701,11 @@ def _click(ctx, hid):
             # 已连接的设备：点了也不做任何事（不重复连接，也就不会开出第二个投屏窗口）
             _status(ctx, '「%s」已经连上了，不用再点。' % r['name'], 'info')
             return
-        if r['state'] != 'found':
-            return      # 离线设备没有按钮（热点），这里只是兜底
-        if _seen_before(r, ctx['known']):
+        if r['state'] == 'found' and _seen_before(r, ctx['known']):
             _start_job(ctx, 'connect', r['addr'], row=i)
         else:
-            _prefill_pair(ctx, r)    # 没配对过：先让用户填 6 位配对码
+            # 没配对过 / 现在离线：都先让用户填 6 位配对码（离线的那台要重新配对）
+            _prefill_pair(ctx, r)
         return
 
 

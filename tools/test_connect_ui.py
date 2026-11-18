@@ -386,6 +386,16 @@ class MergeDevicesTest(unittest.TestCase):
                 'addr': '192.168.137.144:36183', 'name': 'adb-xx'}
         self.assertEqual(cu._remembered_name(row2, []), '无线设备 192.168.137.144')
 
+    def test_row_has_info_for_offline_rows(self):
+        """离线行有没有可辨认信息：有地址/历史名字才有，纯「无线设备」兜底就没有。"""
+        self.assertTrue(cu._row_has_info({'serial': 'S', 'addr': '192.168.1.5:5555'}))
+        self.assertTrue(cu._row_has_info(
+            {'serial': MDNS_SERIAL, 'addr': ''},
+            [{'serial': MDNS_SERIAL, 'name': '一加 13', 'addr': ''}]))
+        self.assertFalse(cu._row_has_info(
+            {'serial': MDNS_SERIAL, 'addr': ''},
+            [{'serial': MDNS_SERIAL, 'name': MDNS_SERIAL, 'addr': ''}]))
+
     def test_order_and_fields(self):
         """三源排序 online > found > offline；kind/state/name/addr 字段正确。"""
         online = [{'serial': 'ABC123', 'model': 'Pixel_7', 'product': '',
