@@ -427,6 +427,13 @@ class WizardSmokeTest(_Isolated):
             self.assertTrue(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
                             '手动模式下三个框都要可见')
         self.assertIn(connect_ui.ID_GO, ctx['hotspots'], '展开后才有「连接手机」大按钮')
+        # 手动填的旧地址不能留到下次：收起再展开应清空 IP/端口
+        u = connect_ui.user32
+        u.SendMessageW(ctx['edits'][connect_ui.ID_IP], 0x000C, 0,
+                       ctypes.c_wchar_p('10.0.0.9'))
+        u.SendMessageW(ctx['edits'][connect_ui.ID_PORT], 0x000C, 0,
+                       ctypes.c_wchar_p('5555'))
+        time.sleep(0.2)
         # 收起
         cx, cy, cw, ch = ctx['hotspots'][connect_ui.ID_PAIR_CLOSE]
         lp = (cx + cw // 2) | ((cy + ch // 2) << 16)
@@ -435,6 +442,17 @@ class WizardSmokeTest(_Isolated):
         time.sleep(0.4)
         self.assertFalse(ctx['pair_open'], '点「收起」应再收起来')
         self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'])
+        # 再次展开：上一次手填的 IP/端口 必须被清掉（旧地址只会让人填错）
+        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_MANUAL]
+        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+        time.sleep(0.4)
+        self.assertTrue(ctx['pair_open'])
+        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]), '',
+                         '手动配对时要清空 IP 框')
+        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]), '',
+                         '手动配对时要清空端口框')
         connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         self.assertTrue(closed.wait(5))
         t.join(5)

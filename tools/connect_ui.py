@@ -529,6 +529,11 @@ def _set_pair_open(ctx, mode='', addr=''):
     ctx['pair_label'] = addr
     ctx['scroll'] = 0                # 面板高度变了，列表回到顶部，免得停在半截
     show_ip = mode == 'manual'
+    if show_ip:                     # 手动填：把上次留下的 IP/端口 清空，别让旧值误导
+        for eid in (ID_IP, ID_PORT):
+            eh = ctx['edits'].get(eid)
+            if eh:
+                user32.SendMessageW(eh, WM_SETTEXT, 0, ctypes.c_wchar_p(''))
     for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, bool(mode))):
         eh = ctx['edits'].get(eid)
         if eh:
@@ -550,8 +555,8 @@ def _prefill_pair(ctx, row):
                             ctypes.c_wchar_p(port))
     _set_pair_open(ctx, 'prefill' if ip else 'manual', addr)
     user32.SetFocus(ctx['edits'][ID_CODE])
-    _status(ctx, '「%s」需要先配对：请在手机上打开「使用配对码配对设备」，'
-                 '把手机上的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
+    _status(ctx, '「%s」还没配对：请在设备上打开「使用配对码配对设备」，'
+                 '把设备上显示的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
             % (row.get('name') or ip or '这台设备'), 'info')
 
 
@@ -949,7 +954,7 @@ SEC_Y = LIST_Y + LIST_H + 16          # 配对面板标题（收起时是「手�
 IP_Y = SEC_Y + 30
 CODE_Y = IP_Y + 40
 GO_Y = CODE_Y + 44
-MANUAL_TEXT = '手机不在列表里？手动配对'
+MANUAL_TEXT = '设备不在列表里？手动配对'
 SUCCESS_CLOSE_MS = 1000         # 「连接成功」toast 停留时长，之后窗口自动关闭
 AUTO_REFRESH_MS = 3000          # 向导开着时每 3 秒悄悄刷新一次设备列表
 AUTO_REFRESH_TIMER = 3          # 该刷新用的 WM_TIMER id
@@ -1234,15 +1239,18 @@ def _paint(ctx, hdc):
         busy = ctx['busy'] and ctx['busy_row'] == i
         if busy:
             _round_rect(hdc, bx, by, bw, bh, 8, C_PRIMARY_LT)
-            _draw_text(hdc, f_small, bx + 8, by + 8, '连接中', C_PRIMARY)
+            tw, th = _text_size(hdc, f_small, '连接中')
+            _draw_text(hdc, f_small, bx + (bw - tw) // 2, by + (bh - th) // 2,
+                       '连接中', C_PRIMARY)
         else:
             # 本机连过的「连接」；没连过的只能先配对，按钮就叫「配对」
             label = '连接' if _seen_before(r, ctx['known']) else '配对'
-            off = 12 if label == '配对' else 16
             # hover 与下方「连接手机」大按钮完全一致：主色填深一档 + 白字
             _round_rect(hdc, bx, by, bw, bh, 8,
                         C_PRIMARY_HOVER if hover else C_PRIMARY)
-            _draw_text(hdc, f_btn, bx + off, by + 7, label, (255, 255, 255))
+            tw, th = _text_size(hdc, f_btn, label)
+            _draw_text(hdc, f_btn, bx + (bw - tw) // 2, by + (bh - th) // 2,
+                       label, (255, 255, 255))
 
     # 设备多于能显示的行数时，右侧画一条细滚动条（滚轮滚动）
     total = len(_list_rows(ctx))
@@ -1263,18 +1271,19 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_body, PAD, hy + 2, MANUAL_TEXT,
                        C_PRIMARY_HOVER if ctx['hover'] == ID_MANUAL else C_PRIMARY)
             _draw_text(hdc, f_small, PAD + 210, hy + 5,
-                       '手机不在附近、或者找不到时，手动填 IP 和配对码', C_FAINT)
+                       '设备不在附近、或者找不到时，手动填 IP 和配对码', C_FAINT)
         else:
             prefill = ctx['pair_mode'] == 'prefill'
-            _draw_text(hdc, f_body, PAD, SEC_Y,
-                       '填写配对码' if prefill else '配对手机', C_INK)
-            hint = ('手机：%s（IP 和端口已自动填好）' % ctx['pair_label']
-                    if prefill else '手机：无线调试 → 使用配对码配对设备')
-            _draw_text(hdc, f_small, PAD + 76, SEC_Y + 3, hint, C_FAINT)
+            _draw_text(hdc, ctx['f_bold'], PAD, SEC_Y,
+                       '填写配对码' if prefill else '配对设备', C_INK)
             # 右上角「收起」
             hx, hy, hw, hh = ctx['hotspots'][ID_PAIR_CLOSE]
             _draw_text(hdc, f_small, hx, hy + 2, '收起',
                        C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
+            if prefill:
+                # 自动问到的 IP:端口 就摆在配对码框正上方，和输入框左缘对齐
+                _draw_text(hdc, f_small, EDIT_X, CODE_Y - 24,
+                           ctx['pair_label'] or '', C_SUB)
             _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
             focus = user32.GetFocus()
             targets = ((ID_CODE, CODE_Y),)
@@ -1638,8 +1647,8 @@ def _click(ctx, hid):
     if hid == ID_MANUAL:
         _set_pair_open(ctx, 'manual')
         user32.SetFocus(ctx['edits'][ID_IP])
-        _status(ctx, '把手机「无线调试」页上的 IP 和端口填进上面两个框，'
-                     '再填手机「使用配对码配对设备」页上的 6 位配对码，然后点「连接手机」。',
+        _status(ctx, '把设备「无线调试」页上的 IP 和端口填进上面两个框，'
+                     '再填设备「使用配对码配对设备」页上的 6 位配对码，然后点「连接手机」。',
                 'info')
         return
     if hid == ID_PAIR_CLOSE:
@@ -1823,7 +1832,7 @@ def _wndproc(hwnd, msg, wparam, lparam):
     if msg == WM_DESTROY:
         ctx['dead'] = True         # 工作线程看到就别再继续（关窗后不该偷偷配对）
         _notify_close(ctx)
-        for f in ('f_title', 'f_body', 'f_small', 'f_btn'):
+        for f in ('f_title', 'f_body', 'f_small', 'f_btn', 'f_bold'):
             if ctx.get(f):
                 gdi32.DeleteObject(ctx[f])
         if ctx.get('edit_br'):
@@ -1985,6 +1994,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
         ctx['f_body'] = _font_create(14, 400)
         ctx['f_small'] = _font_create(12, 400)
         ctx['f_btn'] = _font_create(13, 600)
+        ctx['f_bold'] = _font_create(14, 700)
         ctx['edit_br'] = gdi32.CreateSolidBrush(_rgb(C_EDIT_BG))
         _WINDOWS[hwnd] = ctx
         # 输入框（原生 EDIT：输入法/复制粘贴/光标全都白拿）
