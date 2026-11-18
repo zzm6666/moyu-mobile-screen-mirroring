@@ -1564,23 +1564,15 @@ def _apply_job(ctx):
         ctx['scroll'] = min(ctx.get('scroll') or 0, _max_scroll(ctx))
         _rebuild_hotspots(ctx)
         auto = ctx.pop('auto_refresh', False)
-        n_on = sum(1 for r in rows if r['state'] == 'online')
         # 一台都没发现（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对面板摊开，
         # 省得用户自己去找入口。只自动展开一次，别每次刷新都抢用户的操作。
         if not rows and not ctx.get('auto_opened') and not ctx['pair_open']:
             ctx['auto_opened'] = True
             _set_pair_open(ctx, 'manual')
-        # 自动刷新只为让列表跟上手机状态，别把用户刚看到的错误提示/成功提示顶掉
+        # 列表本身就是答案，不用再报「找到 N 台设备」（用户嫌啰嗦）。
+        # 但自动刷新别把用户刚看到的错误提示/成功提示顶掉。
         if not (auto and ctx['status_kind'] in ('err', 'ok', 'busy')):
-            if rows:
-                if n_on:
-                    _status(ctx, '找到 %d 台设备（%d 台已连接）。点未连接设备右侧的按钮即可投屏。'
-                            % (len(rows), n_on), 'info')
-                else:
-                    _status(ctx, '找到 %d 台设备，点设备右侧的按钮即可投屏。'
-                            % len(rows), 'info')
-            elif not auto:
-                _status(ctx, '', 'info')
+            _status(ctx, '', 'info')
         if ctx['log'] and not auto:
             ctx['log']('wizard: devices=%s' % ([r['serial'] for r in rows],))
         _invalidate(ctx)

@@ -333,6 +333,8 @@ class WizardSmokeTest(_Isolated):
             time.sleep(0.1)
         row = ctx['visible_rows'][0]
         self.assertEqual(row['state'], 'found')
+        self.assertNotIn('台设备', ctx['status_text'],
+                         '刷完不用再报「找到 N 台设备」，列表本身就是答案')
         self.assertFalse(connect_ui._seen_before(row, ctx['known']),
                          '这台设备不该被认为配对过')
         bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
