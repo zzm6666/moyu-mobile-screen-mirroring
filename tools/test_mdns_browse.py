@@ -218,7 +218,6 @@ class BrowseTest(unittest.TestCase):
         self.assertEqual(got, [])
 
     def test_browse_also_asks_targets_by_unicast(self):
-        # 安卓 NsdManager 的配对广播不回组播查询，必须单播问到手机 ip:5353
         sock = FakeSock([])
         mb.browse('_adb-tls-pairing._tcp', timeout=0.2, sock=sock,
                   targets=['192.168.137.144', '', None, '10.0.0.7'])
@@ -229,6 +228,31 @@ class BrowseTest(unittest.TestCase):
         self.assertNotIn(('', mb.MDNS_PORT), dests)
         # 同一轮里每个 target 只问一次
         self.assertEqual(len(dests), 1 + 2)
+
+    def test_addr_falls_back_to_packet_source(self):
+        """SRV 包不带 A 记录时用回包源地址当 IP（安卓常把 SRV 和 A 分两个包发）。"""
+        inst = 'adb-abcdef-ABCDEF._adb-tls-pairing._tcp.local'
+        host = 'Android_7P765W30.local'
+        pkt = _packet([_rec(_name(inst), mb.TYPE_SRV,
+                            struct.pack('>HHH', 0, 0, 41234) + _name(host))])
+        got = mb.browse('_adb-tls-pairing._tcp', timeout=0.2, sock=FakeSock([pkt]))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]['port'], 41234)
+        self.assertEqual(got[0]['addr'], '192.168.137.144',
+                         '没有用回包源地址兜底，发现会因「有端口没 IP」失败')
+
+    def test_bad_target_does_not_block_the_rest(self):
+        """一个非法单播目标发不出去，不能连坐它后面的目标。"""
+        class PickySock(FakeSock):
+            def sendto(self, data, addr):
+                if addr[0] == 'bad':
+                    raise OSError('invalid argument')
+                super(PickySock, self).sendto(data, addr)
+
+        sock = PickySock([])
+        mb.browse('_adb-tls-pairing._tcp', timeout=0.2, sock=sock,
+                  targets=['bad', '10.0.0.7'])
+        self.assertIn(('10.0.0.7', mb.MDNS_PORT), [a for _d, a in sock.sent])
 
 
 if __name__ == '__main__':

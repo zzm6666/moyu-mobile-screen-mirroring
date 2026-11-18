@@ -447,14 +447,17 @@ class WizardSmokeTest(unittest.TestCase):
                           '没用自动发现的配对端口：%r' % pair_cmd)
             self.assertIn('123456', pair_cmd)
             self.assertTrue(discovered, '没有调用自动发现')
-            # 发现的地址要填回输入框，让用户看到电脑找到了什么
-            # （pair 之后还要等 10 秒的「连接端口」发现窗口，所以这里要等足够久）
+            # 配对端口用过就失效，不能回填到输入框（否则下次会被当成连接端口，必然 10061）
             for _ in range(300):
-                if connect_ui._text(edits[connect_ui.ID_IP]):
+                if not ctx['busy']:
                     break
                 time.sleep(0.1)
-            self.assertEqual(connect_ui._text(edits[connect_ui.ID_IP]), '192.168.137.144')
-            self.assertEqual(connect_ui._text(edits[connect_ui.ID_PORT]), '43485')
+            self.assertEqual(connect_ui._text(edits[connect_ui.ID_IP]), '',
+                             '配对端口不该留在 IP 框里')
+            self.assertEqual(connect_ui._text(edits[connect_ui.ID_PORT]), '',
+                             '配对端口不该留在端口框里')
+            self.assertIn('192.168.137.144:43485', ctx['busy_text'],
+                          '忙碌状态里应告诉用户电脑找到了什么：%r' % ctx['busy_text'])
             connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
             self.assertTrue(closed.wait(5), 'WM_CLOSE 后 on_close 没被调用')
             t.join(5)

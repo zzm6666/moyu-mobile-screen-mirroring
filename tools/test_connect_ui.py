@@ -619,12 +619,29 @@ class DiscoverPairTargetTest(unittest.TestCase):
         browse = self.browser(srv_pairing=[{'addr': '192.168.1.9', 'port': 40000}])
         got = cu.discover_pair_target(['192.168.1.9', ''], browser=browse)
         self.assertEqual(got, '192.168.1.9:40000')
-        # 已知手机 IP 时省掉连接广播那一轮，直接单播问配对广播
-        self.assertEqual(browse.calls[0][0], '_adb-tls-pairing._tcp')
-        self.assertEqual(browse.calls[0][1], ['192.168.1.9'])
+        # 连接广播每轮都要问（历史地址可能过期），单播目标里要有已知 IP
+        self.assertEqual(browse.calls[0][0], '_adb-tls-connect._tcp')
+        self.assertEqual(browse.calls[1][0], '_adb-tls-pairing._tcp')
+        self.assertIn('192.168.1.9', browse.calls[1][1])
+
+    def test_invalid_peer_addresses_skipped(self):
+        """'...'、'1.2.3.4.5' 这类不是 IP，不能拿去当单播目标。"""
+        browse = self.browser(srv_pairing=[{'addr': '192.168.1.9', 'port': 40000}])
+        got = cu.discover_pair_target(['...', '1.2.3.4.5', '999.1.1.1'], browser=browse)
+        self.assertEqual(got, '192.168.1.9:40000')
+        self.assertEqual(browse.calls[1][1], [])
 
     def test_nothing_found_returns_empty(self):
         self.assertEqual(cu.discover_pair_target(browser=self.browser()), '')
+
+    def test_ip_only_accepts_both_forms(self):
+        self.assertEqual(cu._ip_only('192.168.1.5'), '192.168.1.5')
+        self.assertEqual(cu._ip_only('192.168.1.5:43847'), '192.168.1.5')
+        self.assertEqual(cu._ip_only('  10.0.0.7 '), '10.0.0.7')
+
+    def test_ip_only_rejects_garbage(self):
+        for bad in ('', '...', '1.2.3.4.5', '999.1.1.1', 'hello', '192.168.1'):
+            self.assertEqual(cu._ip_only(bad), '', '不该把 %r 当 IP' % bad)
 
     def test_item_without_port_ignored(self):
         browse = self.browser(srv_pairing=[{'addr': '192.168.1.5', 'port': 0}])

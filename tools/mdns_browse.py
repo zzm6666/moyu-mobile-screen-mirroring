@@ -130,6 +130,14 @@ def collect(records, data):
     host_addr = {}
     srv = {}             # 实例名 → (host, port)
     names = []
+    seen_lower = set()
+
+    def add(name):
+        # 大小写不敏感去重（key 用的是 lower，别让同名不同大小写产出两条、其中一条没端口）
+        if name and name.lower() not in seen_lower:
+            seen_lower.add(name.lower())
+            names.append(name)
+
     for name, rtype, roff, rdlen in records:
         try:
             if rtype == TYPE_A and rdlen == 4:
@@ -138,20 +146,15 @@ def collect(records, data):
                 _pri, _wt, port = struct.unpack('>HHH', data[roff:roff + 6])
                 target = _rd_name(data, roff + 6, rdlen - 6)
                 srv[name.lower()] = (target, port)
-                if name not in names:            # PTR 已经收过同一个实例就别再加一次
-                    names.append(name)
+                add(name)                # PTR 已经收过同一个实例就别再加一次
             elif rtype == TYPE_PTR:
-                target = _rd_name(data, roff, rdlen)
-                if target and target not in names:
-                    names.append(target)
+                add(_rd_name(data, roff, rdlen))
         except ValueError:
             continue
     out = []
     for instance in names:
         host, port = srv.get(instance.lower(), ('', 0))
         addr = host_addr.get(host.lower(), '')
-        if not addr and '.' not in instance:
-            addr = ''
         out.append({'name': instance, 'host': host, 'port': port, 'addr': addr})
     return [o for o in out if o['name']]
 
@@ -203,23 +206,28 @@ def browse(service_type, timeout=4.0, sock=None, now=time.time, targets=None):
     try:
         while now() < deadline:
             if now() >= next_send:
-                try:
-                    s.sendto(query, (MDNS_ADDR, MDNS_PORT))
-                    for ip in peers:
-                        s.sendto(query, (ip, MDNS_PORT))
-                except OSError:
-                    pass
+                # 每个目标单独 try：一个地址非法/发不出去，不能连坐后面的目标
+                for dest in [(MDNS_ADDR, MDNS_PORT)] + [(ip, MDNS_PORT) for ip in peers]:
+                    try:
+                        s.sendto(query, dest)
+                    except OSError:
+                        continue
                 next_send = now() + 1.0
             s.settimeout(max(0.05, min(0.3, deadline - now())))
             try:
-                data, _addr = s.recvfrom(9000)
+                data, src = s.recvfrom(9000)
             except (socket.timeout, OSError):
                 continue
+            src_ip = src[0] if src and src[0] else ''
             try:
                 records = parse_message(data)
             except ValueError:
                 continue
             for item in collect(records, data):
+                # 单播问 ip:5353 时，回包的源地址就是那台设备；SRV 包通常不带 A 记录，
+                # 而 A 记录又常单独成包——用源地址兜底，否则「有端口没 IP」会被判成没发现
+                if not item.get('addr'):
+                    item['addr'] = src_ip
                 key = item['name'].lower()
                 old = seen.get(key)
                 # 同一个实例可能先来 SRV 再来 A：合并，别丢 ip
