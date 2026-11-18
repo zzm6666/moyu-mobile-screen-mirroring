@@ -16,7 +16,9 @@
 | **设备名（display name）** | 给用户看的名字，取值优先级：营销名（`ro.product.marketname` / `ro.vendor.oplus.market.name` 等，如「一加 13」）→ `adb devices -l` 的 model → `无线设备 <ip>` 兜底。代码：`connect_ui.device_display_name`。 | 不是 serial、不是 mDNS 名 |
 | **重连（reconnect）** | 对历史/发现设备：mDNS 串号已在线→直接用；否则先试旧 `addr` connect，再按 mDNS 找同 IP 新端口 connect。代码：`connect_ui.reconnect_known`。 | 不需要重新配对 |
 | **自动连接（auto connect）** | 启动时 `try_auto_connect`：在线设备 → 配置串号 ip:端口 → mDNS 发现，三步兜底；全失败才弹向导。 | — |
-| **一键连接** | 向导里唯一的「连接手机」按钮：输入 IP:配对端口 + 配对码后，`pair_then_connect` 自动完成 pair → 找连接端口 → connect，用户无感。首次配对必须人工读手机上的 6 位码（协议限制）。 | — |
+| **连接端口广播** | 连接端口是随机端口，电脑只能靠手机的 mDNS 广播（`_adb-tls-connect._tcp`）发现它。广播可能迟到；路由器开了客户端隔离/跨网段时**永远收不到**——此时只能让用户把「无线调试」主页上的端口手动填进「端口」框。代码：`connect_ui.parse_mdns_services`。 | 不是配对端口的别名；也不是能扫描出来的固定端口 |
+| **配对端口广播** | 手机停在「使用配对码配对设备」页面（或扫码配对页）时会广播 `_adb-tls-pairing._tcp`，其中带着**配对端口**。安卓的 NsdManager 广播**不回组播查询**，必须单播问手机 `ip:5353` 才拿得到（实测组播 100 轮 0 条、单播立刻命中）。代码：`connect_ui.discover_pair_target` + `mdns_browse.browse(..., targets=[ip])`。 | 不是连接端口；组播问不到不代表手机没广播 |
+| **一键连接** | 向导里唯一的「连接手机」按钮，`connect_ui.decide_action` 分三路：只填 6 位配对码 → 先 `discover_pair_target` 自动拿到配对端口，再 `pair_then_connect`；填了 IP:端口 + 配对码 → 直接用填的；配对码**留空** → 直接 `connect_only`（已配对过时的兜底）。首次配对仍必须人工读手机上的 6 位码（协议限制）。 | 留空不是「输入不完整」，是「跳过配对」；IP:端口留空也不是错误 |
 
 ## 投屏（scrcpy）
 
