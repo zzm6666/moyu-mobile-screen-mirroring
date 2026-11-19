@@ -986,14 +986,19 @@ class QrPanelTest(_Isolated):
                 connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
                 self.assertEqual(rc.bottom, connect_ui.WIN_H_QR,
                                  '二维码模式窗口要高一些才摆得下码')
-                # 同一模式下再点一次「二维码」＝换一张新码（旧码作废）
+                # 再点一次「二维码」不再是换码（换码交给面板里的「刷新」）
                 old_creds = ctx['qr_creds']
                 _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_QR])
+                time.sleep(0.4)
+                self.assertEqual(ctx['qr_creds'], old_creds, '同一模式下不该自己换码')
+                # 点「刷新」才换一张新码
+                self.assertIn(connect_ui.ID_QR_REFRESH, ctx['hotspots'], '二维码面板没有「刷新」')
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_QR_REFRESH])
                 for _ in range(50):
                     if ctx['qr_creds'] != old_creds:
                         break
                     time.sleep(0.1)
-                self.assertNotEqual(ctx['qr_creds'], old_creds, '再点一次没换新码')
+                self.assertNotEqual(ctx['qr_creds'], old_creds, '点「刷新」没换新码')
                 self.assertTrue(ctx.get('pair_qr'))
                 # 切回配对码：窗口变回原高、输入框回来、大按钮回来
                 _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_CODE])
@@ -1007,6 +1012,10 @@ class QrPanelTest(_Isolated):
                 self.assertTrue(connect_ui.user32.IsWindowVisible(
                     ctx['edits'][connect_ui.ID_CODE]))
                 self.assertIn(connect_ui.ID_GO, ctx['hotspots'])
+                self.assertNotIn('等待设备扫码', ctx['status_text'],
+                                 '切回配对码后状态行还停在扫码提示上')
+                self.assertEqual(ctx['status_text'], connect_ui.PAIR_HINT_MANUAL,
+                                 '来回切一次，配对码模式的提示语不该变')
         finally:
             stop.set()
             self._close(hwnd, t)
