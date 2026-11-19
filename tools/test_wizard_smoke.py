@@ -861,6 +861,68 @@ class ListScrollTest(_Isolated):
         finally:
             self._close(hwnd, t)
 
+    def test_usb_tab_hides_pairing_inputs_and_keeps_panel_closed(self):
+        done = threading.Event()
+        t, hwnd, ctx = self._open(fake_runner_none, done.set)
+        try:
+            for _ in range(100):
+                if ctx.get('pair_open'):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(ctx['pair_open'], '前提：空列表先把配对面板自动摊开了')
+
+            _click_at(hwnd, ctx['hotspots'][connect_ui.ID_TAB_USB])
+            for _ in range(50):
+                if ctx['tab'] == 'usb':
+                    break
+                time.sleep(0.1)
+            self.assertEqual(ctx['tab'], 'usb')
+            # 配对面板只属于无线页：三个输入框是原生子窗口，不藏起来就会浮在
+            # USB 提示文字上面（用户就是这么看到的）
+            self.assertFalse(ctx['pair_open'], 'USB 页还挂着配对面板')
+            for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+                self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
+                                 'USB 页露出了配对输入框 %d' % eid)
+            self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'])
+            self.assertEqual(connect_ui._win_h(ctx), connect_ui.WIN_H_CLOSED)
+
+            # 切回无线页：用户没点「手动配对」，面板不该自己弹出来
+            _click_at(hwnd, ctx['hotspots'][connect_ui.ID_TAB_WIFI])
+            for _ in range(50):
+                if ctx['tab'] == 'wifi':
+                    break
+                time.sleep(0.1)
+            self.assertEqual(ctx['tab'], 'wifi')
+            time.sleep(1.2)          # 跨过一次自动刷新，别让它偷偷把面板摊开
+            self.assertFalse(ctx['pair_open'], '切回无线页时配对面板自己弹出来了')
+            for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+                self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]))
+            self.assertIn(connect_ui.ID_MANUAL, ctx['hotspots'])
+        finally:
+            self._close(hwnd, t)
+
+    def test_pair_panel_refuses_to_open_on_usb_tab(self):
+        """自动刷新/迟到的发现撞上 USB 页时，面板不能摊开（否则输入框糊在 USB 页上）。"""
+        done = threading.Event()
+        t, hwnd, ctx = self._open(fake_runner_none, done.set)
+        try:
+            for _ in range(100):
+                if ctx.get('auto_opened'):
+                    break
+                time.sleep(0.1)
+            _click_at(hwnd, ctx['hotspots'][connect_ui.ID_TAB_USB])
+            for _ in range(50):
+                if ctx['tab'] == 'usb':
+                    break
+                time.sleep(0.1)
+            connect_ui._set_pair_open(ctx, 'manual')
+            self.assertFalse(ctx['pair_open'], 'USB 页被摊开了配对面板')
+            for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+                self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
+                                 'USB 页露出了配对输入框 %d' % eid)
+        finally:
+            self._close(hwnd, t)
+
     def test_empty_list_opens_pairing_panel_by_itself(self):
         done = threading.Event()
         t, hwnd, ctx = self._open(fake_runner_none, done.set)

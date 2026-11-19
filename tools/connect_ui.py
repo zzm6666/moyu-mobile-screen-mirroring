@@ -507,18 +507,22 @@ def _set_pair_open(ctx, mode='', addr=''):
 
     prefill 时 IP、端口 两个框直接藏起来（已经填好，用户不用看也不用改），
     面板标题只说「填写配对码」；manual 时三个框都摆出来。
+
+    面板只属于无线页：在 USB 页调进来也一律按收起处理——三个输入框是原生子窗口，
+    不藏起来就会浮在 USB 提示文字上面（用户报过这个）。
     """
-    ctx['pair_open'] = bool(mode)
+    on = bool(mode) and ctx.get('tab', 'wifi') == 'wifi'
+    ctx['pair_open'] = on
     ctx['pair_mode'] = mode
     ctx['pair_label'] = addr
     ctx['scroll'] = 0                # 面板高度变了，列表回到顶部，免得停在半截
-    show_ip = mode == 'manual'
+    show_ip = on and mode == 'manual'
     if show_ip:                     # 手动填：把上次留下的 IP/端口 清空，别让旧值误导
         for eid in (ID_IP, ID_PORT):
             eh = ctx['edits'].get(eid)
             if eh:
                 user32.SendMessageW(eh, WM_SETTEXT, 0, ctypes.c_wchar_p(''))
-    for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, bool(mode))):
+    for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, on)):
         eh = ctx['edits'].get(eid)
         if eh:
             user32.ShowWindow(eh, 5 if visible else 0)   # SW_SHOW / SW_HIDE
@@ -1574,11 +1578,14 @@ def _apply_job(ctx):
         _rebuild_hotspots(ctx)
         auto = ctx.pop('auto_refresh', False)
         # 一台能操作的设备都没有（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对
-        # 面板摊开，省得用户自己去找入口。只自动展开一次，别每次刷新都抢用户的操作。
+        # 面板摊开，省得用户自己去找入口。只判断一次，别每次刷新都抢用户的操作。
         # 注意要看「看得见的行」：历史里那些离线设备不算，它们根本不在列表里。
-        if not _list_rows(ctx) and not ctx.get('auto_opened') and not ctx['pair_open']:
+        # 空列表是在 USB 页时才发现的就什么都不做——配对面板只属于无线页，
+        # 摊开它会让三个输入框糊在 USB 页面上（用户就是这么看到的）。
+        if not _list_rows(ctx) and not ctx.get('auto_opened'):
             ctx['auto_opened'] = True
-            _set_pair_open(ctx, 'manual')
+            if ctx['tab'] == 'wifi' and not ctx['pair_open']:
+                _set_pair_open(ctx, 'manual')
         # 列表本身就是答案，不用再报「找到 N 台设备」（用户嫌啰嗦）。
         # 只有用户自己点刷新才清空状态行：自动刷新（每 3 秒）绝不能把
         # 用户刚看到的提示清掉——之前「点手动配对后提示一闪就没」就是这么来的。
