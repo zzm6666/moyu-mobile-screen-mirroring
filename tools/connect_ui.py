@@ -1056,7 +1056,7 @@ LIST_H = ROW_H * MAX_ROWS
 MAX_ROWS_FULL = 6                      # 配对面板收起时列表占满下方空白，能多看两台
 LIST_H_FULL = ROW_H * MAX_ROWS_FULL
 SEC_Y = LIST_Y + LIST_H + 16          # 配对面板标题（收起时是「手动配对」链接）
-IP_Y = SEC_Y + 30
+IP_Y = SEC_Y + 38                      # 与上面「配对码/二维码」那一行留出呼吸空间
 CODE_Y = IP_Y + 40
 GO_Y = CODE_Y + 44
 MANUAL_TEXT = '设备不在列表里？手动配对'
@@ -1758,15 +1758,8 @@ def _apply_job(ctx):
         ctx['scroll'] = min(ctx.get('scroll') or 0, _max_scroll(ctx))
         _rebuild_hotspots(ctx)
         auto = ctx.pop('auto_refresh', False)
-        # 一台能操作的设备都没有（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对
-        # 面板摊开，省得用户自己去找入口。只判断一次，别每次刷新都抢用户的操作。
-        # 注意要看「看得见的行」：历史里那些离线设备不算，它们根本不在列表里。
-        # 空列表是在 USB 页时才发现的就什么都不做——配对面板只属于无线页，
-        # 摊开它会让三个输入框糊在 USB 页面上（用户就是这么看到的）。
-        if not _list_rows(ctx) and not ctx.get('auto_opened'):
-            ctx['auto_opened'] = True
-            if ctx['tab'] == 'wifi' and not ctx['pair_open']:
-                _set_pair_open(ctx, 'manual')
+        # 一台能操作的设备都没有也什么都不做：配对面板要用户自己点「手动配对」才出现
+        # （用户要求：打开窗口时只看到设备列表，别塞一个配对表单过来）。
         # 列表本身就是答案，不用再报「找到 N 台设备」（用户嫌啰嗦）。
         # 只有用户自己点刷新才清空状态行：自动刷新（每 3 秒）绝不能把
         # 用户刚看到的提示清掉——之前「点手动配对后提示一闪就没」就是这么来的。
@@ -2195,7 +2188,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'queued': None, 'auto_refresh': False,
                'pair_open': False, 'pair_mode': '', 'pair_label': '',
                'pair_qr': False, 'qr_creds': (), 'qr_rows': [], 'qr_cancel': False,
-               'scroll': 0, 'auto_opened': False}
+               'scroll': 0}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)
         ctx['f_small'] = _font_create(12, 400)

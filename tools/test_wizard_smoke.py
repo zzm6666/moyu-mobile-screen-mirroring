@@ -435,7 +435,7 @@ class WizardSmokeTest(_Isolated):
         self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
         ctx = connect_ui._WINDOWS[hwnd]
         for _ in range(80):
-            if ctx['pair_open']:
+            if ctx['rows']:
                 break
             time.sleep(0.1)
         self.assertTrue([r for r in ctx['rows'] if r['state'] == 'offline'],
@@ -444,8 +444,7 @@ class WizardSmokeTest(_Isolated):
                          '但列表里一台都不该显示：%r' % (ctx['visible_rows'],))
         self.assertEqual(ctx['hotspots'].get(connect_ui.ID_ROW_BASE), None,
                          '没行就不该有行内按钮热点')
-        self.assertTrue(ctx['pair_open'], '一台能操作的设备都没有时应自动摊开配对面板')
-        self.assertEqual(ctx['pair_mode'], 'manual')
+        self.assertFalse(ctx['pair_open'], '一台能操作的设备都没有也不该自己摊开配对面板')
         connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         self.assertTrue(closed.wait(5))
         t.join(5)
@@ -802,13 +801,14 @@ def _wheel(hwnd, client_x, client_y, notches):
 
 
 def _wait_refresh(ctx, timeout=10):
-    """等第一次自动刷新落盘（rows 有内容或确认是空列表）。"""
-    for _ in range(int(timeout / 0.1)):
-        if not ctx['busy'] and ctx['rows']:
+    """等第一次刷新落盘：忙起来又落下就说明结果到了（空列表也一样）。"""
+    saw_busy = False
+    for _ in range(int(timeout / 0.05)):
+        if ctx['busy']:
+            saw_busy = True
+        elif saw_busy:
             return
-        if ctx.get('auto_opened'):
-            return
-        time.sleep(0.1)
+        time.sleep(0.05)
 
 
 class ListScrollTest(_Isolated):
@@ -866,11 +866,14 @@ class ListScrollTest(_Isolated):
         done = threading.Event()
         t, hwnd, ctx = self._open(fake_runner_none, done.set)
         try:
+            _wait_refresh(ctx)
+            self.assertFalse(ctx['pair_open'], '列表是空的也不该自己摊开配对面板')
+            _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MANUAL])
             for _ in range(100):
                 if ctx.get('pair_open'):
                     break
                 time.sleep(0.1)
-            self.assertTrue(ctx['pair_open'], '前提：空列表先把配对面板自动摊开了')
+            self.assertTrue(ctx['pair_open'], '点「手动配对」没打开面板')
 
             _click_at(hwnd, ctx['hotspots'][connect_ui.ID_TAB_USB])
             for _ in range(50):
@@ -907,10 +910,7 @@ class ListScrollTest(_Isolated):
         done = threading.Event()
         t, hwnd, ctx = self._open(fake_runner_none, done.set)
         try:
-            for _ in range(100):
-                if ctx.get('auto_opened'):
-                    break
-                time.sleep(0.1)
+            _wait_refresh(ctx)
             _click_at(hwnd, ctx['hotspots'][connect_ui.ID_TAB_USB])
             for _ in range(50):
                 if ctx['tab'] == 'usb':
@@ -924,18 +924,18 @@ class ListScrollTest(_Isolated):
         finally:
             self._close(hwnd, t)
 
-    def test_empty_list_opens_pairing_panel_by_itself(self):
+    def test_empty_list_keeps_panel_closed(self):
+        """打开窗口时一台设备都没有：只看到列表空态和「手动配对」链接，别塞表单过来。"""
         done = threading.Event()
         t, hwnd, ctx = self._open(fake_runner_none, done.set)
         try:
-            for _ in range(100):
-                if ctx.get('pair_open'):
-                    break
-                time.sleep(0.1)
-            self.assertTrue(ctx['pair_open'], '一台设备都没发现却没自动摊开配对面板')
-            self.assertEqual(ctx['pair_mode'], 'manual')
-            self.assertTrue(ctx['auto_opened'])
-            self.assertIn(connect_ui.ID_GO, ctx['hotspots'])
+            _wait_refresh(ctx)
+            self.assertFalse(ctx['pair_open'], '空列表把配对面板自己摊开了')
+            self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'])
+            self.assertIn(connect_ui.ID_MANUAL, ctx['hotspots'])
+            for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+                self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]))
+            self.assertEqual(connect_ui._win_h(ctx), connect_ui.WIN_H_CLOSED)
         finally:
             self._close(hwnd, t)
 
