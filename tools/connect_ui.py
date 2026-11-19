@@ -21,6 +21,7 @@ import ctypes.wintypes as wt
 import inspect
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -30,6 +31,11 @@ try:                      # 自动发现手机配对端口（纯标准库 mDNS �
     import mdns_browse
 except Exception:         # 环境里没有这个模块时，退化为「只能手填 IP:端口」
     mdns_browse = None
+
+try:                      # 二维码配对：只需要把 QR 载荷算成矩阵，画图还是自己用 GDI
+    import segno
+except Exception:         # 没有这个模块时，面板里只保留「配对码」一种方式
+    segno = None
 
 CREATE_NO_WINDOW = 0x08000000
 IP_PORT_RE = re.compile(r'^[\d.]+:\d+$')
@@ -87,6 +93,7 @@ ID_TAB_WIFI, ID_TAB_USB = 1101, 1102
 ID_REFRESH = 1103
 ID_MANUAL = 1104                 # 配对面板收起时的「手动配对」链接
 ID_PAIR_CLOSE = 1105             # 配对面板右上角「收起」
+ID_MODE_CODE, ID_MODE_QR = 1106, 1107   # 配对面板里「配对码 / 二维码」切换
 ID_ROW_BASE = 1200               # 设备行「连接」按钮：ID_ROW_BASE + 行号
 
 _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
@@ -512,17 +519,22 @@ def _set_pair_open(ctx, mode='', addr=''):
     不藏起来就会浮在 USB 提示文字上面（用户报过这个）。
     """
     on = bool(mode) and ctx.get('tab', 'wifi') == 'wifi'
+    if not on:
+        # 收起或离开无线页：正在等的扫码任务也作废，别再让后台线程等下去
+        ctx['pair_qr'] = False
+        ctx['qr_cancel'] = True
     ctx['pair_open'] = on
     ctx['pair_mode'] = mode
     ctx['pair_label'] = addr
     ctx['scroll'] = 0                # 面板高度变了，列表回到顶部，免得停在半截
-    show_ip = on and mode == 'manual'
+    qr = on and bool(ctx.get('pair_qr'))
+    show_ip = on and mode == 'manual' and not qr
     if show_ip:                     # 手动填：把上次留下的 IP/端口 清空，别让旧值误导
         for eid in (ID_IP, ID_PORT):
             eh = ctx['edits'].get(eid)
             if eh:
                 user32.SendMessageW(eh, WM_SETTEXT, 0, ctypes.c_wchar_p(''))
-    for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, on)):
+    for eid, visible in ((ID_IP, show_ip), (ID_PORT, show_ip), (ID_CODE, on and not qr)):
         eh = ctx['edits'].get(eid)
         if eh:
             user32.ShowWindow(eh, 5 if visible else 0)   # SW_SHOW / SW_HIDE
@@ -530,6 +542,40 @@ def _set_pair_open(ctx, mode='', addr=''):
     _fit_client(ctx['hwnd'], WIN_W, _win_h(ctx))
     _rebuild_hotspots(ctx)
     _invalidate(ctx)
+
+
+def _set_pair_kind(ctx, qr):
+    """面板里在「配对码 / 二维码」之间切换。
+
+    进二维码：现生成一对服务名+口令，画码，然后开一个后台任务等设备扫；
+    切回配对码随时可以（正在等扫码的那个任务会被取消），进二维码则要等手头
+    的配对/刷新先结束，免得互相抢 adb。
+    """
+    if qr:
+        # 每 3 秒的静默刷新也在忙，但它马上就结束：照样让用户切到二维码（任务排队等它）。
+        # 已经在二维码模式里再点一次＝换一张新码，这种情况放行（旧任务会被取消）。
+        if ctx['busy'] and not ctx.get('auto_refresh') and not ctx.get('pair_qr'):
+            return
+    else:
+        ctx['qr_cancel'] = True     # 让等待扫码的后台任务自己退出
+        if ctx['busy']:
+            ctx['busy_text'] = '正在切回配对码'
+    if not qr:
+        ctx['pair_qr'] = False
+        _set_pair_open(ctx, ctx['pair_mode'] or 'manual', ctx['pair_label'])
+        _status(ctx, '把设备上显示的 6 位配对码填进「配对码」框，再点「连接设备」。', 'info')
+        return
+    if segno is None:
+        _status(ctx, '这台电脑缺少二维码组件，先用配对码吧。', 'err')
+        return
+    if ctx.get('pair_qr'):
+        ctx['qr_cancel'] = True     # 换一张码：先让上一个等待任务自己退出
+    service, password = qr_credentials()
+    ctx['pair_qr'] = True
+    ctx['qr_creds'] = (service, password)
+    ctx['qr_rows'] = qr_rows(service, password)
+    _set_pair_open(ctx, ctx['pair_mode'] or 'manual', ctx['pair_label'])
+    _start_job(ctx, 'qr', (service, password), busy_text='等待设备扫码')
 
 
 def _prefill_pair(ctx, row):
@@ -540,6 +586,9 @@ def _prefill_pair(ctx, row):
     端口用，配对必然失败——所以这里只留 IP，端口交给 `discover_pair_target` 现问设备。
     """
     ip = _ip_of(row.get('addr') or '')
+    # 点的是具体某一台设备：从二维码模式回到配对码模式，别再让后台等着扫码
+    ctx['pair_qr'] = False
+    ctx['qr_cancel'] = True
     for eid, text in ((ID_IP, ip), (ID_PORT, '')):
         user32.SendMessageW(ctx['edits'][eid], WM_SETTEXT, 0,
                             ctypes.c_wchar_p(text))
@@ -572,7 +621,9 @@ def _last_known_name(known):
     """历史里最近连过的那台设备叫什么（空列表里提一句用），没有就返回 ''。"""
     for k in known or ():
         name = (k.get('name') or '').strip()
-        if name and not _is_junk_name(name, k.get('serial') or ''):
+        if not name or name.startswith('无线设备'):
+            continue                 # 「无线设备 / 无线设备 <ip>」是兜底名，提了等于没说
+        if not _is_junk_name(name, k.get('serial') or ''):
             return name
     return ''
 
@@ -727,6 +778,13 @@ def try_auto_connect(adb, cfg_serial, runner=run_cmd):
 
 
 PAIR_DISCOVER_SECS = 10      # 配对成功后等手机广播「连接端口」的秒数
+QR_WAIT_SECS = 120           # 扫码配对：等用户扫完码的最长时间（秒）
+QR_SERVICE_PREFIX = 'MOYU-'
+QR_NAME_LEN = 6              # 服务名随机后缀位数（手机把它当 mDNS 实例名的前缀广播回来）
+QR_PASS_LEN = 10             # 配对口令位数
+# 避开 0/o/1/l/i 这类看着像的字符：口令是照着屏幕核对的东西，别让用户自己看错
+QR_NAME_CHARS = 'abcdefghijkmnpqrstuvwxyz23456789'
+QR_PASS_CHARS = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 
 PAIR_SETUP_SECS = 6          # 在手机「使用配对码配对设备」页面等配对端口的秒数
@@ -749,13 +807,15 @@ def _ip_only(text):
     return ip if _is_ip(ip) else ''
 
 
-def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None):
+def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None,
+                         name=''):
     """自动找手机的**配对端口**，返回 'ip:port'；找不到返回 ''。
 
     手机停在「使用配对码配对设备」页面时会广播 `_adb-tls-pairing._tcp`，
     但安卓的 NsdManager 广播**不回组播查询**，必须单播问手机 ip:5353 ——
     所以先用连接广播把手头没有的手机 IP 补齐（它组播就能问到），再逐台单播问配对端口。
     browser: 可注入（默认 mdns_browse.browse），返回 [{'name','host','port','addr'}]。
+    name: 只认实例名里含这段文字的那条广播（扫码配对时用我们自己的服务名匹配）。
     """
     if mdns_browse is None and browser is None:
         return ''
@@ -771,6 +831,8 @@ def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None):
         if ip and ip not in ips and _is_ip(ip):
             ips.append(ip)
     for it in browse('_adb-tls-pairing._tcp', timeout=timeout, targets=ips):
+        if name and name not in (it.get('name') or ''):
+            continue
         ip, port = it.get('addr') or '', it.get('port') or 0
         if _is_ip(ip) and port:
             return '%s:%s' % (ip, port)
@@ -817,6 +879,50 @@ def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
                    '（能看到「IP 地址和端口」那一页）停留几秒让电脑自动连；'
                    '若还是连不上，把那一页上的「端口」填到上面的端口框、配对码留空，'
                    '再点一次「连接设备」。'), ''
+
+
+def qr_credentials(rnd=None):
+    """扫码配对用的服务名后缀和口令：都是我们说了算，手机只负责把名字广播回来。"""
+    r = rnd or random.SystemRandom()
+    service = QR_SERVICE_PREFIX + ''.join(r.choice(QR_NAME_CHARS) for _ in range(QR_NAME_LEN))
+    password = ''.join(r.choice(QR_PASS_CHARS) for _ in range(QR_PASS_LEN))
+    return service, password
+
+
+def qr_payload(service, password):
+    """二维码里的载荷格式（安卓「扫描二维码」页认的就是这个）。"""
+    return 'WIFI:T:ADB;S:%s;P:%s;;' % (service, password)
+
+
+def qr_rows(service, password):
+    """把载荷算成二维码矩阵（每行一串 0/1，已含 4 模块静区）；没有 segno 时返回 []。"""
+    if segno is None:
+        return []
+    qr = segno.make(qr_payload(service, password), error='m')
+    return [tuple(row) for row in qr.matrix_iter(border=4)]
+
+
+def qr_pair(adb, service, password, runner=run_cmd, log=None, wait=QR_WAIT_SECS,
+            browser=None, cancel=None, peers=()):
+    """扫码配对：等手机扫我们生成的码，拿到它广播的配对端口后配对 + 连接。
+
+    手机扫完码会用**我们的服务名**广播 `_adb-tls-pairing._tcp`（端口随机），
+    所以这里按名字匹配而不是按 IP——用户不用告诉电脑手机在哪。
+    cancel: 可选回调，返回 True 表示用户在界面上已经放弃（关窗/切回配对码）。
+    peers: 已知的手机 IP，拿来单播问配对端口（组播被路由器挡住时的兜底）。
+    """
+    deadline = time.time() + max(1, wait)
+    while time.time() < deadline:
+        if cancel and cancel():
+            return False, '已取消扫码配对。', ''
+        target = discover_pair_target(peers, timeout=2, browser=browser, name=service)
+        if target:
+            if log:
+                log('wizard: 扫码配对目标 %r' % (target,))
+            return pair_then_connect(adb, target, password, runner, log)
+        time.sleep(0.5)
+    return False, ('没扫到码。请让设备停在「使用配对码配对设备」页面，点「扫描二维码」'
+                   '对着电脑上的码扫一次，扫上后再等 1-2 秒。'), ''
 
 
 def decide_action(ip, port, code):
@@ -958,6 +1064,11 @@ SUCCESS_CLOSE_MS = 1000         # 「连接成功」toast 停留时长，之后�
 AUTO_REFRESH_MS = 3000          # 向导开着时每 3 秒悄悄刷新一次设备列表
 AUTO_REFRESH_TIMER = 3          # 该刷新用的 WM_TIMER id
 GO_H = 40
+# 扫码模式：没有输入框和大按钮，面板里摆二维码 + 一句提示，窗口跟着变高
+QR_SIZE = 148                          # 二维码边长（37 模块 × 4px，整数倍最清晰）
+WIN_H_QR = 572                         # 二维码模式：摆得下码 + 一行状态，底部不留空白
+MODE_CHIP_W, MODE_CHIP_H = 58, 22      # 「配对码 / 二维码」小分段按钮
+MODE_CHIP_Y = SEC_Y - 3
 USB_HINT_Y = LIST_Y + LIST_H_FULL + 16
 EDIT_X = PAD + 64                     # 输入框左缘（标签右侧）
 IP_W = 176                            # IP 框宽（适量，不拉满）
@@ -1091,8 +1202,10 @@ def _max_rows(ctx):
 
 
 def _win_h(ctx):
-    """窗口高度：面板收起时矮一点（没有大按钮和输入框），展开时回到全高。"""
-    return WIN_H if ctx.get('pair_open') else WIN_H_CLOSED
+    """窗口高度：面板收起时矮一点；二维码模式要摆下二维码，比配对码模式更高。"""
+    if not ctx.get('pair_open'):
+        return WIN_H_CLOSED
+    return WIN_H_QR if ctx.get('pair_qr') else WIN_H
 
 
 def _fit_client(hwnd, w, h):
@@ -1152,11 +1265,33 @@ def _rebuild_hotspots(ctx):
     hs[ID_REFRESH] = (WIN_W - PAD - 64, TAB_Y + 4, 64, 26)
     if ctx['tab'] == 'wifi':
         if ctx.get('pair_open'):
-            hs[ID_GO] = (PAD, GO_Y, WIN_W - 2 * PAD, GO_H)
-            hs[ID_PAIR_CLOSE] = (WIN_W - PAD - 40, SEC_Y - 4, 40, 24)
+            if not ctx.get('pair_qr'):
+                hs[ID_GO] = (PAD, GO_Y, WIN_W - 2 * PAD, GO_H)
+            # 面板右上一排：［配对码］［二维码］ 收起
+            close_x = WIN_W - PAD - 40
+            qr_x = close_x - 12 - MODE_CHIP_W
+            code_x = qr_x - 6 - MODE_CHIP_W
+            hs[ID_MODE_CODE] = (code_x, MODE_CHIP_Y, MODE_CHIP_W, MODE_CHIP_H)
+            hs[ID_MODE_QR] = (qr_x, MODE_CHIP_Y, MODE_CHIP_W, MODE_CHIP_H)
+            hs[ID_PAIR_CLOSE] = (close_x, SEC_Y - 4, 40, 24)
         else:
             hs[ID_MANUAL] = (PAD, _pair_link_y(ctx) - 4, 196, 26)
     ctx['hotspots'] = hs
+
+
+def _draw_qr(hdc, ctx, x, y):
+    """把二维码矩阵画成一格格方块（矩阵里已含 4 模块静区）。"""
+    rows = ctx.get('qr_rows') or []
+    if not rows:
+        return
+    n = len(rows)
+    s = max(1, QR_SIZE // n)          # 整数倍缩放，屏幕上看不出锯齿
+    side = s * n
+    _fill_rect(hdc, x, y, side, side, C_SURFACE)
+    for j, row in enumerate(rows):
+        for i, dark in enumerate(row):
+            if dark:
+                _fill_rect(hdc, x + i * s, y + j * s, s, s, C_INK)
 
 
 def _paint(ctx, hdc):
@@ -1300,59 +1435,79 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_small, PAD + 210, hy + 5,
                        '设备不在附近、或者找不到时，手动填 IP 和配对码', C_FAINT)
         else:
+            qr = bool(ctx.get('pair_qr'))
             prefill = ctx['pair_mode'] == 'prefill'
             _draw_text(hdc, ctx['f_bold'], PAD, SEC_Y,
-                       '填写配对码' if prefill else '配对设备', C_INK)
-            # 右上角「收起」
+                       '扫码配对' if qr else ('填写配对码' if prefill else '配对设备'),
+                       C_INK)
+            # 右上一排：［配对码］［二维码］ 收起
+            for mid, mlabel in ((ID_MODE_CODE, '配对码'), (ID_MODE_QR, '二维码')):
+                mx, my, mw, mh = ctx['hotspots'][mid]
+                mtw = _text_size(hdc, f_small, mlabel)[0]
+                if (mid == ID_MODE_QR) == qr:
+                    _round_rect(hdc, mx, my, mw, mh, 8, C_PRIMARY_LT)
+                    _draw_text(hdc, f_small, mx + (mw - mtw) // 2, my + 4, mlabel, C_PRIMARY)
+                else:
+                    _round_rect(hdc, mx, my, mw, mh, 8,
+                                C_HOVER if ctx['hover'] == mid else C_SURFACE, C_LINE)
+                    _draw_text(hdc, f_small, mx + (mw - mtw) // 2, my + 4, mlabel, C_SUB)
             hx, hy, hw, hh = ctx['hotspots'][ID_PAIR_CLOSE]
             _draw_text(hdc, f_small, hx, hy + 2, '收起',
                        C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
-            if prefill:
-                # 已知的设备地址摆在配对码框正上方：标签与「配对码」左对齐，值跟输入框对齐。
-                # 只有 IP（配对端口要到配对时才问设备）就只写「IP」。
-                label = ctx['pair_label'] or ''
-                _draw_text(hdc, f_small, PAD, CODE_Y - 24,
-                           'IP和端口：' if ':' in label else 'IP：', C_SUB)
-                _draw_text(hdc, f_small, EDIT_X, CODE_Y - 24,
-                           label, C_SUB)
-            _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
-            focus = user32.GetFocus()
-            targets = ((ID_CODE, CODE_Y),)
-            if not prefill:
-                _draw_text(hdc, f_small, PAD, IP_Y + 2, 'IP 端口', C_SUB)
-                # IP 与端口之间的冒号（两个输入框同一行，用户不用输「:」）
-                cw, ch = _text_size(hdc, f_body, ':')
-                colon_x = EDIT_X + IP_W + (2 * COLON_GAP - cw) // 2
-                _draw_text(hdc, f_body, colon_x, IP_Y + (EDIT_H - ch) // 2, ':', C_SUB)
-                targets = ((ID_IP, IP_Y), (ID_PORT, IP_Y), (ID_CODE, CODE_Y))
-            # EDIT 边框（焦点时主色）
-            for eid, ey in targets:
-                eh = ctx['edits'][eid]
-                rc = wt.RECT()
-                user32.GetWindowRect(eh, ctypes.byref(rc))
-                pt = wt.POINT(rc.left, rc.top)
-                user32.ScreenToClient(ctx['hwnd'], ctypes.byref(pt))
-                ew = rc.right - rc.left
-                line = C_EDIT_FOCUS if focus == eh else C_EDIT_LINE
-                _round_rect(hdc, pt.x - 2, pt.y - 2, ew + 4, EDIT_H + 4, 6,
-                            C_EDIT_BG, line)
-            # 唯一的大按钮（后台自动刷新不算「正在连接」，别让按钮自己闪）
-            gx, gy, gw, gh = ctx['hotspots'][ID_GO]
-            hover = ctx['hover'] == ID_GO
-            busy = ctx['busy'] and ctx['busy_row'] is None and not ctx.get('auto_refresh')
-            if busy:
-                dots = '.' * (1 + ctx['tick'] % 3)
-                label = ctx['busy_text'] + dots
-                _round_rect(hdc, gx, gy, gw, gh, 10, C_PRIMARY_LT)
-                tw = _text_size(hdc, f_btn, label)[0]
-                _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, C_PRIMARY)
+            if qr:
+                _draw_qr(hdc, ctx, PAD, IP_Y)
+                hint = ('设备上打开「无线调试 → 使用配对码配对设备 → 扫描二维码」，'
+                        '对着左边的码扫一次，电脑会自动配对并连接。')
+                for i, ln in enumerate(_wrap_text(hdc, f_small, hint,
+                                                  WIN_W - PAD - (PAD + QR_SIZE + 16))[:6]):
+                    _draw_text(hdc, f_small, PAD + QR_SIZE + 16, IP_Y + 6 + i * 20, ln, C_SUB)
             else:
-                _round_rect(hdc, gx, gy, gw, gh, 10,
-                            C_PRIMARY_DK if ctx['pressed'] == ID_GO
-                            else (C_PRIMARY_HOVER if hover else C_PRIMARY))
-                label = '连接设备'
-                tw = _text_size(hdc, f_btn, label)[0]
-                _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
+                if prefill:
+                    # 已知的设备地址摆在配对码框正上方：标签与「配对码」左对齐，值跟输入框对齐。
+                    # 只有 IP（配对端口要到配对时才问设备）就只写「IP」。
+                    label = ctx['pair_label'] or ''
+                    _draw_text(hdc, f_small, PAD, CODE_Y - 24,
+                               'IP和端口：' if ':' in label else 'IP：', C_SUB)
+                    _draw_text(hdc, f_small, EDIT_X, CODE_Y - 24,
+                               label, C_SUB)
+                _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
+                focus = user32.GetFocus()
+                targets = ((ID_CODE, CODE_Y),)
+                if not prefill:
+                    _draw_text(hdc, f_small, PAD, IP_Y + 2, 'IP 端口', C_SUB)
+                    # IP 与端口之间的冒号（两个输入框同一行，用户不用输「:」）
+                    cw, ch = _text_size(hdc, f_body, ':')
+                    colon_x = EDIT_X + IP_W + (2 * COLON_GAP - cw) // 2
+                    _draw_text(hdc, f_body, colon_x, IP_Y + (EDIT_H - ch) // 2, ':', C_SUB)
+                    targets = ((ID_IP, IP_Y), (ID_PORT, IP_Y), (ID_CODE, CODE_Y))
+                # EDIT 边框（焦点时主色）
+                for eid, ey in targets:
+                    eh = ctx['edits'][eid]
+                    rc = wt.RECT()
+                    user32.GetWindowRect(eh, ctypes.byref(rc))
+                    pt = wt.POINT(rc.left, rc.top)
+                    user32.ScreenToClient(ctx['hwnd'], ctypes.byref(pt))
+                    ew = rc.right - rc.left
+                    line = C_EDIT_FOCUS if focus == eh else C_EDIT_LINE
+                    _round_rect(hdc, pt.x - 2, pt.y - 2, ew + 4, EDIT_H + 4, 6,
+                                C_EDIT_BG, line)
+                # 唯一的大按钮（后台自动刷新不算「正在连接」，别让按钮自己闪）
+                gx, gy, gw, gh = ctx['hotspots'][ID_GO]
+                hover = ctx['hover'] == ID_GO
+                busy = ctx['busy'] and ctx['busy_row'] is None and not ctx.get('auto_refresh')
+                if busy:
+                    dots = '.' * (1 + ctx['tick'] % 3)
+                    label = ctx['busy_text'] + dots
+                    _round_rect(hdc, gx, gy, gw, gh, 10, C_PRIMARY_LT)
+                    tw = _text_size(hdc, f_btn, label)[0]
+                    _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, C_PRIMARY)
+                else:
+                    _round_rect(hdc, gx, gy, gw, gh, 10,
+                                C_PRIMARY_DK if ctx['pressed'] == ID_GO
+                                else (C_PRIMARY_HOVER if hover else C_PRIMARY))
+                    label = '连接设备'
+                    tw = _text_size(hdc, f_btn, label)[0]
+                    _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
     else:
         _draw_text(hdc, f_small, PAD, USB_HINT_Y,
                    '提示：手机上弹出「允许 USB 调试」时勾选「一律允许」，以后即插即用。', C_FAINT)
@@ -1366,7 +1521,12 @@ def _paint(ctx, hdc):
         bg = {'err': C_ERR_LT, 'ok': C_OK_LT, 'busy': C_PRIMARY_LT}.get(kind, C_BG)
         lines = _wrap_text(hdc, f_small, st, W - 2 * PAD - 24)
         bh = 12 + len(lines) * 18
-        floor = (GO_Y + GO_H + 8) if ctx['pair_open'] else (_pair_link_y(ctx) + 22)
+        if ctx.get('pair_qr'):
+            floor = IP_Y + QR_SIZE + 12          # 扫码模式没有大按钮，状态行贴着二维码下方
+        elif ctx['pair_open']:
+            floor = GO_Y + GO_H + 8
+        else:
+            floor = _pair_link_y(ctx) + 22
         sy = max(floor, H - 12 - bh)
         _round_rect(hdc, PAD, sy, W - 2 * PAD, bh, 8, bg)
         for i, ln in enumerate(lines):
@@ -1532,6 +1692,19 @@ def _worker_job(ctx, kind, payload):
         elif kind == 'connect':
             ok, msg, serial = connect_only(ctx['adb'], payload, ctx['runner'])
             ctx['job'] = ('connect', (ok, msg, serial), '')
+        elif kind == 'qr':
+            # 扫码配对：等设备扫我们的码，期间用户可能切回配对码/收起/关窗
+            service, password = payload
+            ok, msg, serial = qr_pair(
+                ctx['adb'], service, password, ctx['runner'], ctx['log'],
+                cancel=lambda: bool(ctx.get('qr_cancel') or ctx.get('dead')),
+                peers=_peer_ips(ctx))
+            if ctx.get('dead') or (not ok and msg == '已取消扫码配对。'):
+                # 窗口关了/用户切回配对码：任务只是收尾，别报错也别继续校正串号
+                ctx['job'] = ('idle', '', '')
+                user32.PostMessageW(ctx['hwnd'], WM_APP_JOB, 0, 0)
+                return
+            ctx['job'] = ('qr', (ok, msg, serial), '')
         elif kind == 'reconnect':
             ok, msg, serial = reconnect_known(ctx['adb'], payload, ctx['runner'])
             ctx['job'] = ('reconnect', (ok, msg, serial), '')
@@ -1565,6 +1738,8 @@ def _apply_job(ctx):
     user32.KillTimer(ctx['hwnd'], 1)
     ctx['busy'] = False
     ctx['busy_row'] = None
+    if kind == 'idle':        # 等扫码的任务被取消/窗口已关：只收尾，不报错
+        return
     if job[2]:   # 工作线程抛异常（refresh 也算，不能静默当成 0 台设备）
         if ctx['log']:
             ctx['log']('wizard: %s 异常 %s' % (kind, job[2]))
@@ -1685,6 +1860,12 @@ def _click(ctx, hid):
     if hid == ID_PAIR_CLOSE:
         _set_pair_open(ctx, '')
         _status(ctx, '', 'info')
+        return
+    if hid == ID_MODE_CODE:
+        _set_pair_kind(ctx, False)
+        return
+    if hid == ID_MODE_QR:
+        _set_pair_kind(ctx, True)
         return
     if hid == ID_GO:
         if not ctx['pair_open']:   # 面板收着时这个按钮不存在
@@ -2007,6 +2188,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'toast': '', 'closing': False, 'dead': False, 'typed_ip': '',
                'queued': None, 'auto_refresh': False,
                'pair_open': False, 'pair_mode': '', 'pair_label': '',
+               'pair_qr': False, 'qr_creds': (), 'qr_rows': [], 'qr_cancel': False,
                'scroll': 0, 'auto_opened': False}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)

@@ -1070,5 +1070,90 @@ class TryAutoConnectTest(unittest.TestCase):
         self.assertEqual(r.cmds('connect'), [])
 
 
+class QrPairTest(unittest.TestCase):
+    """扫码配对：码是我们生成的，设备扫完按**我们的服务名**广播配对端口。"""
+
+    def test_credentials_and_payload(self):
+        service, password = cu.qr_credentials()
+        self.assertTrue(service.startswith(cu.QR_SERVICE_PREFIX))
+        self.assertEqual(len(service), len(cu.QR_SERVICE_PREFIX) + cu.QR_NAME_LEN)
+        self.assertEqual(len(password), cu.QR_PASS_LEN)
+        self.assertEqual(cu.qr_payload(service, password),
+                         'WIFI:T:ADB;S:%s;P:%s;;' % (service, password))
+        self.assertNotEqual(cu.qr_credentials(), cu.qr_credentials())
+
+    def test_rows_square_with_quiet_zone(self):
+        rows = cu.qr_rows('MOYU-abc123', 'abcdefghij')
+        self.assertTrue(rows)
+        self.assertEqual(len(rows), len(rows[0]))
+        self.assertFalse(any(rows[0]), '最外圈应留静区')
+        self.assertFalse(any(rows[-1]), '最外圈应留静区')
+        self.assertFalse(any(r[0] for r in rows), '最外圈应留静区')
+
+    def test_target_matched_by_service_name(self):
+        """同一台设备上还有别人的码在广播时，只认我们自己那一张。"""
+        def browse(service_type, timeout=None, targets=None):
+            if 'connect' in service_type:
+                return []
+            return [{'name': 'adb-abc-MoDo9u._adb-tls-pairing._tcp.local',
+                     'addr': '192.168.1.5', 'port': 1111},
+                    {'name': 'MOYU-abc123._adb-tls-pairing._tcp.local',
+                     'addr': '192.168.1.5', 'port': 43485}]
+
+        got = cu.discover_pair_target(browser=browse, name='MOYU-abc123')
+        self.assertEqual(got, '192.168.1.5:43485')
+
+    def test_pair_runs_with_found_port_and_our_password(self):
+        calls, seen = [], {}
+
+        def fake_disc(*a, **kw):
+            calls.append(kw)
+            return '192.168.1.5:43485'
+
+        def fake_pair(adb, ip_port, code, runner=None, log=None):
+            seen['args'] = (ip_port, code)
+            return True, '配对并连接成功', 'adb-abc._adb-tls-connect._tcp'
+
+        with mock.patch.object(cu, 'discover_pair_target', fake_disc), \
+                mock.patch.object(cu, 'pair_then_connect', fake_pair):
+            ok, msg, serial = cu.qr_pair(ADB, 'MOYU-abc123', 'abcdefghij')
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, '配对并连接成功')
+        self.assertEqual(serial, 'adb-abc._adb-tls-connect._tcp')
+        self.assertEqual(seen['args'], ('192.168.1.5:43485', 'abcdefghij'))
+        self.assertEqual(calls[0].get('name'), 'MOYU-abc123')
+
+    def test_peers_are_asked_by_unicast(self):
+        """组播被挡时，已知的手机 IP 要拿去做单播目标。"""
+        calls, seen = [], {}
+
+        def fake_disc(peers=(), timeout=None, browser=None, name=''):
+            calls.append(list(peers))
+            return '192.168.1.5:43485'
+
+        with mock.patch.object(cu, 'discover_pair_target', fake_disc), \
+                mock.patch.object(cu, 'pair_then_connect',
+                                  lambda *a, **kw: (True, 'ok', 'serial')):
+            cu.qr_pair(ADB, 'MOYU-abc123', 'abcdefghij', peers=['192.168.1.5'])
+        self.assertEqual(calls[0], ['192.168.1.5'])
+
+    def test_timeout_message_tells_user_what_to_do(self):
+        with mock.patch.object(cu, 'discover_pair_target', lambda *a, **kw: ''), \
+                mock.patch.object(cu.time, 'sleep', lambda s: None):
+            ok, msg, serial = cu.qr_pair(ADB, 'MOYU-abc123', 'abcdefghij', wait=1)
+        self.assertFalse(ok)
+        self.assertIn('没扫到码', msg)
+        self.assertIn('扫描二维码', msg)
+
+    def test_cancel_stops_waiting(self):
+        with mock.patch.object(cu, 'discover_pair_target',
+                               lambda **kw: self.fail('取消后不该再去问广播')):
+            ok, msg, _ = cu.qr_pair(ADB, 'MOYU-abc123', 'abcdefghij',
+                                    cancel=lambda: True)
+        self.assertFalse(ok)
+        self.assertIn('已取消', msg)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

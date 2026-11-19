@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -937,6 +938,82 @@ class ListScrollTest(_Isolated):
             self.assertIn(connect_ui.ID_GO, ctx['hotspots'])
         finally:
             self._close(hwnd, t)
+
+
+class QrPanelTest(_Isolated):
+    """面板里能切到「二维码」：切过去窗口变高、三个输入框全藏、没有大按钮。"""
+
+    def _open(self, runner, done_cb):
+        t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
+                             kwargs=dict(adb='fake-adb', on_done=done_cb,
+                                         runner=runner))
+        t.start()
+        hwnd = _own_window(done_cb)
+        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+        return t, hwnd, connect_ui._WINDOWS[hwnd]
+
+    def test_switch_to_qr_hides_inputs_and_grows_window(self):
+        stop = threading.Event()
+
+        def fake_qr(adb, service, password, runner=None, log=None, wait=None,
+                    browser=None, cancel=None, peers=()):
+            # 假装在等设备扫码：一直挂到测试结束时放行
+            stop.wait(15)
+            return False, '已取消扫码配对。', ''
+
+        def done_cb(serial, name='', addr=''):
+            pass
+
+        t, hwnd, ctx = self._open(fake_runner, done_cb)
+        try:
+            _wait_refresh(ctx)
+            _open_pair_panel(hwnd)
+            with mock.patch.object(connect_ui, 'qr_pair', fake_qr):
+                # 切到二维码
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_QR])
+                for _ in range(50):
+                    if ctx.get('pair_qr'):
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(ctx.get('pair_qr'), '没切到二维码模式')
+                self.assertTrue(ctx['qr_rows'], '二维码矩阵是空的')
+                for eid in (connect_ui.ID_IP, connect_ui.ID_PORT, connect_ui.ID_CODE):
+                    self.assertFalse(connect_ui.user32.IsWindowVisible(ctx['edits'][eid]),
+                                     '二维码模式不该露出输入框 %d' % eid)
+                self.assertNotIn(connect_ui.ID_GO, ctx['hotspots'],
+                                 '二维码模式没有「连接设备」按钮')
+                rc = connect_ui.wt.RECT()
+                connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
+                self.assertEqual(rc.bottom, connect_ui.WIN_H_QR,
+                                 '二维码模式窗口要高一些才摆得下码')
+                # 同一模式下再点一次「二维码」＝换一张新码（旧码作废）
+                old_creds = ctx['qr_creds']
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_QR])
+                for _ in range(50):
+                    if ctx['qr_creds'] != old_creds:
+                        break
+                    time.sleep(0.1)
+                self.assertNotEqual(ctx['qr_creds'], old_creds, '再点一次没换新码')
+                self.assertTrue(ctx.get('pair_qr'))
+                # 切回配对码：窗口变回原高、输入框回来、大按钮回来
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_CODE])
+                for _ in range(50):
+                    if not ctx.get('pair_qr'):
+                        break
+                    time.sleep(0.1)
+                self.assertFalse(ctx.get('pair_qr'), '切不回配对码模式')
+                connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
+                self.assertEqual(rc.bottom, connect_ui.WIN_H)
+                self.assertTrue(connect_ui.user32.IsWindowVisible(
+                    ctx['edits'][connect_ui.ID_CODE]))
+                self.assertIn(connect_ui.ID_GO, ctx['hotspots'])
+        finally:
+            stop.set()
+            self._close(hwnd, t)
+
+    def _close(self, hwnd, t):
+        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
+        t.join(5)
 
 
 if __name__ == '__main__':
