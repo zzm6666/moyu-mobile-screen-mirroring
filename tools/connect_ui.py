@@ -282,7 +282,8 @@ _ERROR_RULES = (
               '且手机「无线调试」开关还开着。'),
     ('10064', '手机暂时不可达：请确认手机没锁屏断网、和电脑在同一个 Wi-Fi，然后重试。'),
     ('protocol fault', '配对握手失败：配对码或配对端口可能已过期。请在手机上重新打开'
-                       '「使用配对码配对设备」，用新弹出的端口和配对码再试一次。'),
+                       '「使用配对码配对设备」，用新弹出的端口和配对码再试一次'
+                       '（那个端口和投屏用的端口不是同一个）。'),
     ('failed to authenticate', '手机没有授权这台电脑：请看手机屏幕，勾选「一律允许」并点允许。'),
     ('unauthorized', '手机还没有授权这台电脑：请解锁手机，在弹出的「允许 USB 调试」里点允许。'),
     ('no such device', '这台设备当前不在线：请确认手机无线调试还开着，然后点「刷新」。'),
@@ -545,20 +546,21 @@ def _set_pair_open(ctx, mode='', addr=''):
 
 
 def _prefill_pair(ctx, row):
-    """点「配对」：把这一行的 IP:端口 填好，焦点交给配对码框（只差 6 位码）。"""
-    addr = row.get('addr') or ''
-    ip, port = ('', '')
-    if IP_PORT_RE.match(addr):
-        ip, port = addr.rsplit(':', 1)
-    if ip:
-        user32.SendMessageW(ctx['edits'][ID_IP], WM_SETTEXT, 0,
-                            ctypes.c_wchar_p(ip))
-        user32.SendMessageW(ctx['edits'][ID_PORT], WM_SETTEXT, 0,
-                            ctypes.c_wchar_p(port))
-    _set_pair_open(ctx, 'prefill' if ip else 'manual', addr)
+    """点「配对」：填好这一行的 IP、焦点交给配对码框（只差 6 位码）。
+
+    **故意不填端口**：列表里那个 ip:端口 是投屏用的**连接端口**，而配对端口是另一个
+    随机端口（手机「使用配对码配对设备」页面上显示的那个）。把连接端口填进去当配对
+    端口用，配对必然失败——所以这里只留 IP，端口交给 `discover_pair_target` 现问设备。
+    """
+    ip = _ip_of(row.get('addr') or '')
+    for eid, text in ((ID_IP, ip), (ID_PORT, '')):
+        user32.SendMessageW(ctx['edits'][eid], WM_SETTEXT, 0,
+                            ctypes.c_wchar_p(text))
+    _set_pair_open(ctx, 'prefill' if ip else 'manual', ip)
     user32.SetFocus(ctx['edits'][ID_CODE])
     _status(ctx, '「%s」还没配对：请在设备上打开「使用配对码配对设备」，'
                  '把设备上显示的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
+                 '配对端口电脑会自己去问设备。'
             % (row.get('name') or ip or '这台设备'), 'info')
 
 
@@ -1319,11 +1321,13 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_small, hx, hy + 2, '收起',
                        C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
             if prefill:
-                # 自动问到的 IP:端口 摆在配对码框正上方：标签与「配对码」左对齐，地址与输入框对齐
+                # 已知的设备地址摆在配对码框正上方：标签与「配对码」左对齐，值跟输入框对齐。
+                # 只有 IP（配对端口要到配对时才问设备）就只写「IP」。
+                label = ctx['pair_label'] or ''
                 _draw_text(hdc, f_small, PAD, CODE_Y - 24,
-                           'IP和端口：', C_SUB)
+                           'IP和端口：' if ':' in label else 'IP：', C_SUB)
                 _draw_text(hdc, f_small, EDIT_X, CODE_Y - 24,
-                           ctx['pair_label'] or '', C_SUB)
+                           label, C_SUB)
             _draw_text(hdc, f_small, PAD, CODE_Y + 2, '配对码', C_SUB)
             focus = user32.GetFocus()
             targets = ((ID_CODE, CODE_Y),)

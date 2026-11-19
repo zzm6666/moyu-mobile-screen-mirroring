@@ -299,14 +299,22 @@ class WizardSmokeTest(_Isolated):
         self.assertFalse(t.is_alive(), '向导线程没退出')
 
     def test_unpaired_found_row_asks_for_pairing_code(self):
-        """没跟本机配对过的「新发现」设备：点按钮不发起连接，只把 IP:端口填好等配对码。
+        """没跟本机配对过的「新发现」设备：点按钮不发起连接，只等配对码。
 
         用户 m03416：新发现 = 广播可见但没连上，可能从没配对过，点「连接」注定失败，
-        所以这种行按钮叫「配对」，点了把 IP:端口 填好、焦点交给配对码框。
+        所以这种行按钮叫「配对」，点了展开配对面板、焦点交给配对码框。
+        用户 m04211：列表里那个 ip:端口 是**投屏用的连接端口**，配对端口是另一个
+        随机端口（手机「使用配对码配对设备」页面上那个），所以绝不能预填进端口框——
+        预填了就会拿连接端口去配对，必然失败。
         """
         done = threading.Event()
         closed = threading.Event()
         cmds = []
+        discovered = []
+
+        def fake_discover(peers=(), timeout=None, browser=None):
+            discovered.append(list(peers))
+            return '192.168.137.88:43485'
 
         def runner(cmd, timeout=25):
             joined = ' '.join(cmd)
@@ -317,53 +325,82 @@ class WizardSmokeTest(_Isolated):
                 return 0, ('List of discovered mdns services\n'
                            'adb-aaaa1111-NewPhone\t_adb-tls-connect._tcp\t'
                            '192.168.137.88:41234\n')
+            if ' pair ' in joined:
+                return 0, 'Successfully paired to 192.168.137.88:43485'
+            if 'connect' in joined:
+                return 0, 'connected to 192.168.137.88:43485'
             return 0, ''
 
+        orig_discover = connect_ui.discover_pair_target
+        connect_ui.discover_pair_target = fake_discover
         done_cb = done.set
         t = threading.Thread(target=connect_ui.show_wizard, daemon=True,
                              kwargs=dict(adb='fake-adb', on_done=done_cb,
                                          on_close=closed.set, runner=runner))
-        t.start()
-        hwnd = _own_window(done_cb)
-        self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
-        ctx = connect_ui._WINDOWS[hwnd]
-        for _ in range(80):
-            if ctx['visible_rows']:
-                break
-            time.sleep(0.1)
-        row = ctx['visible_rows'][0]
-        self.assertEqual(row['state'], 'found')
-        self.assertNotIn('台设备', ctx['status_text'],
-                         '刷完不用再报「找到 N 台设备」，列表本身就是答案')
-        self.assertFalse(connect_ui._seen_before(row, ctx['known']),
-                         '这台设备不该被认为配对过')
-        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
-        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
-        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
-        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
-        for _ in range(40):
-            if connect_ui._text(ctx['edits'][connect_ui.ID_IP]):
-                break
-            time.sleep(0.1)
-        self.assertTrue(ctx['pair_open'], '点「配对」应把配对面板展开')
-        self.assertEqual(ctx['pair_mode'], 'prefill', 'IP:端口 已自动填好 → prefill 模式')
-        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
-                         '192.168.137.88', '该把这一行的 IP 自动填好')
-        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]),
-                         '41234', '该把这一行的端口自动填好')
-        self.assertFalse(connect_ui.user32.IsWindowVisible(
-            ctx['edits'][connect_ui.ID_IP]),
-            'prefill 模式下 IP 框应藏起来（已经填好，用户不用看）')
-        self.assertTrue(connect_ui.user32.IsWindowVisible(
-            ctx['edits'][connect_ui.ID_CODE]), '配对码框要可见')
-        self.assertIn('配对码', ctx['status_text'], '状态行要提示去填配对码')
-        self.assertFalse(any('connect' in c and ' pair' not in c for c in cmds),
-                         '没配对过就不该直接发起连接：%r' % cmds)
-        self.assertFalse(done.is_set(), '不该连接成功')
-        connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
-        self.assertTrue(closed.wait(5))
-        t.join(5)
-        self.assertFalse(t.is_alive())
+        try:
+            t.start()
+            hwnd = _own_window(done_cb)
+            self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
+            ctx = connect_ui._WINDOWS[hwnd]
+            for _ in range(80):
+                if ctx['visible_rows']:
+                    break
+                time.sleep(0.1)
+            row = ctx['visible_rows'][0]
+            self.assertEqual(row['state'], 'found')
+            self.assertNotIn('台设备', ctx['status_text'],
+                             '刷完不用再报「找到 N 台设备」，列表本身就是答案')
+            self.assertFalse(connect_ui._seen_before(row, ctx['known']),
+                             '这台设备不该被认为配对过')
+            bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
+            lp = (bx + bw // 2) | ((by + bh // 2) << 16)
+            connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
+            connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
+            for _ in range(40):
+                if connect_ui._text(ctx['edits'][connect_ui.ID_IP]):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(ctx['pair_open'], '点「配对」应把配对面板展开')
+            self.assertEqual(ctx['pair_mode'], 'prefill', 'IP 已知 → prefill 模式')
+            self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
+                             '192.168.137.88', '该把这一行的 IP 自动填好')
+            self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_PORT]), '',
+                             '连接端口不是配对端口，绝不能预填进端口框')
+            self.assertEqual(ctx['pair_label'], '192.168.137.88',
+                             '框上方只报 IP（配对端口要到配对时才问设备）')
+            self.assertFalse(connect_ui.user32.IsWindowVisible(
+                ctx['edits'][connect_ui.ID_IP]),
+                'prefill 模式下 IP 框应藏起来（已经填好，用户不用看）')
+            self.assertTrue(connect_ui.user32.IsWindowVisible(
+                ctx['edits'][connect_ui.ID_CODE]), '配对码框要可见')
+            self.assertIn('配对码', ctx['status_text'], '状态行要提示去填配对码')
+            self.assertFalse(any(' pair ' in c or ('connect' in c and 'mdns' not in c)
+                                 for c in cmds),
+                             '没配对过就不该直接发起连接：%r' % cmds)
+            # 填好 6 位码点「连接手机」：配对端口必须来自设备的配对广播，
+            # 而不是列表里那个连接端口（用户 m04211 的失败原因）
+            connect_ui.user32.SendMessageW(ctx['edits'][connect_ui.ID_CODE],
+                                           0x000C, 0, ctypes.c_wchar_p('123456'))
+            connect_ui.user32.PostMessageW(hwnd, 0x0111, connect_ui.ID_GO, 0)
+            pair_cmd = None
+            for _ in range(80):
+                pair_cmd = next((c for c in cmds if ' pair ' in c), None)
+                if pair_cmd:
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(pair_cmd, '没发起 adb pair：%r' % cmds)
+            self.assertIn('192.168.137.88:43485', pair_cmd,
+                          '必须用设备广播的配对端口：%r' % pair_cmd)
+            self.assertNotIn('41234', pair_cmd,
+                             '不能用列表里的连接端口去配对：%r' % pair_cmd)
+            self.assertIn('123456', pair_cmd)
+            self.assertTrue(discovered, '没有走自动发现')
+        finally:
+            connect_ui.discover_pair_target = orig_discover
+            connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+            closed.wait(5)
+            t.join(5)
+            self.assertFalse(t.is_alive())
 
     def test_offline_row_gets_pair_button_and_anonymous_row_is_hidden(self):
         """离线设备：认得出的留一行「配对」按钮，认不出的（名字是串号、没地址）不显示。
