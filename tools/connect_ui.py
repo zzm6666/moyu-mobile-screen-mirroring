@@ -1067,8 +1067,8 @@ GO_H = 40
 # 扫码模式：没有输入框和大按钮，面板里摆二维码 + 一句提示，窗口跟着变高
 QR_SIZE = 148                          # 二维码边长（37 模块 × 4px，整数倍最清晰）
 WIN_H_QR = 572                         # 二维码模式：摆得下码 + 一行状态，底部不留空白
-MODE_CHIP_W, MODE_CHIP_H = 58, 22      # 「配对码 / 二维码」小分段按钮
-MODE_CHIP_Y = SEC_Y - 3
+MODE_CHIP_W, MODE_CHIP_H = 60, 24      # 「配对码 / 二维码」小分段按钮（配色同上方 tab，字不加粗）
+MODE_CHIP_Y = SEC_Y - 2
 USB_HINT_Y = LIST_Y + LIST_H_FULL + 16
 EDIT_X = PAD + 64                     # 输入框左缘（标签右侧）
 IP_W = 176                            # IP 框宽（适量，不拉满）
@@ -1269,11 +1269,11 @@ def _rebuild_hotspots(ctx):
                 hs[ID_GO] = (PAD, GO_Y, WIN_W - 2 * PAD, GO_H)
             # 面板右上一排：［配对码］［二维码］ 收起
             close_x = WIN_W - PAD - 40
-            qr_x = close_x - 12 - MODE_CHIP_W
+            qr_x = close_x - 10 - MODE_CHIP_W
             code_x = qr_x - 6 - MODE_CHIP_W
             hs[ID_MODE_CODE] = (code_x, MODE_CHIP_Y, MODE_CHIP_W, MODE_CHIP_H)
             hs[ID_MODE_QR] = (qr_x, MODE_CHIP_Y, MODE_CHIP_W, MODE_CHIP_H)
-            hs[ID_PAIR_CLOSE] = (close_x, SEC_Y - 4, 40, 24)
+            hs[ID_PAIR_CLOSE] = (close_x, MODE_CHIP_Y, 40, MODE_CHIP_H)
         else:
             hs[ID_MANUAL] = (PAD, _pair_link_y(ctx) - 4, 196, 26)
     ctx['hotspots'] = hs
@@ -1312,15 +1312,16 @@ def _paint(ctx, hdc):
         active = (tid == ID_TAB_WIFI and ctx['tab'] == 'wifi') or \
                  (tid == ID_TAB_USB and ctx['tab'] == 'usb')
         hover = ctx['hover'] == tid
+        tw, th = _text_size(hdc, f_btn, label)
+        tx = x + (w - tw) // 2
+        ty = y + (h - th) // 2
         if active:
             _round_rect(hdc, x, y, w, h, 10, C_PRIMARY)
-            _draw_text(hdc, f_btn, x + (w - _text_size(hdc, f_btn, label)[0]) // 2,
-                       y + 8, label, (255, 255, 255))
+            _draw_text(hdc, f_btn, tx, ty, label, (255, 255, 255))
         else:
             _round_rect(hdc, x, y, w, h, 10, C_HOVER if hover else C_SURFACE,
                         C_LINE)
-            _draw_text(hdc, f_btn, x + (w - _text_size(hdc, f_btn, label)[0]) // 2,
-                       y + 8, label, C_SUB if not hover else C_INK)
+            _draw_text(hdc, f_btn, tx, ty, label, C_SUB if not hover else C_INK)
 
     # 刷新按钮（右上角小按钮，纯文字）
     rx, ry, rw, rh = ctx['hotspots'][ID_REFRESH]
@@ -1440,19 +1441,24 @@ def _paint(ctx, hdc):
             _draw_text(hdc, ctx['f_bold'], PAD, SEC_Y,
                        '扫码配对' if qr else ('填写配对码' if prefill else '配对设备'),
                        C_INK)
-            # 右上一排：［配对码］［二维码］ 收起
+            # 右上一排：［配对码］［二维码］ 收起（配色/active 同上方 tab，文字不加深）
             for mid, mlabel in ((ID_MODE_CODE, '配对码'), (ID_MODE_QR, '二维码')):
                 mx, my, mw, mh = ctx['hotspots'][mid]
-                mtw = _text_size(hdc, f_small, mlabel)[0]
+                mtw, mth = _text_size(hdc, f_small, mlabel)
+                mtx = mx + (mw - mtw) // 2
+                mty = my + (mh - mth) // 2
                 if (mid == ID_MODE_QR) == qr:
-                    _round_rect(hdc, mx, my, mw, mh, 8, C_PRIMARY_LT)
-                    _draw_text(hdc, f_small, mx + (mw - mtw) // 2, my + 4, mlabel, C_PRIMARY)
+                    _round_rect(hdc, mx, my, mw, mh, 10, C_PRIMARY)
+                    _draw_text(hdc, f_small, mtx, mty, mlabel, (255, 255, 255))
                 else:
-                    _round_rect(hdc, mx, my, mw, mh, 8,
-                                C_HOVER if ctx['hover'] == mid else C_SURFACE, C_LINE)
-                    _draw_text(hdc, f_small, mx + (mw - mtw) // 2, my + 4, mlabel, C_SUB)
+                    mhover = ctx['hover'] == mid
+                    _round_rect(hdc, mx, my, mw, mh, 10,
+                                C_HOVER if mhover else C_SURFACE, C_LINE)
+                    _draw_text(hdc, f_small, mtx, mty, mlabel,
+                               C_SUB if not mhover else C_INK)
             hx, hy, hw, hh = ctx['hotspots'][ID_PAIR_CLOSE]
-            _draw_text(hdc, f_small, hx, hy + 2, '收起',
+            _draw_text(hdc, f_small, hx, hy + (hh - _text_size(hdc, f_small, '收起')[1]) // 2,
+                       '收起',
                        C_PRIMARY_HOVER if ctx['hover'] == ID_PAIR_CLOSE else C_SUB)
             if qr:
                 _draw_qr(hdc, ctx, PAD, IP_Y)
