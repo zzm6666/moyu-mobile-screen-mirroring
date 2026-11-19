@@ -193,6 +193,7 @@ APP_HOME = app_dir()          # exe 目录
 RES_HOME = resource_dir()     # 只读资源目录（打包后是 _internal）
 CONFIG_PATH = config_path(APP_HOME, RES_HOME, FROZEN)
 BASE = os.path.dirname(CONFIG_PATH)   # 数据目录：config.json 与 app.log 都放这里
+SCRCPY_LOG = os.path.join(BASE, 'scrcpy.log')   # scrcpy 自己的输出，排查「启动即退出」用
 try:
     # 打包版首次运行时 %APPDATA%\魔芋 还不存在，先建出来，否则日志和配置都写不进去
     os.makedirs(BASE, exist_ok=True)
@@ -251,6 +252,26 @@ def log(msg):
             f.write('%s %s\n' % (time.strftime('%H:%M:%S'), msg))
     except Exception:
         pass
+
+
+def rect_str(r):
+    """RECT → '4,8-260,610' 这种便于读日志的字符串。"""
+    try:
+        return '%d,%d-%d,%d' % (r.left, r.top, r.right, r.bottom)
+    except Exception:
+        return '?'
+
+
+def scrcpy_log_tail(path=SCRCPY_LOG, limit=600):
+    """读 scrcpy 自己输出的末尾几行，用来在日志里说清「为什么退出」。"""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode('utf-8', 'replace').strip()
+    except Exception:
+        return ''
 
 
 log('--- start, v%s BASE=%s frozen=%s scrcpy_dir=%s'
@@ -730,6 +751,7 @@ def _kill_scrcpy():
     """
     p = state['proc']
     if p is None or p.poll() is not None:
+        _close_scrcpy_log()
         return
     try:
         subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'],
@@ -737,6 +759,18 @@ def _kill_scrcpy():
                        creationflags=CREATE_NO_WINDOW, timeout=10)
     except Exception:
         pass
+    _close_scrcpy_log()
+
+
+def _close_scrcpy_log():
+    """关掉 scrcpy 输出文件句柄（重启 scrcpy / 退出时都要关，否则句柄泄漏）。"""
+    logf = state.get('scrcpy_log')
+    state['scrcpy_log'] = None
+    if logf:
+        try:
+            logf.close()
+        except Exception:
+            pass
 
 
 AUTO_CONNECT_GRACE = 6.0    # 启动时等 adb 自己把「已配对的无线设备」连上多久
@@ -817,9 +851,17 @@ def start_scrcpy():
     # 用户可能在连接向导里配对好几分钟，配对成功那一刻距启动早已超过 60 秒，
     # 用旧起点会在 scrcpy 窗口出现前的一两秒里弹出误报（投屏其实是好的）。
     state['started_at'] = time.time()
+    # scrcpy 失败时只会往 stderr 写原因（rc=2 有很多种：设备掉线、编码器不支持、
+    # 端口过期……）。以前把这些丢掉，用户只看到「窗口没出来」，日志里一片空白。
+    logf = None
+    try:
+        logf = open(SCRCPY_LOG, 'wb')
+    except Exception:
+        logf = None
+    state['scrcpy_log'] = logf
     state['proc'] = subprocess.Popen(args, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL,
+                                     stdout=logf if logf else subprocess.DEVNULL,
+                                     stderr=subprocess.STDOUT if logf else subprocess.DEVNULL,
                                      creationflags=CREATE_NO_WINDOW)
     log('scrcpy launched pid=%s aspect=%.4f' % (state['proc'].pid, state['aspect']))
 
@@ -1997,6 +2039,7 @@ def quiet_stop(reason=''):
     """
     if state['proc'] is not None and state['proc'].poll() is None and not state['quitting']:
         _kill_scrcpy()
+    _close_scrcpy_log()
     state['proc'] = None
     state['child'] = None
     state['serial'] = None
@@ -2022,6 +2065,7 @@ def quit_app():
     p = state['proc']
     if p is not None and p.poll() is None:
         _kill_scrcpy()
+    _close_scrcpy_log()
     if state['tray']:
         user32.DestroyWindow(state['tray'])
     else:
@@ -2184,7 +2228,17 @@ def watchdog(hwnd):
             if not state['hidden']:
                 user32.ShowWindow(state['frame'], 5)
                 user32.ShowWindow(t, 5)
-                log('window: shown after connect')
+                raise_mirror()
+                # 分层窗口在隐藏期间被系统丢掉内容时，show 出来会是一片透明（
+                # 用户看到的就是「窗口根本没出现」）。显示后再强制重画一次。
+                update_frame(state['frame'], force=True)
+                fr, cr, fg = RECT(), RECT(), RECT()
+                user32.GetWindowRect(state['frame'], ctypes.byref(fr))
+                user32.GetWindowRect(t, ctypes.byref(cr))
+                user32.GetWindowRect(user32.GetForegroundWindow(), ctypes.byref(fg))
+                log('window: shown after connect frame=%s child=%s fg=%s vis=(%s,%s)'
+                    % (rect_str(fr), rect_str(cr), rect_str(fg),
+                       user32.IsWindowVisible(state['frame']), user32.IsWindowVisible(t)))
             return
     else:
         if user32.IsWindow(state['child']):
@@ -2211,7 +2265,8 @@ def watchdog(hwnd):
     if p is None:
         return
     if p.poll() is not None and not state['quitting']:
-        log('scrcpy exit rc=%s' % p.returncode)
+        tail = scrcpy_log_tail()
+        log('scrcpy exit rc=%s%s' % (p.returncode, (' out=' + tail.replace('\n', ' | ')) if tail else ''))
         state['retries'] = state.get('retries', 0) + 1
         # 手机无线调试端口会变、也可能短暂掉线：只要还有在线设备就自动重连两次
         if state['retries'] <= 2 and list_devices():
@@ -2222,7 +2277,14 @@ def watchdog(hwnd):
             threading.Thread(target=start_scrcpy, daemon=True).start()
             return
         # 手机断开/重新配对了：投屏就安静地结束，不弹「投屏进程已退出」的框
+        online_after = bool(state.get('serial')) and state['serial'] in list_devices()
         quiet_stop('scrcpy exit rc=%s' % p.returncode)
+        # 但「手机还在、投屏却没画面」不是断开，是故障：一声不响会让用户以为
+        # 窗口根本没出现（就是这么被投诉的）。这种情况必须说清楚，并指路日志。
+        if online_after:
+            fail('投屏窗口没能显示出来。\n\n手机还在线，但投屏程序启动后自己退出了。'
+                 '\n请点托盘「连接手机…」再试一次；反复失败的话，把 '
+                 'scrcpy.log 发给我（和 app.log 在同一个目录）。')
         return
     if time.time() - state['started_at'] > 60:
         fail('投屏窗口 60 秒仍未出现。\n请确认手机端无线调试正常，或重启本程序。')

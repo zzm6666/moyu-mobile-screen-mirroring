@@ -123,11 +123,18 @@ class WatchdogTimeoutTest(unittest.TestCase):
         self.assertIsNone(app.state['serial'])
         self.assertEqual(app.state['retries'], 0)
 
-    def test_scrcpy_exit_after_retries_stops_quietly(self):
-        """设备还在线但自动重连次数用完了：同样安静收尾，不弹框。"""
-        app.state.update({'proc': ExitedProc(), 'retries': 3, 'nid': None})
+    def test_scrcpy_exit_while_device_online_warns_user(self):
+        """手机还在线、scrcpy 自己退了 = 故障，必须说清楚。
+
+        以前这里也安静收尾，用户只看到「投屏窗口没出现」，日志里一片空白。
+        """
+        app.state.update({'proc': ExitedProc(), 'retries': 3, 'nid': None,
+                          'serial': '192.168.1.2:5555'})
         app.watchdog(None)
-        self.assertEqual(self._fail_calls, [])
+        self.assertEqual(len(self._fail_calls), 1,
+                         '手机在线时 scrcpy 退出应提示一次：%r' % (self._fail_calls,))
+        self.assertIn('投屏窗口', self._fail_calls[0])
+        self.assertIn('scrcpy.log', self._fail_calls[0], '要指路日志，否则无从排查')
         self.assertIsNone(app.state['proc'])
 
     def test_start_scrcpy_resets_timer(self):
