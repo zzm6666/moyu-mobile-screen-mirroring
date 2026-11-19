@@ -11,19 +11,19 @@
 | **连接（connect）** | `adb connect ip:连接端口`，建立 ADB 传输通道。已配对的设备每次端口变化后都要重新 connect，但**不需要重新 pair**。 | 不是配对 |
 | **串号（serial）** | `adb devices` 第一列的设备标识。USB 是硬件序列号（如 `ABC123`）；无线有两种：`ip:端口`（如 `192.168.1.5:41001`）和 mDNS 串号（如 `adb-bfd7e543-MoDo9u._adb-tls-connect._tcp`）。 | mDNS 串号不是设备名，绝不能直接显示给用户 |
 | **在线（online）** | `adb devices` 里状态为 `device` 的条目（`offline`/`unauthorized` 不算）。代码：`connect_ui.parse_devices_l` / `mirror_app.list_devices`。向导 UI 统一显示为「已连接」。 | — |
-| **发现（found）** | 手机在广播 `_adb-tls-connect._tcp`、但本机现在没有和它连上（`adb devices` 里没有）。可能以前配对过（无线调试关过再开、拔过线），也可能从没跟本机配对过。向导 UI 显示为「新发现」。 | 不是「未配对的新设备」，也不是「一定连得上」 |
+| **发现（found）** | 手机在广播 `_adb-tls-connect._tcp`、但本机现在没有和它连上（`adb devices` 里没有）。可能以前配对过（无线调试关过再开、拔过线），也可能从没跟本机配对过。**向导里没有单独的状态标签**：只有「已连接」才挂徽标，其余能操作的行都只挂「配对」按钮（用户 m04638）。 | 不是「未配对的新设备」，也不是「一定连得上」 |
 | **历史设备（known device）** | 本机成功连接过、记在 `config.json → known_devices` 的设备：`{serial, name, addr, last_seen}`，新在前、最多 8 台、按 serial+同 IP 去重。 | 不等于「已配对设备」——adb 没有列出配对记录的 API，历史表只是本机经验 |
 | **设备名（display name）** | 给用户看的名字，取值优先级：营销名（`ro.product.marketname` / `ro.vendor.oplus.market.name` 等，如「一加 13」）→ `adb devices -l` 的 model → `无线设备 <ip>` 兜底。代码：`connect_ui.device_display_name`。 | 不是 serial、不是 mDNS 名 |
-| **重连（reconnect）** | 对历史/发现设备：mDNS 串号已在线→直接用；否则先试旧 `addr` connect，再按 mDNS 找同 IP/同服务名的新端口 connect。代码：`connect_ui.reconnect_known`。 | 不需要重新配对；当前 UI 不再直接调用它（离线行没有按钮，手机重新开无线调试后会以「新发现」自己回来） |
-| **行内按钮（row action）** | 设备行右侧的按钮，只有「新发现」行才有：「已连接」行不给（点它是重复连接）；「新发现」行按历史分——本机连过（`connect_ui._seen_before`，按串号或 IP 命中 `known_devices`）显示「连接」，从没连过显示「配对」。点「配对」展开配对面板、只填该行 **IP**（绝不填端口：列表里的是连接端口，配对端口是手机配对页上另一个随机端口，配对时由 `discover_pair_target` 现问），焦点交给配对码框，用户只需填 6 位码。 | 按钮文案不是装饰：它是「这台设备还需不需要配对」的唯一提示 |
-| **离线（offline）** | 既不在 `adb devices`、也没有任何 mDNS 广播（多半手机没开无线调试）。**不进设备列表**：此刻既连不上也配不了，只会剩个死按钮；手机一开无线调试就会以「新发现」重新出现。列表空着时若历史里有名字，空态提示「上次连过的「X」现在没开着无线调试」（`connect_ui._last_known_name`）。数据层 `merge_devices` 仍产出 offline 行（供去重与名字用），只在 `connect_ui._list_rows` 里过滤掉。 | 用户 m04505：离线状态本身没有存在意义 |
+| **重连（reconnect）** | 对历史/发现设备：mDNS 串号已在线→直接用；否则先试旧 `addr` connect，再按 mDNS 找同 IP/同服务名的新端口 connect。代码：`connect_ui.reconnect_known`。 | 不需要重新配对；当前 UI 不再直接调用它（列表里没连上的行只给「配对」，手机重新开无线调试后会自己回到列表） |
+| **行内按钮（row action）** | 设备行右侧的按钮，只有**没连上**的行才有：「已连接」行不给（点它是重复连接）。文案统一是「配对」——没连上就要先配对，点它展开配对面板、只填该行 **IP**（绝不填端口：列表里的是连接端口，配对端口是手机配对页上另一个随机端口，配对时由 `discover_pair_target` 现问），焦点交给配对码框，填完 6 位码再点「连接设备」（用户 m04638：不再按历史分「连接」/「配对」）。 | 按钮文案不是装饰：它说明下一步一定需要配对码 |
+| **离线（offline）** | 既不在 `adb devices`、也没有任何 mDNS 广播（多半手机没开无线调试）。**不进设备列表**：此刻既连不上也配不了，只会剩个死按钮；手机一开无线调试就自己回到列表。列表空着时若历史里有名字，空态提示「上次连过的「X」现在没开着无线调试」（`connect_ui._last_known_name`）。数据层 `merge_devices` 仍产出 offline 行（供去重与名字用），只在 `connect_ui._list_rows` 里过滤掉。 | 用户 m04505：离线状态本身没有存在意义 |
 | **配对面板（pair panel）** | 窗口下方那块填配对码的区域，平时收起（`ctx['pair_open']=False`），只在列表下方留一行「设备不在列表里？手动配对」；一台设备都没发现时**自动展开**一次（`ctx['auto_opened']`）。展开方式三种：`_set_pair_open(ctx, '')` 收起 / `'prefill'` 只显示配对码框（自动问到的 IP:端口 以小字显示在框正上方，不占输入框）/ `'manual'` 三个框都显示，且会**清空**上次留下的 IP/端口。窗口高度跟着面板走（`_win_h`：收起 508 / 展开 560，`_fit_client` 才把含边框的 SetWindowPos 尺寸换算成客户区）。代码：`connect_ui._set_pair_open`、`_prefill_pair`、`_fit_client`。 | prefill 不是「不让用户改地址」，是「地址已经问过设备了」；手动模式清空是为了不让人照着旧地址填错 |
 | **列表滚动（list scroll）** | 列表卡片**高度固定**：收起配对面板时 6 行（`MAX_ROWS_FULL`），展开时 4 行（`MAX_ROWS`）；设备更多时用滚轮翻（`ctx['scroll']`，每次 1 行，右侧画细滚动条）。`_visible_rows` 给绘制和热点同一段窗口。 | 高度固定是为了窗口不长高、按钮位置不跳 |
 | **自动连接（auto connect）** | 启动时 `try_auto_connect`：在线设备 → 配置串号 ip:端口 → mDNS 发现，三步兜底；全失败才弹向导。 | — |
 | **自动刷新（auto refresh）** | 向导开着时每 3 秒（`connect_ui.AUTO_REFRESH_MS`，WM_TIMER id 3）悄悄刷一次设备列表：不转圈、不写日志；**完全不碰状态行**（`_apply_job` 里只有非 auto 才清状态），用户看到的错误/操作提示不会被它清掉。手机重开无线调试后几秒内自己变回「新发现/已连接」。 | 不是「刷新按钮的自动化替代」——手动刷新仍会显示进度与结果 |
 | **连接端口广播** | 连接端口是随机端口，电脑只能靠手机的 mDNS 广播（`_adb-tls-connect._tcp`）发现它。广播可能迟到；路由器开了客户端隔离/跨网段时**永远收不到**——此时只能让用户把「无线调试」主页上的端口手动填进「端口」框。代码：`connect_ui.parse_mdns_services`。 | 不是配对端口的别名；也不是能扫描出来的固定端口 |
 | **配对端口广播** | 手机停在「使用配对码配对设备」页面（或扫码配对页）时会广播 `_adb-tls-pairing._tcp`，其中带着**配对端口**。安卓的 NsdManager 广播**不回组播查询**，必须单播问手机 `ip:5353` 才拿得到（实测组播 100 轮 0 条、单播立刻命中）。代码：`connect_ui.discover_pair_target` + `mdns_browse.browse(..., targets=[ip])`。 | 不是连接端口；组播问不到不代表手机没广播 |
-| **一键连接** | 向导里唯一的「连接手机」按钮，`connect_ui.decide_action` 分三路：只填 6 位配对码 → 先 `discover_pair_target` 自动拿到配对端口，再 `pair_then_connect`；填了 IP:端口 + 配对码 → 直接用填的；配对码**留空** → 直接 `connect_only`（已配对过时的兜底）。首次配对仍必须人工读手机上的 6 位码（协议限制）。 | 留空不是「输入不完整」，是「跳过配对」；IP:端口留空也不是错误 |
+| **一键连接** | 向导里唯一的「连接设备」按钮（用户 m04638 改名，原「连接手机」），`connect_ui.decide_action` 分三路：只填 6 位配对码 → 先 `discover_pair_target` 自动拿到配对端口，再 `pair_then_connect`；填了 IP:端口 + 配对码 → 直接用填的；配对码**留空** → 直接 `connect_only`（已配对过时的兜底）。首次配对仍必须人工读手机上的 6 位码（协议限制）。 | 留空不是「输入不完整」，是「跳过配对」；IP:端口留空也不是错误 |
 
 ## 投屏（scrcpy）
 

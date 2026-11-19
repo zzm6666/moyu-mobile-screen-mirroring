@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""连接手机向导：逻辑层 + 自绘 UI（纯 ctypes Win32，无第三方依赖）。
+"""连接设备向导：逻辑层 + 自绘 UI（纯 ctypes Win32，无第三方依赖）。
 
 逻辑层（可离线单测，全部 adb 调用走可注入的 runner）：
   - friendly_error / pair_only / connect_only：报错一律翻译成通俗中文，
@@ -12,7 +12,7 @@
 
 UI 层（show_wizard）：
   两个 Tab「无线连接 / USB 连接」；设备列表每行带「连接」按钮；
-  首次配对只有 IP:端口 + 配对码 + 一个「连接手机」大按钮，
+  首次配对只有 IP:端口 + 配对码 + 一个「连接设备」大按钮，
   点击后配对→找连接端口→连接全自动，用户无感。
   窗口自绘（GDI 圆角/配色/微软雅黑），输入框仍是原生 EDIT 保证输入法可用。
 """
@@ -502,23 +502,6 @@ def _is_junk_name(name, serial=''):
     return name.startswith('adb-') or bool(IP_PORT_RE.match(name))
 
 
-def _seen_before(row, known=()):
-    """这台设备以前跟本机连过没有（按串号或 IP 匹配历史）。
-
-    「新发现」= 手机在广播无线调试服务、但电脑现在没有和它连上。它可能以前
-    配对过（拔了线/关过无线调试），也可能从来没跟本机配对过——后者点「连接」
-    只会得到「手机没有授权这台电脑」。所以按钮文案按这个判断分「连接」/「配对」。
-    """
-    serial = row.get('serial') or ''
-    ip = _ip_of(row.get('addr') or '')
-    for k in known or []:
-        if serial and k.get('serial') == serial:
-            return True
-        if ip and _ip_of(k.get('addr') or '') == ip:
-            return True
-    return False
-
-
 def _set_pair_open(ctx, mode='', addr=''):
     """开/关配对面板。mode: '' 收起 / 'prefill' 已填好 IP:端口 / 'manual' 手动填。
 
@@ -559,7 +542,7 @@ def _prefill_pair(ctx, row):
     _set_pair_open(ctx, 'prefill' if ip else 'manual', ip)
     user32.SetFocus(ctx['edits'][ID_CODE])
     _status(ctx, '「%s」还没配对：请在设备上打开「使用配对码配对设备」，'
-                 '把设备上显示的 6 位配对码填进「配对码」框，再点下面的「连接手机」。'
+                 '把设备上显示的 6 位配对码填进「配对码」框，再点下面的「连接设备」。'
                  '配对端口电脑会自己去问设备。'
             % (row.get('name') or ip or '这台设备'), 'info')
 
@@ -792,7 +775,7 @@ def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None):
 
 def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
                       wait=PAIR_DISCOVER_SECS):
-    """一键「连接手机」：配对 + 自动找到真正的「连接端口」再连，用户无感。
+    """一键「连接设备」：配对 + 自动找到真正的「连接端口」再连，用户无感。
 
     手机无线调试有两个端口：配对弹窗里的**配对端口**和主页面上「IP 地址和端口」的
     **连接端口**，两者通常不同——配对成功后不能拿配对端口去 connect。
@@ -829,11 +812,11 @@ def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
     return False, ('配对成功了，但没收到手机的连接广播。请回到手机「无线调试」主页'
                    '（能看到「IP 地址和端口」那一页）停留几秒让电脑自动连；'
                    '若还是连不上，把那一页上的「端口」填到上面的端口框、配对码留空，'
-                   '再点一次「连接手机」。'), ''
+                   '再点一次「连接设备」。'), ''
 
 
 def decide_action(ip, port, code):
-    """「连接手机」按钮该干什么：有配对码 → 配对+连接；只填 IP:端口 → 直接连接。
+    """「连接设备」按钮该干什么：有配对码 → 配对+连接；只填 IP:端口 → 直接连接。
 
     返回 (kind, payload, 提示)：kind 是 'pair' / 'connect' / ''，
     为空串表示输入不合格，此时提示是中文错误文案。
@@ -845,7 +828,7 @@ def decide_action(ip, port, code):
     if code:
         if not valid_code(code):
             return '', None, ('配对码是手机「使用配对码配对设备」页面上显示的 6 位数字；'
-                              '已经配对过可以留空，直接点「连接手机」。')
+                              '已经配对过可以留空，直接点「连接设备」。')
         if not ip_port:
             return 'pair', ('', code), ''    # 端口交给电脑自动发现
         return 'pair', (ip_port, code), ''
@@ -1181,7 +1164,7 @@ def _paint(ctx, hdc):
     f_btn = ctx['f_btn']
 
     # 标题区
-    _draw_text(hdc, f_title, PAD, 16, '连接手机', C_INK)
+    _draw_text(hdc, f_title, PAD, 16, '连接设备', C_INK)
     _draw_text(hdc, f_small, PAD + 92, 24, '连上后自动开始投屏', C_FAINT)
 
     # Tab 栏（分段式）
@@ -1241,9 +1224,10 @@ def _paint(ctx, hdc):
         # 名称（营销名/型号，绝不显示 mDNS 串号）；过长先截断，给后面的徽标留位
         name = r['name']
         dot_c = {'online': C_OK, 'found': C_ACCENT}[r['state']]
-        label, fg, bg = {'online': ('已连接', C_OK, C_OK_LT),
-                         'found': ('新发现', C_ACCENT, C_ACCENT_LT)}[r['state']]
-        bw = _text_size(hdc, f_small, label)[0] + 14
+        # 徽标只有「已连接」一种：没连上的行不挂标签（点它是去配对，不是状态差异）
+        label, fg, bg = (('已连接', C_OK, C_OK_LT) if r['state'] == 'online'
+                         else ('', None, None))
+        bw = (_text_size(hdc, f_small, label)[0] + 14) if label else 0
         right = WIN_W - PAD - (14 if r['state'] == 'online' else 76 + 12)
         max_name_w = right - (PAD + 34) - bw - 8
         while name and _text_size(hdc, f_body, name + '…')[0] > max_name_w:
@@ -1265,12 +1249,13 @@ def _paint(ctx, hdc):
         _draw_text(hdc, f_body, nx, name_y, name, C_INK)
         # 状态徽标紧跟设备名同一行，与名称文字垂直居中对齐
         nw = _text_size(hdc, f_body, name)[0]
-        bh = _text_size(hdc, f_small, label)[1] + 6
-        _badge(hdc, f_small, nx + nw + 8, name_y + (20 - bh) // 2, label, fg, bg)
+        if label:
+            bh = _text_size(hdc, f_small, label)[1] + 6
+            _badge(hdc, f_small, nx + nw + 8, name_y + (20 - bh) // 2, label, fg, bg)
         if sub:
             _draw_text(hdc, f_small, nx, sub_y, sub, C_FAINT)
-        # 行尾按钮：已连接的设备不摆按钮（点了也是重复连接）。
-        # 「新发现」连过的显示「连接」、没连过的显示「配对」。
+        # 行尾按钮：已连接的设备不摆按钮（点了也是重复连接）；没连上的一律「配对」——
+        # 它现在没连上，要重新连就得先配对（配对端口电脑自己去问设备）。
         if r['state'] != 'found':
             continue
         bx, by, bw, bh = ctx['hotspots'][ID_ROW_BASE + i]
@@ -1282,15 +1267,13 @@ def _paint(ctx, hdc):
             _draw_text(hdc, f_small, bx + (bw - tw) // 2, by + (bh - th) // 2,
                        '连接中', C_PRIMARY)
         else:
-            # 本机连过的「连接」；没连过的（以及离线的）只能先配对，按钮就叫「配对」
-            label = '连接' if (r['state'] == 'found' and
-                               _seen_before(r, ctx['known'])) else '配对'
-            # hover 与下方「连接手机」大按钮完全一致：主色填深一档 + 白字
+            # 没连上的设备只能先配对：按钮就叫「配对」，点了展开配对面板填 6 位码
+            # hover 与下方「连接设备」大按钮完全一致：主色填深一档 + 白字
             _round_rect(hdc, bx, by, bw, bh, 8,
                         C_PRIMARY_HOVER if hover else C_PRIMARY)
-            tw, th = _text_size(hdc, f_btn, label)
+            tw, th = _text_size(hdc, f_btn, '配对')
             _draw_text(hdc, f_btn, bx + (bw - tw) // 2, by + (bh - th) // 2,
-                       label, (255, 255, 255))
+                       '配对', (255, 255, 255))
 
     # 设备多于能显示的行数时，右侧画一条细滚动条（滚轮滚动）
     total = len(_list_rows(ctx))
@@ -1363,7 +1346,7 @@ def _paint(ctx, hdc):
                 _round_rect(hdc, gx, gy, gw, gh, 10,
                             C_PRIMARY_DK if ctx['pressed'] == ID_GO
                             else (C_PRIMARY_HOVER if hover else C_PRIMARY))
-                label = '连接手机'
+                label = '连接设备'
                 tw = _text_size(hdc, f_btn, label)[0]
                 _draw_text(hdc, f_btn, gx + (gw - tw) // 2, gy + 11, label, (255, 255, 255))
     else:
@@ -1424,7 +1407,7 @@ def _start_job(ctx, kind, payload, row=None, busy_text='正在连接'):
     if ctx['busy']:
         if kind == 'refresh':
             return
-        # 正在刷新设备列表时用户点了「连接手机」：别把这次点击丢掉，等刷新结束再跑
+        # 正在刷新设备列表时用户点了「连接设备」：别把这次点击丢掉，等刷新结束再跑
         ctx['queued'] = (kind, payload, row, busy_text)
         _status(ctx, busy_text + '…（正在刷新设备）', 'busy')
         return
@@ -1520,7 +1503,7 @@ def _worker_job(ctx, kind, payload):
                 if mdns_browse is None:
                     fail_msg = ('这个安装包缺少「自动找手机」的组件。请在手机上打开'
                                 '「使用配对码配对设备」页面，把上面的 IP 和端口填进'
-                                '前两个框，再点「连接手机」。')
+                                '前两个框，再点「连接设备」。')
                 else:
                     ip_port = discover_pair_target(_peer_ips(ctx))
                     if ctx['log']:
@@ -1532,7 +1515,7 @@ def _worker_job(ctx, kind, payload):
                     else:
                         fail_msg = ('没找到手机。请让手机停在「使用配对码配对设备」'
                                     '那一页（上面有 6 位码和 IP:端口），再点一次'
-                                    '「连接手机」。')
+                                    '「连接设备」。')
             if ctx.get('dead'):        # 用户已经关掉向导：别在后台偷偷配对
                 ctx['job'] = None
                 return
@@ -1689,7 +1672,7 @@ def _click(ctx, hid):
         _set_pair_open(ctx, 'manual')
         user32.SetFocus(ctx['edits'][ID_IP])
         _status(ctx, '把设备「无线调试」页上的 IP 和端口填进上面两个框，'
-                     '再填设备「使用配对码配对设备」页上的 6 位配对码，然后点「连接手机」。',
+                     '再填设备「使用配对码配对设备」页上的 6 位配对码，然后点「连接设备」。',
                 'info')
         return
     if hid == ID_PAIR_CLOSE:
@@ -1721,11 +1704,8 @@ def _click(ctx, hid):
             # 已连接的设备：点了也不做任何事（不重复连接，也就不会开出第二个投屏窗口）
             _status(ctx, '「%s」已经连上了，不用再点。' % r['name'], 'info')
             return
-        if r['state'] == 'found' and _seen_before(r, ctx['known']):
-            _start_job(ctx, 'connect', r['addr'], row=i)
-        else:
-            # 没配对过 / 现在离线：都先让用户填 6 位配对码（离线的那台要重新配对）
-            _prefill_pair(ctx, r)
+        # 没连上的设备一律先配对：填 6 位配对码再点「连接设备」
+        _prefill_pair(ctx, r)
         return
 
 
@@ -1998,7 +1978,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
         wx = wa.left + max(0, ((wa.right - wa.left) - WIN_W) // 2)
         wy = wa.top + max(0, ((wa.bottom - wa.top) - WIN_H_CLOSED) // 2)
         style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN
-        hwnd = user32.CreateWindowExW(0, 'MoyuConnectWizard', '魔芋 · 连接手机',
+        hwnd = user32.CreateWindowExW(0, 'MoyuConnectWizard', '魔芋 · 连接设备',
                                       style, wx, wy, WIN_W, WIN_H_CLOSED, None, None, hinst, None)
         if not hwnd:
             if on_log:
