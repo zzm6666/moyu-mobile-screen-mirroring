@@ -386,15 +386,14 @@ class MergeDevicesTest(unittest.TestCase):
                 'addr': '192.168.137.144:36183', 'name': 'adb-xx'}
         self.assertEqual(cu._remembered_name(row2, []), '无线设备 192.168.137.144')
 
-    def test_row_has_info_for_offline_rows(self):
-        """离线行有没有可辨认信息：有地址/历史名字才有，纯「无线设备」兜底就没有。"""
-        self.assertTrue(cu._row_has_info({'serial': 'S', 'addr': '192.168.1.5:5555'}))
-        self.assertTrue(cu._row_has_info(
-            {'serial': MDNS_SERIAL, 'addr': ''},
-            [{'serial': MDNS_SERIAL, 'name': '一加 13', 'addr': ''}]))
-        self.assertFalse(cu._row_has_info(
-            {'serial': MDNS_SERIAL, 'addr': ''},
-            [{'serial': MDNS_SERIAL, 'name': MDNS_SERIAL, 'addr': ''}]))
+    def test_last_known_name_for_empty_state(self):
+        """空列表提示里那句「上次连过的 X」，只认真名字，不认串号。"""
+        self.assertEqual(cu._last_known_name([]), '')
+        self.assertEqual(cu._last_known_name(
+            [{'serial': MDNS_SERIAL, 'name': MDNS_SERIAL, 'addr': ''},
+             {'serial': MDNS_SERIAL, 'name': '一加 13', 'addr': ''}]), '一加 13')
+        self.assertEqual(cu._last_known_name(
+            [{'serial': MDNS_SERIAL, 'name': '192.168.1.5:5555', 'addr': ''}]), '')
 
     def test_order_and_fields(self):
         """三源排序 online > found > offline；kind/state/name/addr 字段正确。"""

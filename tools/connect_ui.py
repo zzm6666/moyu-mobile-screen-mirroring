@@ -581,15 +581,13 @@ def _remembered_name(row, known=()):
     return '无线设备'
 
 
-def _row_has_info(row, known=()):
-    """这一行有没有可辨认的信息（名字或地址）。
-
-    离线行既没有地址、名字也只是「无线设备」兜底时，用户看不出是哪台设备、
-    也没有按钮可点，留着就是噪音——直接不显示。
-    """
-    if (row.get('addr') or '').strip():
-        return True
-    return _remembered_name(row, known) != '无线设备'
+def _last_known_name(known):
+    """历史里最近连过的那台设备叫什么（空列表里提一句用），没有就返回 ''。"""
+    for k in known or ():
+        name = (k.get('name') or '').strip()
+        if name and not _is_junk_name(name, k.get('serial') or ''):
+            return name
+    return ''
 
 
 def merge_devices(online, discovered, known):
@@ -942,8 +940,6 @@ C_OK = (22, 163, 74)            # 在线
 C_OK_LT = (226, 246, 233)
 C_ERR = (200, 44, 44)           # 错误红
 C_ERR_LT = (252, 235, 235)
-C_OFF = (156, 163, 173)         # 离线灰
-C_OFF_LT = (238, 238, 236)
 C_HOVER = (240, 239, 235)       # 行 hover
 C_EDIT_BG = (255, 255, 255)
 C_EDIT_LINE = (203, 201, 195)
@@ -1092,15 +1088,14 @@ def _hit(ctx, x, y):
 
 
 def _list_rows(ctx):
-    """当前标签页的设备行（全部，滚动只看其中一段）。"""
+    """当前标签页的设备行（全部，滚动只看其中一段）。
+
+    只列**现在能操作**的设备：已连接（点托盘即可投屏）、新发现（能连接或配对）。
+    「离线」= 手机没开无线调试，此刻既配不了也连不上；而它一旦打开无线调试，就会
+    以「新发现」重新出现——所以离线行只会是死按钮，不显示。
+    """
     kind = 'usb' if ctx.get('tab') == 'usb' else 'wifi'
-    rows = [r for r in ctx['rows'] if r['kind'] == kind]
-    if kind == 'wifi':
-        known = ctx.get('known') or ()
-        # 离线又完全看不出是哪台设备的行（没地址、名字也只是「无线设备」）不显示
-        rows = [r for r in rows
-                if r['state'] != 'offline' or _row_has_info(r, known)]
-    return rows
+    return [r for r in ctx['rows'] if r['kind'] == kind and r['state'] != 'offline']
 
 
 def _max_rows(ctx):
@@ -1164,8 +1159,8 @@ def _rebuild_hotspots(ctx):
     ctx['visible_rows'], _top = _visible_rows(ctx)
     for i, r in enumerate(ctx['visible_rows']):
         y = LIST_Y + i * ROW_H
-        # 已连接的不用点；「新发现」和「离线」都有按钮：离线那台点了是去配对
-        if r['state'] in ('found', 'offline'):
+        # 已连接的不用点；「新发现」有按钮（以前连过→连接，没连过→配对）
+        if r['state'] == 'found':
             hs[ID_ROW_BASE + i] = (WIN_W - PAD - 76, y + 10, 64, 32)
     hs[ID_REFRESH] = (WIN_W - PAD - 64, TAB_Y + 4, 64, 26)
     if ctx['tab'] == 'wifi':
@@ -1220,8 +1215,15 @@ def _paint(ctx, hdc):
     if not rows:
         if ctx['tab'] == 'wifi':
             msg1 = '还没有无线设备'
-            msg2 = '手机开启「无线调试」后会自动出现在这里；'
-            msg3 = '第一次使用请点下方「手动配对」。'
+            last = _last_known_name(ctx.get('known') or ())
+            if last:
+                msg2 = '上次连过的「%s」现在没开着无线调试；' % last
+                msg3 = ('打开「无线调试」它就会自动出现。' if ctx['pair_open']
+                        else '打开「无线调试」它就会自动出现，或点下方「手动配对」。')
+            else:
+                msg2 = '手机打开「无线调试」后会自动出现在这里；'
+                msg3 = ('第一次使用请在下面手动填 IP 和配对码。' if ctx['pair_open']
+                        else '第一次使用请点下方「手动配对」。')
         else:
             msg1 = '没有检测到 USB 设备'
             msg2 = '用数据线连接手机，并在手机上'
@@ -1238,10 +1240,9 @@ def _paint(ctx, hdc):
             _hline(hdc, PAD + 14, y, W - 2 * PAD - 28, C_LINE)
         # 名称（营销名/型号，绝不显示 mDNS 串号）；过长先截断，给后面的徽标留位
         name = r['name']
-        dot_c = {'online': C_OK, 'found': C_ACCENT, 'offline': C_OFF}[r['state']]
+        dot_c = {'online': C_OK, 'found': C_ACCENT}[r['state']]
         label, fg, bg = {'online': ('已连接', C_OK, C_OK_LT),
-                         'found': ('新发现', C_ACCENT, C_ACCENT_LT),
-                         'offline': ('离线', C_OFF, C_OFF_LT)}[r['state']]
+                         'found': ('新发现', C_ACCENT, C_ACCENT_LT)}[r['state']]
         bw = _text_size(hdc, f_small, label)[0] + 14
         right = WIN_W - PAD - (14 if r['state'] == 'online' else 76 + 12)
         max_name_w = right - (PAD + 34) - bw - 8
@@ -1261,8 +1262,7 @@ def _paint(ctx, hdc):
             sub_y = 0
         # 状态点与名称行同一垂直中线（名称墨迹中心约在 name_y+10）
         _dot(hdc, PAD + 16, name_y + 6, 8, dot_c)
-        _draw_text(hdc, f_body, nx, name_y, name,
-                   C_INK if r['state'] != 'offline' else C_SUB)
+        _draw_text(hdc, f_body, nx, name_y, name, C_INK)
         # 状态徽标紧跟设备名同一行，与名称文字垂直居中对齐
         nw = _text_size(hdc, f_body, name)[0]
         bh = _text_size(hdc, f_small, label)[1] + 6
@@ -1270,8 +1270,8 @@ def _paint(ctx, hdc):
         if sub:
             _draw_text(hdc, f_small, nx, sub_y, sub, C_FAINT)
         # 行尾按钮：已连接的设备不摆按钮（点了也是重复连接）。
-        # 「新发现」连过的显示「连接」、没连过的显示「配对」；离线设备只能重新配对。
-        if r['state'] not in ('found', 'offline'):
+        # 「新发现」连过的显示「连接」、没连过的显示「配对」。
+        if r['state'] != 'found':
             continue
         bx, by, bw, bh = ctx['hotspots'][ID_ROW_BASE + i]
         hover = ctx['hover'] == ID_ROW_BASE + i
@@ -1590,9 +1590,10 @@ def _apply_job(ctx):
         ctx['scroll'] = min(ctx.get('scroll') or 0, _max_scroll(ctx))
         _rebuild_hotspots(ctx)
         auto = ctx.pop('auto_refresh', False)
-        # 一台都没发现（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对面板摊开，
-        # 省得用户自己去找入口。只自动展开一次，别每次刷新都抢用户的操作。
-        if not rows and not ctx.get('auto_opened') and not ctx['pair_open']:
+        # 一台能操作的设备都没有（手机没开无线调试 / mDNS 被路由器挡了）：直接把配对
+        # 面板摊开，省得用户自己去找入口。只自动展开一次，别每次刷新都抢用户的操作。
+        # 注意要看「看得见的行」：历史里那些离线设备不算，它们根本不在列表里。
+        if not _list_rows(ctx) and not ctx.get('auto_opened') and not ctx['pair_open']:
             ctx['auto_opened'] = True
             _set_pair_open(ctx, 'manual')
         # 列表本身就是答案，不用再报「找到 N 台设备」（用户嫌啰嗦）。

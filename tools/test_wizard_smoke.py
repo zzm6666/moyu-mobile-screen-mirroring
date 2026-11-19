@@ -174,11 +174,8 @@ class WizardSmokeTest(_Isolated):
         row_y = connect_ui.LIST_Y + j * connect_ui.ROW_H
         row_px = (connect_ui.PAD + 100, row_y + connect_ui.ROW_H - 8)  # 行内空白，非按钮
         btn_px = (bx + bw // 2, by + bh - 4)                           # 按钮内靠下，避开文字
-        k = next((i for i, r in enumerate(rows) if r['state'] == 'offline'), None)
-        self.assertIsNotNone(k, '假 runner + known 应刷出离线（历史）设备')
-        # 离线设备也有按钮——点了是去重新配对（自动问新端口），不是直接连接
-        self.assertIn(connect_ui.ID_ROW_BASE + k, ctx['hotspots'],
-                      '离线设备应有「配对」按钮')
+        self.assertFalse([r for r in rows if r['state'] == 'offline'],
+                         '离线设备不该出现在列表里（历史里有，但它此刻既不能连也不能配）')
         base_btn, base_row = pixel(*btn_px), pixel(*row_px)
         self.assertEqual(base_btn, connect_ui.C_PRIMARY, '按钮常态应为主色')
         self.assertEqual(base_row, connect_ui.C_SURFACE, '设备行常态应为卡片白')
@@ -402,10 +399,11 @@ class WizardSmokeTest(_Isolated):
             t.join(5)
             self.assertFalse(t.is_alive())
 
-    def test_offline_row_gets_pair_button_and_anonymous_row_is_hidden(self):
-        """离线设备：认得出的留一行「配对」按钮，认不出的（名字是串号、没地址）不显示。
+    def test_offline_rows_are_not_listed(self):
+        """离线设备不进列表：此刻既连不上也配不了，只会是个死按钮。
 
-        用户 m03950：看不出是哪台设备、又没有按钮可点的离线行留着没意义。
+        用户 m04505：离线说明手机根本没开无线调试，本来就不能配对/连接；
+        而它一开无线调试就会以「新发现」出现——所以离线行没有存在意义。
         """
         done = threading.Event()
         closed = threading.Event()
@@ -432,27 +430,17 @@ class WizardSmokeTest(_Isolated):
         self.assertTrue(hwnd, '向导窗口 10 秒内没出现')
         ctx = connect_ui._WINDOWS[hwnd]
         for _ in range(80):
-            if ctx['visible_rows']:
-                break
-            time.sleep(0.1)
-        rows = ctx['visible_rows']
-        self.assertEqual([r['name'] for r in rows], ['一加 13'],
-                         '看不出是哪台设备的离线行应被藏掉：%r' % [r['name'] for r in rows])
-        self.assertEqual(rows[0]['state'], 'offline')
-        self.assertIn(connect_ui.ID_ROW_BASE, ctx['hotspots'],
-                      '离线设备要有「配对」按钮（点了是重新配对，不是硬连）')
-        bx, by, bw, bh = ctx['hotspots'][connect_ui.ID_ROW_BASE]
-        lp = (bx + bw // 2) | ((by + bh // 2) << 16)
-        connect_ui.user32.PostMessageW(hwnd, 0x0201, 1, lp)
-        connect_ui.user32.PostMessageW(hwnd, 0x0202, 0, lp)
-        for _ in range(40):
             if ctx['pair_open']:
                 break
             time.sleep(0.1)
-        self.assertTrue(ctx['pair_open'], '点离线设备的「配对」应展开配对面板')
-        self.assertEqual(ctx['pair_mode'], 'prefill')
-        self.assertEqual(connect_ui._text(ctx['edits'][connect_ui.ID_IP]),
-                         '192.168.137.77')
+        self.assertTrue([r for r in ctx['rows'] if r['state'] == 'offline'],
+                        '数据层仍会带出历史里的离线设备（供去重/名字用）')
+        self.assertEqual(ctx['visible_rows'], [],
+                         '但列表里一台都不该显示：%r' % (ctx['visible_rows'],))
+        self.assertEqual(ctx['hotspots'].get(connect_ui.ID_ROW_BASE), None,
+                         '没行就不该有行内按钮热点')
+        self.assertTrue(ctx['pair_open'], '一台能操作的设备都没有时应自动摊开配对面板')
+        self.assertEqual(ctx['pair_mode'], 'manual')
         connect_ui.user32.PostMessageW(hwnd, 0x0010, 0, 0)
         self.assertTrue(closed.wait(5))
         t.join(5)
