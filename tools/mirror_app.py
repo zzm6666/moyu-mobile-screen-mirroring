@@ -773,6 +773,44 @@ def _close_scrcpy_log():
             pass
 
 
+def launch_xy():
+    """scrcpy 窗口一出生就该待的位置（屏幕上、外框里的视频区左上角）。
+
+    scrcpy 进程一起来就会显示自己的窗口。以前给它 ``--window-x=0 --window-y=0``，
+    于是先闪一下屏幕左上角那个「裸窗口」，等看门狗（1 秒一次）收养进外框才归位。
+    这里提前算好位置：就算还来不及藏，也是从最终位置开始。
+    """
+    f = state['frame']
+    if not f or not user32.IsWindow(f):
+        return 0, 0
+    r = RECT()
+    user32.GetWindowRect(f, ctypes.byref(r))
+    W, H = content_size(r.right - r.left, r.bottom - r.top)
+    vx, vy, vw, vh = calc_video_rect(W, H)
+    bx, by, _bw, _bh = child_box(vx, vy, vw, vh)
+    return r.left + SHADOW_PAD + bx, r.top + SHADOW_PAD + by
+
+
+def _hide_child_until_adopted(proc, timeout=6.0, interval=0.04):
+    """scrcpy 窗口一出现就藏起来，等外框和画面一起露面。
+
+    看门狗 1 秒才跑一次，这中间用户会看到一个没有操作栏的「裸」窗口（还会先闪
+    在屏幕左上角）。这里 40ms 盯一次：只要窗口出现了、还没被收养，就先隐藏，
+    剩下的交给看门狗照常收养并显示。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        if state['proc'] is not proc or state['quitting']:
+            return
+        if state['child'] is not None:
+            return          # 已经被收养了，别再插手
+        t = target_hwnd()
+        if t and user32.IsWindow(t) and state['child'] is None \
+                and user32.IsWindowVisible(t):
+            user32.ShowWindow(t, 0)
+        time.sleep(interval)
+
+
 AUTO_CONNECT_GRACE = 6.0    # 启动时等 adb 自己把「已配对的无线设备」连上多久
 
 
@@ -831,6 +869,7 @@ def start_scrcpy():
                            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=8)
         except Exception:
             pass
+    lx, ly = launch_xy()          # scrcpy 窗口一出生就落在它最终该在的位置
     args = [SCRCPY, '-s', serial,
             '--window-title=' + TITLE,
             '--window-borderless',
@@ -840,7 +879,7 @@ def start_scrcpy():
             # 画面铺满整个窗口，窗口内部不再留 1px 黑底；窗口比可见区大 2px，
             # 多出来的部分被圆角裁剪区挡掉，形变约 0.8%，肉眼看不出来。
             '--render-fit=stretched',
-            '--window-x=0', '--window-y=0',
+            '--window-x=%d' % lx, '--window-y=%d' % ly,
             '--window-width=%d' % CFG['w'], '--window-height=%d' % CFG['h'],
             '--max-fps=%d' % CFG['fps'],
             '--video-bit-rate=' + str(CFG['bitrate']),
@@ -863,7 +902,11 @@ def start_scrcpy():
                                      stdout=logf if logf else subprocess.DEVNULL,
                                      stderr=subprocess.STDOUT if logf else subprocess.DEVNULL,
                                      creationflags=CREATE_NO_WINDOW)
-    log('scrcpy launched pid=%s aspect=%.4f' % (state['proc'].pid, state['aspect']))
+    log('scrcpy launched pid=%s aspect=%.4f at (%d,%d)'
+        % (state['proc'].pid, state['aspect'], lx, ly))
+    # 抢先一步：scrcpy 自己的窗口一出现就先藏，等外框就绪再一起露面（避免闪一下裸窗口）
+    threading.Thread(target=_hide_child_until_adopted,
+                     args=(state['proc'],), daemon=True).start()
 
 
 def _font(size):

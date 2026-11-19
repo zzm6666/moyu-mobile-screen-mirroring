@@ -345,5 +345,53 @@ class StartupWaitTest(unittest.TestCase):
         self.assertEqual(len(self.wizard_calls), 1, '手机不在时要弹连接向导')
 
 
+class HideRawScrcpyWindowTest(unittest.TestCase):
+    """scrcpy 自己的窗口一出现就要先藏起来。
+
+    不然用户先看到屏幕左上角闪一个没有操作栏的裸窗口（scrcpy 默认摆 0,0），
+    等看门狗 1 秒后收养进外框，才在右下角出现真正的投屏窗口。
+    """
+
+    def setUp(self):
+        self._saved = dict(app.state)
+        self._orig = {'target_hwnd': app.target_hwnd,
+                      'IsWindow': app.user32.IsWindow,
+                      'IsWindowVisible': app.user32.IsWindowVisible,
+                      'ShowWindow': app.user32.ShowWindow}
+        self.calls = []
+        app.user32.IsWindow = lambda h: True
+        app.user32.IsWindowVisible = lambda h: True
+        app.user32.ShowWindow = lambda h, cmd: self.calls.append((int(h), cmd)) or True
+        self.proc = object()
+        app.state.update({'proc': self.proc, 'child': None, 'quitting': False})
+
+    def tearDown(self):
+        app.target_hwnd = self._orig['target_hwnd']
+        app.user32.IsWindow = self._orig['IsWindow']
+        app.user32.IsWindowVisible = self._orig['IsWindowVisible']
+        app.user32.ShowWindow = self._orig['ShowWindow']
+        app.state.clear()
+        app.state.update(self._saved)
+
+    def test_hides_window_that_appeared_before_adoption(self):
+        app.target_hwnd = lambda: 4242
+        app._hide_child_until_adopted(self.proc, timeout=0.2, interval=0.01)
+        self.assertTrue(self.calls, '窗口出现了却没被藏起来，用户会看到裸窗口闪一下')
+        self.assertEqual(self.calls[0][0], 4242)
+        self.assertTrue(all(cmd == 0 for _h, cmd in self.calls), '只能隐藏（SW_HIDE=0）')
+
+    def test_leaves_it_alone_once_adopted(self):
+        app.target_hwnd = lambda: 4242
+        app.state['child'] = 4242          # 看门狗已经收养
+        app._hide_child_until_adopted(self.proc, timeout=0.1, interval=0.01)
+        self.assertEqual(self.calls, [], '收养之后不该再插手，否则会把画面藏掉')
+
+    def test_stops_when_another_scrcpy_was_launched(self):
+        app.target_hwnd = lambda: 4242
+        app.state['proc'] = object()       # 换了新进程，旧线程要退出
+        app._hide_child_until_adopted(self.proc, timeout=5.0, interval=0.01)
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()
