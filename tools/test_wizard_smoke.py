@@ -986,6 +986,19 @@ class QrPanelTest(_Isolated):
                 connect_ui.user32.GetClientRect(hwnd, ctypes.byref(rc))
                 self.assertEqual(rc.bottom, connect_ui.WIN_H_QR,
                                  '二维码模式窗口要高一些才摆得下码')
+                # 变高之后新露出来的那一条也得画到（曾经留着一条黑边没人画）
+                u, g = connect_ui.user32, connect_ui.gdi32
+                u.GetDC.argtypes = [connect_ui.wt.HWND]
+                u.GetDC.restype = connect_ui.wt.HDC
+                u.ReleaseDC.argtypes = [connect_ui.wt.HWND, connect_ui.wt.HDC]
+                g.GetPixel.argtypes = [connect_ui.wt.HDC, ctypes.c_int, ctypes.c_int]
+                hdc = u.GetDC(hwnd)
+                try:
+                    for yy in (rc.bottom - 12, rc.bottom - 6, rc.bottom - 1):
+                        self.assertNotEqual(g.GetPixel(hdc, 260, yy), 0,
+                                            '底部 y=%d 是没画到的黑边' % yy)
+                finally:
+                    u.ReleaseDC(hwnd, hdc)
                 # 再点一次「二维码」不再是换码（换码交给面板里的「刷新」）
                 old_creds = ctx['qr_creds']
                 _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_QR])

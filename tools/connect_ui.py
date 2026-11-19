@@ -564,6 +564,7 @@ def _set_pair_open(ctx, mode='', addr=''):
     if on:                           # 提示语由模式决定，任何入口进来都一致
         _status(ctx, _pair_hint(ctx), 'info')
     _invalidate(ctx)
+    _repaint_all(ctx)                # 尺寸变了：整窗重画，别在底部留一条没画到的
 
 
 def _set_pair_kind(ctx, qr):
@@ -1249,6 +1250,23 @@ def _fit_client(hwnd, w, h):
     dh = (wr.bottom - wr.top) - rc.bottom
     user32.SetWindowPos(hwnd, None, 0, 0, w + dw, h + dh,
                         0x0002 | 0x0004 | 0x0010)   # NOMOVE|NOZORDER|NOACTIVATE
+
+
+def _repaint_all(ctx):
+    """把整个客户区重画一遍。
+
+    改完窗口尺寸后系统给 WM_PAINT 的裁剪区可能还是**旧尺寸**，新露出来的那一条
+    （二维码模式比配对码模式高 12px）就没人画，看起来就是下方一条黑边。
+    这里直接拿窗口 DC 整窗画一次，不受裁剪区影响。
+    """
+    hwnd = ctx['hwnd']
+    hdc = user32.GetDC(hwnd)
+    if not hdc:
+        return
+    try:
+        _paint(ctx, hdc)
+    finally:
+        user32.ReleaseDC(hwnd, hdc)
 
 
 def _list_h(ctx):
