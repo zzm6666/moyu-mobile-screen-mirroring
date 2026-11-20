@@ -586,6 +586,23 @@ class ReconnectKnownTest(ChineseMsgMixin, unittest.TestCase):
 
 
 class PairThenConnectTest(ChineseMsgMixin, unittest.TestCase):
+    def test_password_mode_skips_six_digit_check(self):
+        """扫码的口令不是 6 位数字，`code_is_password=True` 时不能拦它。"""
+        r = FakeRunner(devices=devices_text(MDNS_SERIAL))
+        ok, msg, serial = cu.pair_then_connect(ADB, '192.168.1.5:43485',
+                                               'KRelVpcgo1', r,
+                                               code_is_password=True)
+        self.assertTrue(ok, msg)
+        self.assertEqual(r.cmds('pair'), [['pair', '192.168.1.5:43485',
+                                          'KRelVpcgo1']])
+
+    def test_six_digit_check_still_guards_the_code_page(self):
+        r = FakeRunner()
+        ok, msg, _ = cu.pair_then_connect(ADB, '192.168.1.5:43485', 'KRelVpcgo1', r)
+        self.assertFalse(ok)
+        self.assertIn('6 位', msg)
+        self.assertEqual(r.cmds('pair'), [])
+
     def test_pair_fail_returns_chinese_error(self):
         """配对失败 → 直接返回中文错误，不再查 devices/mdns。"""
         r = FakeRunner(pair_result=(1, "error: protocol fault (couldn't read)"))
@@ -1191,7 +1208,8 @@ class QrPairTest(unittest.TestCase):
             calls.append(kw)
             return '192.168.1.5:43485'
 
-        def fake_pair(adb, ip_port, code, runner=None, log=None):
+        def fake_pair(adb, ip_port, code, runner=None, log=None,
+                      code_is_password=False):
             seen['args'] = (ip_port, code)
             return True, '配对并连接成功', 'adb-abc._adb-tls-connect._tcp'
 
@@ -1218,6 +1236,32 @@ class QrPairTest(unittest.TestCase):
                                   lambda *a, **kw: (True, 'ok', 'serial')):
             cu.qr_pair(ADB, 'MOYU-abc123', 'abcdefghij', peers=['192.168.1.5'])
         self.assertEqual(calls[0], ['192.168.1.5'])
+
+    def test_pair_uses_our_password_end_to_end(self):
+        """扫码的口令是 10 位随机串，必须真发给 `adb pair`。
+
+        曾经的 bug：`pair_then_connect` 一律按「6 位配对码」校验，10 位口令被判非法，
+        于是 `adb pair` 一次都没执行——手机一直「正在配对设备」，电脑状态行还冒出
+        「配对码是手机屏幕上的 6 位数字」这句只属于配对码模式的提示。
+        """
+        cmds = []
+
+        def fake_runner(cmd, timeout=None):
+            cmds.append(list(cmd))
+            if 'pair' in cmd:
+                return 0, 'Successfully paired to 192.168.1.5:43485'
+            if 'devices' in cmd:
+                return 0, 'List of devices attached\nadb-abc._adb-tls-connect._tcp\tdevice'
+            return 0, ''
+
+        with mock.patch.object(cu, 'discover_pair_target',
+                               lambda *a, **kw: '192.168.1.5:43485'):
+            ok, msg, serial = cu.qr_pair(ADB, 'MOYU-abc123', 'KRelVpcgo1',
+                                         runner=fake_runner, wait=1)
+        self.assertTrue(ok, msg)
+        pair_cmds = [c for c in cmds if 'pair' in c]
+        self.assertEqual(pair_cmds, [[ADB, 'pair', '192.168.1.5:43485',
+                                      'KRelVpcgo1']])
 
     def test_timeout_message_tells_user_what_to_do(self):
         with mock.patch.object(cu, 'discover_pair_target', lambda *a, **kw: ''), \

@@ -361,11 +361,18 @@ def _ip_of(ip_port):
     return (ip_port or '').split(':')[0]
 
 
-def pair_only(adb, ip_port, code, runner=run_cmd):
-    """只做 adb pair；返回 (是否成功, 通俗提示)。"""
+def pair_only(adb, ip_port, code, runner=run_cmd, code_is_password=False):
+    """只做 adb pair；返回 (是否成功, 通俗提示)。
+
+    两种配对口令：配对码页面给的是 6 位数字；扫码配对给的是我们写进二维码里的
+    10 位随机口令。后者不走 `valid_code` 的六位数字校验。
+    """
     if not normalize_ip_port(ip_port):
         return False, '请填写「IP:配对端口」，例如 192.168.1.5:43847'
-    if not valid_code(code):
+    if code_is_password:
+        if not (code or '').strip():
+            return False, '二维码里没有配对口令，点面板里的「刷新」换一张再扫'
+    elif not valid_code(code):
         return False, '配对码是手机屏幕上的 6 位数字'
     rc, out = runner([adb, 'pair', ip_port, (code or '').strip()])
     if 'Successfully paired' not in (out or ''):
@@ -916,7 +923,7 @@ def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None,
 
 
 def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
-                      wait=PAIR_DISCOVER_SECS):
+                      wait=PAIR_DISCOVER_SECS, code_is_password=False):
     """一键「连接设备」：配对 + 自动找到真正的「连接端口」再连，用户无感。
 
     手机无线调试有两个端口：配对弹窗里的**配对端口**和主页面上「IP 地址和端口」的
@@ -927,8 +934,9 @@ def pair_then_connect(adb, ip_port, code, runner=run_cmd, log=None,
       2. 不行再查 `adb mdns services` 拿该 IP 的连接端口，然后 connect；
       3. 重试 wait 秒；仍不行就把「端口框手动填一次」的办法说清楚。
     log: 可选日志回调；放弃时写原始 mdns 输出，便于以后定位。
+    code_is_password: 扫码配对时口令是我们写进二维码的随机串，不走六位数字校验。
     """
-    ok, msg = pair_only(adb, ip_port, code, runner)
+    ok, msg = pair_only(adb, ip_port, code, runner, code_is_password)
     if not ok:
         return False, msg, ''
     ip = _ip_of(ip_port)
@@ -1002,7 +1010,8 @@ def qr_pair(adb, service, password, runner=run_cmd, log=None, wait=QR_WAIT_SECS,
         if target:
             if log:
                 log('wizard: 扫码配对目标 %r' % (target,))
-            return pair_then_connect(adb, target, password, runner, log)
+            return pair_then_connect(adb, target, password, runner, log,
+                                     code_is_password=True)
         time.sleep(0.5)
     return False, ('没扫到码。请让设备停在「使用配对码配对设备」页面，点「扫描二维码」'
                    '对着电脑上的码扫一次，扫上后再等 1-2 秒。'), ''
