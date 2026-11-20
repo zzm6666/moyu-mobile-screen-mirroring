@@ -69,6 +69,20 @@ def remote_tag_sha(tag, tok):
     return obj.get('sha') or ''
 
 
+def remote_tree_sha(commit_sha, tok):
+    """远端某个 commit 的树（拿不到返回 ''）。"""
+    try:
+        return (api('GET', '/git/commits/' + commit_sha, tok=tok).get('tree') or {}).get('sha') or ''
+    except urllib.error.HTTPError:
+        return ''
+
+
+def local_tree_sha():
+    """本地 HEAD 的树。"""
+    return subprocess.run(['git', 'rev-parse', 'HEAD^{tree}'], cwd=ROOT,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def token():
     """从 Git Credential Manager 取 GitHub token（和 git push 用的是同一个）。"""
     out = subprocess.run(['git', 'credential', 'fill'], cwd=ROOT, capture_output=True,
@@ -181,8 +195,14 @@ def main():
                           text=True).stdout.strip()
     if not run(['git', 'push', '-f', 'origin', 'refs/tags/' + tag]):
         remote = remote_tag_sha(tag, tok)
-        if remote and remote.startswith(head[:12]):
-            print('提醒：推送 tag 时网络失败，但远端已有 %s（%s），继续发布。' % (tag, remote[:8]))
+        # 内容一致就算数：网络不通时我用 Git Data API 把提交重放到了远端，
+        # 那种情况下远端 commit 的 sha 和本地不同，但两边的树是一模一样的。
+        same = bool(remote) and (remote.startswith(head[:12])
+                                 or (local_tree_sha() and
+                                     remote_tree_sha(remote, tok) == local_tree_sha()))
+        if same:
+            print('提醒：推送 tag 时网络失败，但远端 %s（%s）与本地内容一致，继续发布。'
+                  % (tag, remote[:8]))
         else:
             print('推送 tag 失败，且远端没有指向 %s 的 %s，先解决网络再发。' % (head[:8], tag))
             return 1
