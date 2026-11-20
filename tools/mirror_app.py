@@ -773,25 +773,40 @@ def _close_scrcpy_log():
             pass
 
 
-def launch_xy():
-    """scrcpy 窗口一出生就该待的位置（屏幕上、外框里的视频区左上角）。
+SPAWN_XY = -30000    # scrcpy 窗口的出生点：屏幕外（见 launch_xy 的说明）
 
-    scrcpy 进程一起来就会显示自己的窗口。以前给它 ``--window-x=0 --window-y=0``，
-    于是先闪一下屏幕左上角那个「裸窗口」，等看门狗（1 秒一次）收养进外框才归位。
-    这里提前算好位置：就算还来不及藏，也是从最终位置开始。
+
+def launch_xy():
+    """scrcpy 窗口的出生位置：屏幕外。
+
+    scrcpy 进程一起来就会显示自己的「裸」窗口（无外框、无操作栏）。实测 SDL 不认
+    STARTUPINFO 的 SW_HIDE——进程起来约 1 秒后窗口照样可见，所以只能让它生在屏幕外：
+    这样不管我们多快把它藏起来，用户都看不到那一闪。
+    收养进外框时（它已经隐藏了）由 position_scrcpy 搬到最终位置。
+    """
+    return SPAWN_XY, SPAWN_XY
+
+
+def spawn_size():
+    """scrcpy 窗口的出生尺寸：直接给最终的 child 尺寸，收养时不用再改大小。
+
+    以前这里给的是 CFG['w']/CFG['h']（视频尺寸），比 child_box() 小了 2*OVERSCAN，
+    收养时窗口会边长几像素——用户看到的就是「跳一下」。
     """
     f = state['frame']
     if not f or not user32.IsWindow(f):
-        return 0, 0
+        return CFG['w'], CFG['h']
     r = RECT()
     user32.GetWindowRect(f, ctypes.byref(r))
     W, H = content_size(r.right - r.left, r.bottom - r.top)
     vx, vy, vw, vh = calc_video_rect(W, H)
-    bx, by, _bw, _bh = child_box(vx, vy, vw, vh)
-    return r.left + SHADOW_PAD + bx, r.top + SHADOW_PAD + by
+    _bx, _by, bw, bh = child_box(vx, vy, vw, vh)
+    if bw < 40 or bh < 40:
+        return CFG['w'], CFG['h']
+    return bw, bh
 
 
-def _hide_child_until_adopted(proc, timeout=6.0, interval=0.04):
+def _hide_child_until_adopted(proc, timeout=6.0, interval=0.002):
     """scrcpy 窗口一出现就藏起来，等外框和画面一起露面。
 
     看门狗 1 秒才跑一次，这中间用户会看到一个没有操作栏的「裸」窗口（还会先闪
@@ -869,7 +884,8 @@ def start_scrcpy():
                            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=8)
         except Exception:
             pass
-    lx, ly = launch_xy()          # scrcpy 窗口一出生就落在它最终该在的位置
+    lx, ly = launch_xy()          # 生在屏幕外：裸窗口无论多快藏都不会被看到
+    sw, sh = spawn_size()         # 出生就按最终 child 尺寸，收养时不用再改大小
     args = [SCRCPY, '-s', serial,
             '--window-title=' + TITLE,
             '--window-borderless',
@@ -880,7 +896,7 @@ def start_scrcpy():
             # 多出来的部分被圆角裁剪区挡掉，形变约 0.8%，肉眼看不出来。
             '--render-fit=stretched',
             '--window-x=%d' % lx, '--window-y=%d' % ly,
-            '--window-width=%d' % CFG['w'], '--window-height=%d' % CFG['h'],
+            '--window-width=%d' % sw, '--window-height=%d' % sh,
             '--max-fps=%d' % CFG['fps'],
             '--video-bit-rate=' + str(CFG['bitrate']),
             '-m', str(CFG['max_size'])]
@@ -902,8 +918,8 @@ def start_scrcpy():
                                      stdout=logf if logf else subprocess.DEVNULL,
                                      stderr=subprocess.STDOUT if logf else subprocess.DEVNULL,
                                      creationflags=CREATE_NO_WINDOW)
-    log('scrcpy launched pid=%s aspect=%.4f at (%d,%d)'
-        % (state['proc'].pid, state['aspect'], lx, ly))
+    log('scrcpy launched pid=%s aspect=%.4f spawn=(%d,%d) %dx%d'
+        % (state['proc'].pid, state['aspect'], lx, ly, sw, sh))
     # 抢先一步：scrcpy 自己的窗口一出现就先藏，等外框就绪再一起露面（避免闪一下裸窗口）
     threading.Thread(target=_hide_child_until_adopted,
                      args=(state['proc'],), daemon=True).start()
@@ -2269,12 +2285,12 @@ def watchdog(hwnd):
             set_tray_tip('%s · 投屏中' % APP_NAME)
             # 连上了才露面：没连手机时不显示投屏窗口（收进托盘期间除外）
             if not state['hidden']:
+                # 先把外框画好再露面：分层窗口隐藏期间内容可能被系统丢掉，先重画一次，
+                # 用户看到的就是「一整块画好的窗口」，而不是「先空一下再填满」。
+                update_frame(state['frame'], force=True)
                 user32.ShowWindow(state['frame'], 5)
                 user32.ShowWindow(t, 5)
                 raise_mirror()
-                # 分层窗口在隐藏期间被系统丢掉内容时，show 出来会是一片透明（
-                # 用户看到的就是「窗口根本没出现」）。显示后再强制重画一次。
-                update_frame(state['frame'], force=True)
                 fr, cr, fg = RECT(), RECT(), RECT()
                 user32.GetWindowRect(state['frame'], ctypes.byref(fr))
                 user32.GetWindowRect(t, ctypes.byref(cr))

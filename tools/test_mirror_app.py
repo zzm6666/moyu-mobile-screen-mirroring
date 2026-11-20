@@ -186,6 +186,59 @@ class WatchdogTimeoutTest(unittest.TestCase):
         self.assertIn(['popen'], order)
         self.assertIsNone(app.state['child'], '没有清掉 child，新窗口不会被收养')
 
+    def test_scrcpy_spawns_offscreen_at_final_child_size(self):
+        """scrcpy 窗口要生在屏幕外、并且一出生就是最终 child 尺寸。
+
+        裸窗口（无外框无操作栏）SDL 不认 SW_HIDE，只能靠「生在屏幕外」让它看不见；
+        尺寸给错了（以前给视频尺寸，比 child 小 2*OVERSCAN），收养时窗口会边长几像素，
+        用户看到的就是「闪一下再跳一下」。
+        """
+        app.CFG['serial'] = '192.168.1.2:5555'
+        app.list_devices = lambda: ['192.168.1.2:5555']
+        app.get_phone_aspect = lambda: 0.4545
+        app.has_audio_device = lambda: True
+        rect = (1624, 386, 1904, 1016)      # 外框窗口矩形
+        app.state['frame'] = object()       # 只要非空且 IsWindow 为真
+        orig_user32 = app.user32
+        app.user32 = types.SimpleNamespace(
+            IsWindow=lambda h: 1,
+            GetWindowRect=self._fake_get_window_rect(rect),
+        )
+        launched = {}
+
+        def fake_popen(args, **kw):
+            launched['args'] = args
+            return FakeProc()
+
+        app.subprocess.Popen = fake_popen
+        try:
+            app.start_scrcpy()
+        finally:
+            app.user32 = orig_user32
+
+        args = launched['args']
+        got_x = int([a for a in args if a.startswith('--window-x=')][0].split('=')[1])
+        got_y = int([a for a in args if a.startswith('--window-y=')][0].split('=')[1])
+        self.assertEqual((got_x, got_y), (app.SPAWN_XY, app.SPAWN_XY),
+                         'scrcpy 窗口没生在屏幕外，裸窗口会闪一下：%r' % (args,))
+        # 出生尺寸 = child_box() 算出来的最终尺寸（不是 CFG 里那个视频尺寸）
+        W, H = app.content_size(rect[2] - rect[0], rect[3] - rect[1])
+        vx, vy, vw, vh = app.calc_video_rect(W, H)
+        _bx, _by, bw, bh = app.child_box(vx, vy, vw, vh)
+        got_w = int([a for a in args if a.startswith('--window-width=')][0].split('=')[1])
+        got_h = int([a for a in args if a.startswith('--window-height=')][0].split('=')[1])
+        self.assertEqual((got_w, got_h), (bw, bh),
+                         '出生尺寸不是最终 child 尺寸，收养时会跳一下: %r'
+                         % (((got_w, got_h), (bw, bh)),))
+
+    @staticmethod
+    def _fake_get_window_rect(box):
+        def fake(hwnd, pref):
+            r = pref._obj
+            r.left, r.top, r.right, r.bottom = box
+            return 1
+        return fake
+
     def test_start_scrcpy_uses_the_serial_adb_reports(self):
         """配置里存的是 ip:port，但 adb 把它认成 mDNS 串号：要用 mDNS 串号起 scrcpy。
 
