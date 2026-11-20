@@ -257,3 +257,30 @@ class BrowseTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class LocalIpsTest(unittest.TestCase):
+    """本机地址不能靠 DNS 解析（getaddrinfo(gethostname()) 会卡几十秒）。"""
+
+    def test_no_dns_lookup(self):
+        calls = []
+        orig = mb.socket.getaddrinfo
+
+        def fake(*a, **kw):
+            calls.append(a)
+            raise AssertionError('不该做 DNS 解析')
+
+        mb.socket.getaddrinfo = fake
+        mb._LOCAL_IPS_CACHE = None
+        try:
+            mb._local_ips()
+        finally:
+            mb.socket.getaddrinfo = orig
+            mb._LOCAL_IPS_CACHE = None
+        self.assertEqual(calls, [])
+
+    def test_result_is_cached(self):
+        mb._LOCAL_IPS_CACHE = ['10.1.2.3']
+        try:
+            self.assertEqual(mb._local_ips(), ['10.1.2.3'])
+        finally:
+            mb._LOCAL_IPS_CACHE = None

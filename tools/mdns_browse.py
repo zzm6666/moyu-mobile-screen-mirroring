@@ -159,16 +159,34 @@ def collect(records, data):
     return [o for o in out if o['name']]
 
 
+_LOCAL_IPS_CACHE = None
+
+
 def _local_ips():
-    """本机的 IPv4 地址（用来给每个网卡都加一次组播加入）。"""
+    """本机的 IPv4 地址（用来给每个网卡都加一次组播加入）。
+
+    **别用 socket.getaddrinfo(socket.gethostname())**：那是一次 DNS 解析，有的机器
+    （尤其是没连网/DNS 慢的时候）会卡几十秒——扫码配对曾经就卡死在这里，界面一直
+    「等待设备扫码」。改成 UDP「连一下」取本端地址：不发包、不解析，纳秒级。
+    结果缓存起来，第二次调用不再碰 socket。
+    """
+    global _LOCAL_IPS_CACHE
+    if _LOCAL_IPS_CACHE is not None:
+        return _LOCAL_IPS_CACHE
     ips = []
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if ip not in ips and not ip.startswith('127.'):
-                ips.append(ip)
-    except OSError:
-        pass
+    for dest, port in ((MDNS_ADDR, MDNS_PORT), ('223.5.5.5', 53)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect((dest, port))
+                ip = s.getsockname()[0]
+            finally:
+                s.close()
+        except OSError:
+            continue
+        if ip and not ip.startswith('127.') and ip not in ips:
+            ips.append(ip)
+    _LOCAL_IPS_CACHE = ips
     return ips
 
 

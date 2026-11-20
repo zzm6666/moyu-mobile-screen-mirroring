@@ -542,7 +542,7 @@ def _set_pair_open(ctx, mode='', addr=''):
     if not on:
         # 收起或离开无线页：正在等的扫码任务也作废，别再让后台线程等下去
         ctx['pair_qr'] = False
-        ctx['qr_cancel'] = True
+        ctx['qr_token'] = None      # 令牌作废：正在等的扫码任务自己退出
     ctx['pair_open'] = on
     ctx['pair_mode'] = mode
     ctx['pair_label'] = addr
@@ -581,7 +581,7 @@ def _set_pair_kind(ctx, qr):
         if ctx['busy'] and not ctx.get('auto_refresh'):
             return
     else:
-        ctx['qr_cancel'] = True     # 让等待扫码的后台任务自己退出
+        ctx['qr_token'] = None      # 令牌作废：等待扫码的后台任务自己退出
         ctx['busy_text'] = ''
     if not qr:
         ctx['pair_qr'] = False
@@ -591,11 +591,12 @@ def _set_pair_kind(ctx, qr):
         _status(ctx, '这台电脑缺少二维码组件，先用配对码吧。', 'err')
         return
     service, password = qr_credentials()
+    token = ctx['qr_token'] = object()      # 这一轮等码的令牌（取消靠它作废）
     ctx['pair_qr'] = True
     ctx['qr_creds'] = (service, password)
     ctx['qr_rows'] = qr_rows(service, password)
     _set_pair_open(ctx, ctx['pair_mode'] or 'manual', ctx['pair_label'])
-    _start_job(ctx, 'qr', (service, password), busy_text='等待设备扫码')
+    _start_job(ctx, 'qr', (service, password, token), busy_text='等待设备扫码')
 
 
 def _refresh_qr(ctx):
@@ -604,13 +605,14 @@ def _refresh_qr(ctx):
         return
     if ctx['busy'] and ctx.get('run_kind') != 'qr':
         return                      # 正在配对/连接时别换，免得打断（正在等扫码可以换）
-    ctx['qr_cancel'] = True
+    ctx['qr_token'] = None          # 旧任务作废（它会在下一轮退出）
     service, password = qr_credentials()
+    token = ctx['qr_token'] = object()      # 新任务的新令牌：它不会认为自己是「已取消」
     ctx['qr_creds'] = (service, password)
     ctx['qr_rows'] = qr_rows(service, password)
     _rebuild_hotspots(ctx)
     _invalidate(ctx)
-    _start_job(ctx, 'qr', (service, password), busy_text='等待设备扫码')
+    _start_job(ctx, 'qr', (service, password, token), busy_text='等待设备扫码')
 
 
 def _prefill_pair(ctx, row):
@@ -623,7 +625,7 @@ def _prefill_pair(ctx, row):
     ip = _ip_of(row.get('addr') or '')
     # 点的是具体某一台设备：从二维码模式回到配对码模式，别再让后台等着扫码
     ctx['pair_qr'] = False
-    ctx['qr_cancel'] = True
+    ctx['qr_token'] = None
     ctx['pair_name'] = row.get('name') or ''
     for eid, text in ((ID_IP, ip), (ID_PORT, '')):
         user32.SendMessageW(ctx['edits'][eid], WM_SETTEXT, 0,
@@ -839,8 +841,37 @@ def _ip_only(text):
     return ip if _is_ip(ip) else ''
 
 
+def _browse_with_timeout(browse, service_type, timeout, targets=None, log=None):
+    """问一次 mDNS，但绝不把调用方拖死：查询卡住就丢掉这一轮。
+
+    冻结包里出过「browse 一直不返回、界面永远『等待设备扫码』」这种事，
+    所以即使底层 socket 出问题，也要让重试循环继续转。
+    """
+    box = {}
+
+    def run():
+        try:
+            box['items'] = browse(service_type, timeout=timeout, targets=targets)
+        except Exception as exc:                 # noqa: BLE001 —— 记下来就够了
+            box['err'] = exc
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(max(0.2, timeout) + 1.0)
+    if th.is_alive():
+        if log:
+            log('mdns: %s 查询卡住（%s 秒没返回），这一轮跳过'
+                % (service_type, timeout))
+        return []
+    if 'err' in box:
+        if log:
+            log('mdns: %s 查询出错 %r' % (service_type, box['err']))
+        return []
+    return box.get('items') or []
+
+
 def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None,
-                         name=''):
+                         name='', log=None):
     """自动找手机的**配对端口**，返回 'ip:port'；找不到返回 ''。
 
     手机停在「使用配对码配对设备」页面时会广播 `_adb-tls-pairing._tcp`，
@@ -848,8 +879,11 @@ def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None,
     所以先用连接广播把手头没有的手机 IP 补齐（它组播就能问到），再逐台单播问配对端口。
     browser: 可注入（默认 mdns_browse.browse），返回 [{'name','host','port','addr'}]。
     name: 只认实例名里含这段文字的那条广播（扫码配对时用我们自己的服务名匹配）。
+    log: 可选日志回调，排「为什么没问到达」时看它。
     """
     if mdns_browse is None and browser is None:
+        if log:
+            log('mdns: 没有可用的 mDNS 浏览器（mdns_browse 导入失败）')
         return ''
     browse = browser or mdns_browse.browse
     ips = []
@@ -858,16 +892,26 @@ def discover_pair_target(peers=(), timeout=PAIR_SETUP_SECS, browser=None,
             ips.append(ip)
     # 连接广播（`_adb-tls-connect._tcp`）组播就有回包：它能把「历史地址过期了」补回来，
     # 所以每次都要问（1.5 秒），不能因为手头有旧 IP 就跳过
-    for it in browse('_adb-tls-connect._tcp', timeout=min(1.5, timeout), targets=[]):
+    found = _browse_with_timeout(browse, '_adb-tls-connect._tcp',
+                                 timeout=min(1.5, timeout), targets=[], log=log)
+    for it in found:
         ip = it.get('addr') or ''
         if ip and ip not in ips and _is_ip(ip):
             ips.append(ip)
-    for it in browse('_adb-tls-pairing._tcp', timeout=timeout, targets=ips):
+    if log:
+        log('mdns: 连接广播 %r → 待问的 IP %r' % (found, ips))
+    pairs = _browse_with_timeout(browse, '_adb-tls-pairing._tcp',
+                                 timeout=timeout, targets=ips, log=log)
+    if log:
+        log('mdns: 配对广播 %r（只认名字含 %r 的）' % (pairs, name))
+    for it in pairs:
         if name and name not in (it.get('name') or ''):
             continue
         ip, port = it.get('addr') or '', it.get('port') or 0
         if _is_ip(ip) and port:
             return '%s:%s' % (ip, port)
+    if log:
+        log('mdns: 这一轮没找到配对端口')
     return ''
 
 
@@ -944,10 +988,17 @@ def qr_pair(adb, service, password, runner=run_cmd, log=None, wait=QR_WAIT_SECS,
     peers: 已知的手机 IP，拿来单播问配对端口（组播被路由器挡住时的兜底）。
     """
     deadline = time.time() + max(1, wait)
+    round_no = 0
     while time.time() < deadline:
         if cancel and cancel():
             return False, '已取消扫码配对。', ''
-        target = discover_pair_target(peers, timeout=2, browser=browser, name=service)
+        round_no += 1
+        if log:
+            log('wizard: qr 第%d轮开始问广播（还剩 %.0f 秒）'
+                % (round_no, deadline - time.time()))
+        target = discover_pair_target(peers, timeout=2, browser=browser,
+                                      name=service,
+                                      log=log if round_no <= 2 else None)
         if target:
             if log:
                 log('wizard: 扫码配对目标 %r' % (target,))
@@ -1675,6 +1726,27 @@ def _peer_ips(ctx):
     return ips
 
 
+def _pair_peers(ctx, adb=None, runner=None):
+    """单播问配对端口时用的候选 IP：界面上的 + 历史里的 + adb 自己 mdns 缓存里的。
+
+    adb 的 mdns 缓存（`adb mdns services`）是 adb server 进程问到的，和我们的
+    socket 走的是两条路；我们这边被防火墙挡住时，它的缓存往往还有地址，拿它兜底。
+    """
+    ips = list(_peer_ips(ctx))
+    if not adb:
+        return ips
+    runner = runner or run_cmd
+    try:
+        out = runner([adb, 'mdns', 'services'])[1]
+    except Exception:
+        return ips
+    for it in parse_mdns_all(out or ''):
+        ip = _ip_only(it.get('addr') or '')
+        if ip and ip not in ips:
+            ips.append(ip)
+    return ips
+
+
 def _enrich_mdns(discovered, browser=None, timeout=1.5):
     """用自带的 mDNS 浏览器给「发现」行补上地址。
 
@@ -1739,7 +1811,9 @@ def _worker_job(ctx, kind, payload):
                                 '「使用配对码配对设备」页面，把上面的 IP 和端口填进'
                                 '前两个框，再点「连接设备」。')
                 else:
-                    ip_port = discover_pair_target(_peer_ips(ctx))
+                    ip_port = discover_pair_target(_pair_peers(ctx, ctx['adb'],
+                                                               ctx['runner']),
+                                                   log=ctx['log'])
                     if ctx['log']:
                         ctx['log']('wizard: 自动发现配对端口 %r' % (ip_port,))
                     if ip_port:
@@ -1764,11 +1838,16 @@ def _worker_job(ctx, kind, payload):
             ctx['job'] = ('connect', (ok, msg, serial), '')
         elif kind == 'qr':
             # 扫码配对：等设备扫我们的码，期间用户可能切回配对码/收起/关窗
-            service, password = payload
+            service, password, token = payload
+            peers = _pair_peers(ctx, ctx['adb'], ctx['runner'])
+            if ctx['log']:
+                ctx['log']('wizard: 扫码配对开始 service=%r 候选 IP=%r'
+                           % (service, peers))
             ok, msg, serial = qr_pair(
                 ctx['adb'], service, password, ctx['runner'], ctx['log'],
-                cancel=lambda: bool(ctx.get('qr_cancel') or ctx.get('dead')),
-                peers=_peer_ips(ctx))
+                cancel=lambda: (ctx.get('qr_token') is not token
+                                or bool(ctx.get('dead'))),
+                peers=peers)
             if ctx.get('dead') or (not ok and msg == '已取消扫码配对。'):
                 # 窗口关了/用户切回配对码：任务只是收尾，别报错也别继续校正串号
                 ctx['job'] = ('idle', '', '')
@@ -1779,6 +1858,11 @@ def _worker_job(ctx, kind, payload):
             ok, msg, serial = reconnect_known(ctx['adb'], payload, ctx['runner'])
             ctx['job'] = ('reconnect', (ok, msg, serial), '')
     except Exception as exc:
+        if ctx['log']:
+            import traceback
+            ctx['log']('wizard: %s 任务异常 %r | %s'
+                       % (kind, exc,
+                          traceback.format_exc().replace('\n', ' | ')))
         ctx['job'] = (kind, '', str(exc) or exc.__class__.__name__)
     # 连接成功后统一成 adb 此刻真正认的串号（ip:port ↔ mDNS 串号），否则投屏起不来
     job = ctx.get('job')
@@ -1810,6 +1894,9 @@ def _apply_job(ctx):
     ctx['busy_row'] = None
     ctx['run_kind'] = ''
     if kind == 'idle':        # 等扫码的任务被取消/窗口已关：只收尾，不报错
+        # 面板还开着就把提示恢复成常驻文案，别留「等待设备扫码…」这种僵尸状态。
+        if ctx.get('pair_open'):
+            _status(ctx, _pair_hint(ctx), 'info')
         return
     if kind == 'qr' and not ctx.get('pair_qr') and isinstance(job[1], tuple) \
             and not job[1][0]:
@@ -2199,6 +2286,9 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                 pass
 
     def _worker():
+        # 冻结包里第三方模块可能没打进去：一条日志就能看出「扫码/自动发现」为什么不动
+        _log('wizard: mdns_browse=%r segno=%r'
+             % ('ok' if mdns_browse else None, 'ok' if segno else None))
         try:
             _build_and_run(adb, on_done, on_log, on_close, known, runner, icon_path)
         except Exception as exc:                 # 线程里没人接异常，一定要写日志
@@ -2256,7 +2346,7 @@ def show_wizard(adb, on_done, on_log=None, on_close=None, known=None, runner=run
                'queued': None, 'auto_refresh': False, 'run_kind': '',
                'pair_open': False, 'pair_mode': '', 'pair_label': '',
                'pair_name': '',
-               'pair_qr': False, 'qr_creds': (), 'qr_rows': [], 'qr_cancel': False,
+               'pair_qr': False, 'qr_creds': (), 'qr_rows': [], 'qr_token': None,
                'scroll': 0}
         ctx['f_title'] = _font_create(19, 600)
         ctx['f_body'] = _font_create(14, 400)

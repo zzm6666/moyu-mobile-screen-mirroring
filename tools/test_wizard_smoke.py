@@ -298,7 +298,7 @@ class WizardSmokeTest(_Isolated):
             result.update(serial=s, name=n)
             done.set()
 
-        def fake_discover(peers=(), timeout=None, browser=None):
+        def fake_discover(peers=(), timeout=None, browser=None, name='', log=None):
             discovered.append(list(peers))
             return '192.168.137.88:43485'
 
@@ -701,7 +701,7 @@ class WizardSmokeTest(_Isolated):
         done = threading.Event()
         discovered = []
 
-        def fake_discover(peers=(), timeout=None, browser=None):
+        def fake_discover(peers=(), timeout=None, browser=None, name='', log=None):
             discovered.append(list(peers))
             return '192.168.137.144:43485'
 
@@ -1031,6 +1031,51 @@ class QrPanelTest(_Isolated):
                                  '来回切一次，配对码模式的提示语不该变')
         finally:
             stop.set()
+            self._close(hwnd, t)
+
+    def test_qr_wait_does_not_cancel_itself(self):
+        """扫码任务刚起身不能认为「已被取消」。
+
+        曾经的 bug：收起面板（开窗时、或切到 USB 页）会把取消标志置真，而进入二维码模式
+        时没复位，于是每一次扫码任务第一轮就自我退出——一次广播都不问，界面永远停在
+        「等待设备扫码」，手机一直「正在配对设备」。
+        """
+        seen = {}
+
+        def fake_qr(adb, service, password, runner=None, log=None, wait=None,
+                    browser=None, cancel=None, peers=()):
+            seen['service'] = service
+            seen['cancelled_at_start'] = bool(cancel and cancel())
+            return False, '没扫到码。', ''
+
+        def done_cb(serial, name='', addr=''):
+            pass
+
+        t, hwnd, ctx = self._open(fake_runner, done_cb)
+        try:
+            _wait_refresh(ctx)
+            _open_pair_panel(hwnd)
+            with mock.patch.object(connect_ui, 'qr_pair', fake_qr):
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_MODE_QR])
+                for _ in range(80):
+                    if seen:
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(seen, '点了「二维码」却没去等扫码')
+                self.assertFalse(seen['cancelled_at_start'],
+                                 '扫码任务一上来就以为「已取消」了，等于永远等不到设备')
+                self.assertIsNotNone(ctx.get('qr_token'), '等码的令牌没登记')
+                token = ctx['qr_token']
+                seen.clear()
+                _click_at(hwnd, ctx['hotspots'][connect_ui.ID_QR_REFRESH])
+                for _ in range(80):
+                    if seen:
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(seen, '点「刷新」后没重新等码')
+                self.assertFalse(seen['cancelled_at_start'], '换码后的新任务也被当成「已取消」')
+                self.assertIsNot(ctx['qr_token'], token, '换码后令牌应该换新的')
+        finally:
             self._close(hwnd, t)
 
     def _close(self, hwnd, t):

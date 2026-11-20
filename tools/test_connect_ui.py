@@ -777,6 +777,87 @@ class DiscoverPairTargetTest(unittest.TestCase):
         browse = self.browser(srv_pairing=[{'addr': '192.168.1.5', 'port': 0}])
         self.assertEqual(cu.discover_pair_target(browser=browse), '')
 
+    def test_log_tells_what_was_seen(self):
+        """排「为什么没问到达」：日志要写出广播内容和待问 IP。"""
+        lines = []
+        browse = self.browser(srv_pairing=[{'name': 'MOYU-abc', 'addr': '192.168.1.5',
+                                            'port': 43485}])
+        cu.discover_pair_target(['192.168.1.5'], browser=browse, name='MOYU-zzz',
+                                log=lines.append)
+        self.assertTrue([s for s in lines if '配对广播' in s], lines)
+        self.assertTrue([s for s in lines if '待问的 IP' in s], lines)
+
+
+class BrowseTimeoutTest(unittest.TestCase):
+    """mDNS 查询卡住时，重试循环不能被拖死（冻结包里曾整窗卡在『等待设备扫码』）。"""
+
+    def test_hanging_browse_returns_empty_instead_of_blocking(self):
+        import time as _t
+
+        def hang(service_type, timeout=None, targets=None):
+            _t.sleep(5)
+            return [{'name': 'late'}]
+
+        begin = _t.time()
+        got = cu._browse_with_timeout(hang, '_adb-tls-pairing._tcp', 0.2)
+        self.assertEqual(got, [])
+        self.assertLess(_t.time() - begin, 2.5, '卡住的查询没有按时放弃')
+
+    def test_browse_error_is_swallowed(self):
+        def boom(service_type, timeout=None, targets=None):
+            raise OSError('no route to host')
+
+        self.assertEqual(cu._browse_with_timeout(boom, 'x', 0.2), [])
+
+    def test_normal_browse_passes_through(self):
+        def ok(service_type, timeout=None, targets=None):
+            return [{'name': 'a._adb-tls-pairing._tcp.local', 'addr': '1.2.3.4',
+                     'port': 1234}]
+
+        self.assertEqual(len(cu._browse_with_timeout(ok, 'x', 0.2, targets=['1.2.3.4'])), 1)
+
+
+class PairPeersTest(unittest.TestCase):
+    """单播问配对端口前，候选 IP 要从界面、历史、adb 自己的 mdns 缓存三处凑齐。"""
+
+    MDNS_OUT = ('List of discovered mdns services\n'
+                'adb-bfd7e543-MoDo9u\t_adb-tls-connect._tcp\t192.168.137.144:39181\n'
+                'adb-009b17d0\t_adb._tcp\t20.30.1.217:5555\n')
+
+    def runner(self, out=MDNS_OUT):
+        calls = []
+
+        def run(cmd, timeout=25):
+            calls.append(cmd)
+            return 0, out
+
+        run.calls = calls
+        return run
+
+    def test_uses_adb_mdns_cache(self):
+        """界面上一台设备都没有时，adb 的 mdns 缓存里还有手机地址。"""
+        ctx = {'rows': [], 'known': [], 'typed_ip': ''}
+        self.assertEqual(cu._pair_peers(ctx, 'adb.exe', self.runner()),
+                         ['192.168.137.144'])
+
+    def test_merges_ui_known_and_cache(self):
+        ctx = {'rows': [{'addr': '192.168.1.7:40001'}],
+               'known': [{'addr': ''}, {'addr': '192.168.1.7:1'}],
+               'typed_ip': '10.0.0.9'}
+        self.assertEqual(cu._pair_peers(ctx, 'adb.exe', self.runner()),
+                         ['192.168.1.7', '10.0.0.9', '192.168.137.144'])
+
+    def test_no_adb_means_ui_only(self):
+        ctx = {'rows': [{'addr': '192.168.1.7:40001'}], 'known': [], 'typed_ip': ''}
+        self.assertEqual(cu._pair_peers(ctx, None), ['192.168.1.7'])
+
+    def test_adb_failure_does_not_blow_up(self):
+        def boom(cmd, timeout=25):
+            raise OSError('adb 不在')
+
+        ctx = {'rows': [], 'known': [], 'typed_ip': ''}
+        self.assertEqual(cu._pair_peers(ctx, 'adb.exe', boom), [])
+
 
 class ConnectOnlyTest(ChineseMsgMixin, unittest.TestCase):
     def test_connected_to_success(self):
@@ -1128,7 +1209,7 @@ class QrPairTest(unittest.TestCase):
         """组播被挡时，已知的手机 IP 要拿去做单播目标。"""
         calls, seen = [], {}
 
-        def fake_disc(peers=(), timeout=None, browser=None, name=''):
+        def fake_disc(peers=(), timeout=None, browser=None, name='', log=None):
             calls.append(list(peers))
             return '192.168.1.5:43485'
 
